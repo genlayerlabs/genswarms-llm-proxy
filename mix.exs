@@ -26,7 +26,7 @@ defmodule GenswarmsLlmProxy.MixProject do
       {:bandit, "~> 1.0"},
       {:plug, "~> 1.14"},
       {:jason, "~> 1.4"},
-      {:decimal, "~> 2.0"}
+      {:decimal, "~> 2.0 or ~> 3.0"}
     ]
   end
 end
