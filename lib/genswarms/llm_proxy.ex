@@ -106,7 +106,8 @@ defmodule Genswarms.LlmProxy do
       stream_timeout_s: Map.get(config, :stream_timeout_s, 300),
       allow_streaming: Map.get(config, :allow_streaming, false),
       prompt_cache: Map.get(config, :prompt_cache, true),
-      max_retries: min(max(Map.get(config, :max_retries, 1), 0), 3)
+      max_retries: min(max(Map.get(config, :max_retries, 1), 0), 3),
+      empty_completion_retries: min(max(Map.get(config, :empty_completion_retries, 0), 0), 3)
     }
 
     if Decimal.compare(plug_opts.default_daily_limit, Decimal.new("0")) != :gt do
@@ -1341,6 +1342,7 @@ defmodule Genswarms.LlmProxy.Plug do
       |> Map.put_new(:allow_streaming, false)
       |> Map.put_new(:prompt_cache, true)
       |> Map.put_new(:max_retries, 1)
+      |> Map.put_new(:empty_completion_retries, 0)
       |> Map.update!(:daily_request_limit, &Proxy.request_limit/1)
 
     conn
@@ -1438,7 +1440,7 @@ defmodule Genswarms.LlmProxy.Plug do
     started = System.monotonic_time(:millisecond)
 
     result =
-      call_with_retry(
+      call_with_empty_retry(
         upstream,
         body,
         headers,
@@ -1545,6 +1547,49 @@ defmodule Genswarms.LlmProxy.Plug do
   # A timeout-after-send (28), recv error (56), or partial transfer (18) is NOT retried
   # (the upstream may have already processed/billed it). Genuine 5xx arrives as
   # {:ok, 5xx, _} and is never retried. Short jittered backoff between attempts.
+  # Empty-completion retry (ported from the micro-markets proxy — the mm-only
+  # feature the unified package must keep): a 2xx whose assistant message has
+  # blank content and NO tool call is retried up to opts.empty_completion_retries
+  # times (default 0 — wingston-lineage behavior unchanged unless opted in).
+  defp call_with_empty_retry(upstream, body, headers, opts, transport_retries) do
+    empties = min(max(Map.get(opts, :empty_completion_retries, 0), 0), 3)
+    do_empty_retry(upstream, body, headers, opts, transport_retries, empties)
+  end
+
+  defp do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left) do
+    result = call_with_retry(upstream, body, headers, opts, transport_retries)
+
+    case result do
+      {:ok, status, resp} when status in 200..299 ->
+        if empties_left > 0 and empty_assistant_completion?(resp) do
+          bump_metric(opts, "llm_proxy_empty_completion_retry")
+          do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left - 1)
+        else
+          result
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp empty_assistant_completion?(%{"choices" => [first | _]}) when is_map(first) do
+    message = Map.get(first, "message")
+
+    is_map(message) and blank_content?(Map.get(message, "content")) and
+      not has_tool_call?(message)
+  end
+
+  defp empty_assistant_completion?(_), do: false
+
+  defp blank_content?(nil), do: true
+  defp blank_content?(content) when is_binary(content), do: String.trim(content) == ""
+  defp blank_content?(_), do: false
+
+  defp has_tool_call?(%{"tool_calls" => calls}) when is_list(calls), do: calls != []
+  defp has_tool_call?(%{"function_call" => call}) when is_map(call), do: map_size(call) > 0
+  defp has_tool_call?(_), do: false
+
   defp call_with_retry(upstream, body, headers, opts, retries_left) do
     case upstream.(body, headers, opts) do
       {:error, {:curl, code}} when code in [6, 7] and retries_left > 0 ->
