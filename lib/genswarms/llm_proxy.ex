@@ -61,6 +61,7 @@ defmodule Genswarms.LlmProxy do
   require Logger
 
   @state_name __MODULE__.State
+  @bandit_name __MODULE__.Bandit
   @default_port 4318
   @default_daily_limit "0.50"
 
@@ -101,7 +102,12 @@ defmodule Genswarms.LlmProxy do
       swarm_name: Map.get(config, :swarm_name, "swarm"),
       sender: Map.get(config, :sender, :sender),
       metrics: Map.get(config, :metrics, :metrics),
-      upstream_timeout_s: Map.get(config, :upstream_timeout_s, 120),
+      upstream_timeout_s:
+        Map.get(config, :upstream_timeout_s) ||
+          (case Map.get(config, :upstream_timeout_ms) do
+             ms when is_integer(ms) and ms > 0 -> max(div(ms, 1000), 1)
+             _ -> 120
+           end),
       connect_timeout_s: Map.get(config, :connect_timeout_s, 10),
       stream_timeout_s: Map.get(config, :stream_timeout_s, 300),
       allow_streaming: Map.get(config, :allow_streaming, false),
@@ -120,33 +126,19 @@ defmodule Genswarms.LlmProxy do
     # A loopback port race (two boots, or a leftover listener) must NOT crash the
     # object at boot — mirror webhook.ex / run_live's dashboard guard: accept an
     # already-started listener and log-and-continue on any other start error.
+    # mm hardening: a NAMED listener + whereis-first — a double init (or a
+    # leftover) must reuse the running listener, never bind twice (the second
+    # Bandit.start_link would exit-signal the caller through the link).
     bandit =
-      case Bandit.start_link(
-             plug: {__MODULE__.Plug, plug_opts},
-             scheme: :http,
-             ip: {127, 0, 0, 1},
-             port: port
-           ) do
-        {:ok, pid} ->
-          pid
+      case Process.whereis(@bandit_name) do
+        running when is_pid(running) ->
+          Logger.info("llm_proxy: Bandit listener already running (#{inspect(running)})")
+          running
 
-        {:error, {:already_started, pid}} ->
-          Logger.info("llm_proxy: Bandit listener already started on port #{port}")
-          pid
-
-        {:error, reason} ->
-          Logger.warning(
-            Genswarms.LlmProxy.Plug.sanitize_log(
-              Genswarms.LlmProxy.Plug.scrub_secret(
-                "llm_proxy: Bandit listener did not start on port #{port}: #{inspect(reason)} " <>
-                  "(proxy endpoint unavailable; bot unaffected)",
-                plug_opts.upstream_api_key
-              )
-            )
-          )
-
-          nil
+        _ ->
+          start_bandit_once(plug_opts, port)
       end
+
 
     {:ok,
      %{
@@ -203,6 +195,43 @@ defmodule Genswarms.LlmProxy do
     if Process.alive?(state.state_pid), do: Agent.stop(state.state_pid)
     :ok
   end
+  defp start_bandit_once(plug_opts, port) do
+    case Bandit.start_link(
+           plug: {__MODULE__.Plug, plug_opts},
+           scheme: :http,
+           ip: {127, 0, 0, 1},
+           port: port
+         ) do
+      {:ok, pid} ->
+        try do
+          Process.register(pid, @bandit_name)
+        rescue
+          # register race (another init won): keep OUR pid — both serve the port? No:
+          # ours bound the socket; the name is best-effort discovery, not identity.
+          ArgumentError -> :ok
+        end
+
+        pid
+
+      {:error, {:already_started, pid}} ->
+        Logger.info("llm_proxy: Bandit listener already started on port #{port}")
+        pid
+
+      {:error, reason} ->
+        Logger.warning(
+          Genswarms.LlmProxy.Plug.sanitize_log(
+            Genswarms.LlmProxy.Plug.scrub_secret(
+              "llm_proxy: Bandit listener did not start on port #{port}: #{inspect(reason)} " <>
+                "(proxy endpoint unavailable; bot unaffected)",
+              plug_opts.upstream_api_key
+            )
+          )
+        )
+
+        nil
+    end
+  end
+
 
   def endpoint(port), do: "http://127.0.0.1:#{port}/v1/chat/completions"
 
@@ -424,9 +453,27 @@ defmodule Genswarms.LlmProxy do
 
   defp quota_status(%{"conversation_id" => cid} = msg, state)
        when is_binary(cid) and cid != "" do
-    quota = Map.get(state, :quota, %{})
+    # Tolerate both host state shapes: everything under :quota (wingston lineage)
+    # or store_mod/default_daily_limit at the top level with a *_usd global key
+    # (mm lineage). The message may pin an explicit "day" (ISO) — mm's commands do.
+    quota =
+      state
+      |> Map.get(:quota, %{})
+      |> Map.put_new(:store_mod, Map.get(state, :store_mod))
+      |> Map.put_new(:default_daily_limit, Map.get(state, :default_daily_limit, @default_daily_limit))
+      |> then(fn q ->
+        if Map.has_key?(q, :global_daily_limit),
+          do: q,
+          else: Map.put(q, :global_daily_limit, Map.get(q, :global_daily_limit_usd, Decimal.new("0")))
+      end)
+
     clock = Map.get(quota, :clock, fn -> DateTime.utc_now() end)
-    day = clock.() |> utc_day()
+
+    day =
+      case Date.from_iso8601(to_string(Map.get(msg, "day") || "")) do
+        {:ok, d} -> d
+        _ -> clock.() |> utc_day()
+      end
     kind = Map.get(msg, "kind") || dm_kind(Map.get(quota, :dm_module), cid)
     workspace_key = Map.get(msg, "workspace_key") || "default"
 
@@ -472,9 +519,37 @@ defmodule Genswarms.LlmProxy do
         used_usd: money(global_used),
         limit_usd: money(global_limit),
         pct: pct_decimal(global_used, global_limit)
+      },
+      # mm vocabulary: the same numbers nested under "quota" with 2dp money strings
+      # and a human reset stamp — both host lineages' consumers keep working.
+      quota: %{
+        budget: %{
+          spent_usd: money2(Map.get(usage, :spent_usd, Decimal.new("0"))),
+          limit_usd: money2(Map.get(usage, :limit_usd, default_limit)),
+          remaining_usd:
+            money2(
+              Decimal.max(
+                Decimal.sub(
+                  Map.get(usage, :limit_usd, default_limit),
+                  Map.get(usage, :spent_usd, Decimal.new("0"))
+                ),
+                Decimal.new("0")
+              )
+            )
+        },
+        requests: %{
+          used: requests_used,
+          limit: request_limit,
+          remaining: quota_remaining(requests_used, request_limit)
+        },
+        global: %{spent_usd: money2(global_used), limit_usd: money2(global_limit)},
+        reset_at: "#{Date.to_iso8601(Date.add(day, 1))} 00:00 UTC"
       }
     }
   end
+
+  defp money2(value), do: value |> decimal() |> Decimal.round(2) |> Decimal.to_string(:normal)
+
 
   defp quota_status(msg, _state) do
     %{
@@ -504,6 +579,10 @@ defmodule Genswarms.LlmProxy do
           is_atom(store_mod) and Code.ensure_loaded?(store_mod) and
               function_exported?(store_mod, :llm_usage_for_budget, 3) ->
             store_mod.llm_usage_for_budget(budget_identity, day, default_limit)
+
+          is_atom(store_mod) and Code.ensure_loaded?(store_mod) and
+              function_exported?(store_mod, :llm_budget_usage, 2) ->
+            store_mod.llm_budget_usage(budget_identity, day)
 
           true ->
             nil
@@ -634,6 +713,13 @@ defmodule Genswarms.LlmProxy do
     totals = dashboard_totals(usage_rows)
 
     %{
+      # mm vocabulary: uncapped budget count + requests at "llm_proxy" (the table
+      # below stays capped at 100 rows for display — count and display differ).
+      "llm_proxy" => %{
+        "budgets" => length(usage_rows),
+        "requests" => totals.requests,
+        "spent_usd" => money(totals.spent_usd)
+      },
       "proxy_router" => %{
         "day" => Date.to_iso8601(day),
         "source" => source,
@@ -655,6 +741,7 @@ defmodule Genswarms.LlmProxy do
               "meta" => source,
               "items" => [
                 %{"label" => "Users", "value" => length(rows)},
+                %{"label" => "Budgets", "value" => length(usage_rows)},
                 %{"label" => "Spend", "value" => "$" <> money(totals.spent_usd)},
                 %{"label" => "Requests", "value" => totals.requests},
                 %{"label" => "Tokens", "value" => totals.total_tokens},
@@ -681,11 +768,56 @@ defmodule Genswarms.LlmProxy do
               ],
               "rows" => rows
             }
-          ]
+          ] ++ List.wrap(model_section(dashboard_model_rows(Keyword.get(opts, :store_mod), day)))
         }
       ]
     }
   end
+  # Per-model breakdown (ported from mm's dashboard-llm-telemetry): durable only —
+  # aggregated by the store's llm_usage_by_model/1; nil (section omitted) when the
+  # store doesn't export it or has no per-model data.
+  defp dashboard_model_rows(store_mod, day) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_usage_by_model, 1) do
+      store_mod.llm_usage_by_model(day)
+    else
+      []
+    end
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp model_section([]), do: nil
+
+  defp model_section(model_rows) do
+    rows =
+      Enum.map(model_rows, fn row ->
+        %{
+          "model" => to_string(Map.get(row, :model) || ""),
+          "spent" => "$" <> money(Map.get(row, :spent_usd)),
+          "tokens" => Map.get(row, :total_tokens, 0),
+          "cache" => cache_rate(Map.get(row, :cached_tokens), Map.get(row, :prompt_tokens)),
+          "calls" => Map.get(row, :calls, 0)
+        }
+      end)
+
+    %{
+      "type" => "table",
+      "title" => "By model",
+      "meta" => "spend / tokens / cache per served model",
+      "columns" => [
+        %{"key" => "model", "label" => "model", "mono" => true},
+        %{"key" => "spent", "label" => "spent", "align" => "right"},
+        %{"key" => "tokens", "label" => "tokens", "align" => "right"},
+        %{"key" => "cache", "label" => "cache", "align" => "right"},
+        %{"key" => "calls", "label" => "calls", "align" => "right"}
+      ],
+      "rows" => rows
+    }
+  end
+
 
   def fallback_budget_status(pid \\ @state_name, session, day, session_id, default_limit) do
     Agent.get_and_update(pid, fn state ->
@@ -1057,7 +1189,9 @@ defmodule Genswarms.LlmProxy do
       not finite_decimal?(d) -> {Decimal.new(0), true}
       Decimal.compare(d, 0) == :lt -> {Decimal.new(0), false}
       Decimal.compare(d, @nineteen_nines) == :gt -> {@nineteen_nines, true}
-      true -> {Decimal.round(d, 9), false}
+      # normalize: strip the trailing zeros round-to-9 introduces (0.000123000) so
+      # value-equal costs are struct-equal across hosts (mm rows pin this).
+      true -> {d |> Decimal.round(9) |> Decimal.normalize(), false}
     end
   end
 
@@ -1333,8 +1467,17 @@ defmodule Genswarms.LlmProxy.Plug do
   # or test that builds plug opts directly must never leak the raw key through
   # inspect/crash reports (mm hardening; wrap is idempotent).
   def init(opts) do
-    opts |> Map.new() |> Map.update(:upstream_api_key, nil, &Genswarms.LlmProxy.Secret.wrap/1)
+    opts |> Map.new() |> Map.update(:upstream_api_key, nil, &Genswarms.LlmProxy.Secret.wrap/1) |> normalize_timeout()
   end
+
+  # Accept the mm-lineage :upstream_timeout_ms knob on plug opts too (converted
+  # once here; the transport reads seconds).
+  defp normalize_timeout(%{upstream_timeout_s: _} = opts), do: opts
+
+  defp normalize_timeout(%{upstream_timeout_ms: ms} = opts) when is_integer(ms) and ms > 0,
+    do: Map.put(opts, :upstream_timeout_s, max(div(ms, 1000), 1))
+
+  defp normalize_timeout(opts), do: opts
 
   @impl Plug
   def call(conn, opts) do
@@ -1386,6 +1529,30 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   def bump_metric(_opts, _key), do: :ok
+
+  # Structured, durable quota metric (mm contract): if the host store exports
+  # bump_metric/3, record the block with tags — coexists with the flat object
+  # counter above (wingston stores without bump_metric/3 no-op here).
+  defp bump_quota_metric(opts, session, reason) do
+    store_mod = Map.get(opts, :store_mod)
+
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :bump_metric, 3) do
+      store_mod.bump_metric(
+        "llm_proxy.quota_blocked",
+        %{reason: reason, kind: session.kind, provider: opts.provider},
+        1
+      )
+    end
+
+    :ok
+  rescue
+    e ->
+      Logger.warning("llm_proxy: quota metric store failed: " <> Exception.message(e))
+      :ok
+  catch
+    _, _ -> :ok
+  end
 
   # Replaces the literal `key` (if binary and non-empty) and sk-…/Bearer …-shaped
   # substrings with [REDACTED]. Protects upstream secrets from leaking into logs.
@@ -1600,10 +1767,26 @@ defmodule Genswarms.LlmProxy.Plug do
   # Ported with the empty-retry feature from micro-markets: every discarded
   # blank attempt is a REAL upstream call — bill it (status "empty_retry").
   defp record_discarded_attempts(_opts, _session, _request_ctx, _request, spent, []), do: spent
+  # Hostile/garbage upstream token counts ("many", lists, maps) normalize to 0
+  # BEFORE any consumer — cost, x_router, and the durable record all see ints
+  # (mm hardening; a poisoned count must never crash a host store).
+  defp normalize_usage_counts(usage) when is_map(usage) do
+    Map.merge(usage, %{
+      "prompt_tokens" => nonneg_int(Map.get(usage, "prompt_tokens")),
+      "completion_tokens" => nonneg_int(Map.get(usage, "completion_tokens")),
+      "total_tokens" => nonneg_int(Map.get(usage, "total_tokens"))
+    })
+  end
+
+  defp normalize_usage_counts(_), do: %{"prompt_tokens" => 0, "completion_tokens" => 0, "total_tokens" => 0}
+
+  defp nonneg_int(v) when is_integer(v) and v >= 0, do: v
+  defp nonneg_int(_), do: 0
+
 
   defp record_discarded_attempts(opts, session, request_ctx, request, spent_before, discarded) do
     Enum.reduce(discarded, spent_before, fn %{body: body}, spent ->
-      usage = Map.get(body, "usage") || %{}
+      usage = normalize_usage_counts(Map.get(body, "usage") || %{})
       upstream_router = upstream_router(Map.get(body, "x_router"))
       model = served_model(upstream_router, body, request)
       {cost, _invalid?} = executed_cost_usd(usage, opts.prices, upstream_router, spent, opts.margin_pct)
@@ -1889,6 +2072,14 @@ defmodule Genswarms.LlmProxy.Plug do
     Decimal.compare(limit, 0) == :gt and
       Decimal.compare(global_spent(opts, request_ctx.day), limit) != :lt
   end
+  # mm vocabulary: the global block carries the ceiling's numbers in x_router.global.
+  defp global_status(opts, request_ctx) do
+    %{
+      spent_usd: global_spent(opts, request_ctx.day),
+      limit_usd: Map.get(opts, :global_daily_limit, Decimal.new("0"))
+    }
+  end
+
 
   defp global_spent(opts, day) do
     pg = global_spent_pg(opts, day)
@@ -1908,6 +2099,7 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp budget_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
+    bump_quota_metric(opts, session, "budget_exhausted")
     notice = budget_notice(request_ctx, budget)
 
     msg =
@@ -1934,6 +2126,7 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp request_quota_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
+    bump_quota_metric(opts, session, "request_quota_exhausted")
     limit = request_quota_limit(opts)
     notice = request_quota_notice(request_ctx, limit)
 
@@ -1957,7 +2150,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
-  @global_notice "⏳ The assistant reached its daily service budget. Please try again tomorrow at 00:00 UTC. 🪶"
+  @global_notice "⏳ The service daily LLM budget is exhausted. Please try again tomorrow at 00:00 UTC. 🪶"
 
   # Operator-wide ceiling block. Mirrors budget_exhausted_response: deterministic Telegram
   # notice (once per conversation per UTC day), a durable block metric the operator can ALERT
@@ -1971,6 +2164,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     bump_metric(opts, "llm_proxy_global_block")
+    bump_quota_metric(opts, session, "global_budget_exhausted")
 
     Logger.error(
       "llm_proxy: GLOBAL daily budget ceiling reached — blocking all conversations until 00:00 UTC"
@@ -1979,11 +2173,11 @@ defmodule Genswarms.LlmProxy.Plug do
     if streaming? do
       budget_exhausted_sse(conn, request_ctx)
     else
-      global_exhausted_json(conn, request_ctx, opts)
+      global_exhausted_json(conn, request_ctx, opts, global_status(opts, request_ctx))
     end
   end
 
-  defp global_exhausted_json(conn, request_ctx, opts) do
+  defp global_exhausted_json(conn, request_ctx, opts, global) do
     request_id = request_id()
 
     json(conn, 200, %{
@@ -2010,6 +2204,11 @@ defmodule Genswarms.LlmProxy.Plug do
         "session_id" => request_ctx.session_id,
         "budget_exhausted" => true,
         "global_budget_exhausted" => true,
+        "global" => %{
+          "spent_usd" => Proxy.decimal_to_json_number(global.spent_usd),
+          "limit_usd" => Proxy.decimal_to_json_number(global.limit_usd),
+          "reset_at" => request_ctx.reset_at
+        },
         "reset_at" => request_ctx.reset_at
       }
     })
@@ -2160,6 +2359,11 @@ defmodule Genswarms.LlmProxy.Plug do
         "session_id" => request_ctx.session_id,
         "request_quota_exhausted" => true,
         "requests" => request_count(Map.get(budget, :requests, 0)),
+        "request_quota" => %{
+          "requests" => request_count(Map.get(budget, :requests, 0)),
+          "limit" => limit,
+          "reset_at" => request_ctx.reset_at
+        },
         "request_limit" => limit,
         "reset_at" => request_ctx.reset_at
       }
@@ -2173,7 +2377,7 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp request_quota_notice(request_ctx, _limit) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
-    "⏳ This chat reached today's AI usage limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+    "⏳ This chat reached today's daily LLM request limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
   end
 
   defp record_budget_call(opts, session, request_ctx, record) do
@@ -2222,7 +2426,7 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp respond_upstream(conn, status, body, latency_ms, session, request_ctx, budget, opts)
        when status in 200..299 do
-    usage = Map.get(body, "usage") || %{}
+    usage = normalize_usage_counts(Map.get(body, "usage") || %{})
     upstream_router = upstream_router(Map.get(body, "x_router"))
     model = served_model(upstream_router, body, conn.body_params)
 

@@ -105,8 +105,8 @@ check.(
 {:ok, state2} = boot2
 
 check.(
-  "second init/1 reused the existing state Agent and could NOT take the bound port (bandit == nil)",
-  state2.state_pid == state1.state_pid and state2.bandit == nil
+  "second init/1 reuses BOTH the state Agent and the running listener (mm semantics: whereis-first, never a second bind)",
+  state2.state_pid == state1.state_pid and state2.bandit == state1.bandit and is_pid(state2.bandit)
 )
 
 # ── terminate/2 does not crash (and is total over the nil-bandit / shared-Agent case) ──

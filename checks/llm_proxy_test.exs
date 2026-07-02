@@ -883,7 +883,7 @@ quota_notice? =
   Enum.any?(quota_events_list, fn
     {"wingston", :sender, :llm_proxy,
      %{"action" => "slot_reply", "slot" => "quota_agent", "content" => notice}} ->
-      String.contains?(notice, "AI usage limit")
+      String.contains?(notice, "daily LLM request limit")
 
     _ ->
       false

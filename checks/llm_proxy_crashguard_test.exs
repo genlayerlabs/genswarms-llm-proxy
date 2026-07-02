@@ -95,21 +95,19 @@ end
 
 # ── Test 1: Crash guard — hostile body causes respond_upstream to RAISE ──────
 #
-# Hostile body shape: %{"usage" => "not-a-map", "choices" => 123}
+# Hostile body shape: a 2xx whose decoded JSON body is NOT a map ("hostile" —
+# a bare JSON string decodes fine, so http_upstream CAN yield this).
 #
 # Why it raises in the CURRENT proxy code (not the stub):
-#   respond_upstream/8 (status 200..299 arm) does:
-#     usage = Map.get(body, "usage") || %{}   → "not-a-map" (truthy string)
-#     cost  = executed_cost_usd(usage, ...)   → cost_usd("not-a-map", prices)
-#     cost_usd/2: prompt = usage["prompt_tokens"]
-#                 → Access.get("not-a-map", "prompt_tokens")
-#                 → raises FunctionClauseError (BitString has no Access impl)
+#   respond_upstream/8 (status 200..299 arm) does Map.get(body, "usage") on a
+#   BitString → BadMapError. (The old vector — usage: "not-a-map" — no longer
+#   crashes: normalize_usage_counts coerces garbage counts to 0 by design.)
 # The crash guard must catch this and return 502 without propagating.
 
 Agent.update(metric_captures, fn _ -> [] end)
 
 hostile_upstream = fn _body, _headers, _cfg ->
-  {:ok, 200, %{"usage" => "not-a-map", "choices" => 123}}
+  {:ok, 200, "hostile-not-a-map"}
 end
 
 hostile_conn = post_completions.(cg_token, hostile_upstream)
