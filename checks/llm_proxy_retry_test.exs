@@ -96,7 +96,7 @@ t1 =
 
 check.(
   "1: decode-failure {:error,502,_} NOT retried — counter==1, returns {:ok,502,_,_}",
-  Agent.get(t1_count, & &1) == 1 and match?({:ok, 502, _, _}, t1)
+  Agent.get(t1_count, & &1) == 1 and match?({:ok, 502, _, _, _}, t1)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ t2 =
 
 check.(
   "2: genuine 5xx {:ok,503,_} NOT retried — counter==1, returns {:ok,503,_,_}",
-  Agent.get(t2_count, & &1) == 1 and match?({:ok, 503, _, _}, t2)
+  Agent.get(t2_count, & &1) == 1 and match?({:ok, 503, _, _, _}, t2)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ t3 =
 
 check.(
   "3: {:error,{:curl,7}} retried once, counter==2, returns {:ok,200,_,_}",
-  Agent.get(t3_count, & &1) == 2 and match?({:ok, 200, _, _}, t3)
+  Agent.get(t3_count, & &1) == 2 and match?({:ok, 200, _, _, _}, t3)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ t4 =
 
 check.(
   "4: {:error,{:curl,28}} (post-send) NOT retried — counter==1, returns {:ok,502,_,_}",
-  Agent.get(t4_count, & &1) == 1 and match?({:ok, 502, _, _}, t4)
+  Agent.get(t4_count, & &1) == 1 and match?({:ok, 502, _, _, _}, t4)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -218,7 +218,7 @@ t5 =
 
 check.(
   "5: {:ok,400,_} (4xx) NOT retried — counter==1, returns {:ok,400,_,_}",
-  Agent.get(t5_count, & &1) == 1 and match?({:ok, 400, _, _}, t5)
+  Agent.get(t5_count, & &1) == 1 and match?({:ok, 400, _, _, _}, t5)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -302,7 +302,7 @@ t7 =
     ctx
   )
 
-{:ok, _t7_status, _t7_body, t7_latency_ms} = t7
+{:ok, _t7_status, _t7_body, t7_latency_ms, _t7_discarded} = t7
 
 check.(
   "7: latency_ms is cumulative across attempts — latency_ms ≥ 100 (includes backoff sleep)",

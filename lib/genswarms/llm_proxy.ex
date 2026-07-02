@@ -1255,9 +1255,23 @@ defmodule Genswarms.LlmProxy.Plug do
             end
 
           try do
-            {:ok, upstream_status, upstream_body, latency_ms} =
+            {:ok, upstream_status, upstream_body, latency_ms, discarded_attempts} =
               call_upstream(buffered_body, opts, request_ctx)
 
+
+            # Discarded blank attempts consumed real tokens: record them (status
+            # "empty_retry") and advance the spend BEFORE pricing the final answer.
+            spent_after_discards =
+              record_discarded_attempts(
+                opts,
+                session,
+                request_ctx,
+                conn.body_params,
+                budget.spent_usd || Decimal.new("0"),
+                discarded_attempts
+              )
+
+            budget = Map.put(budget, :spent_usd, spent_after_discards)
             respond_upstream(
               conn,
               upstream_status,
@@ -1315,7 +1329,12 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   @impl Plug
-  def init(opts), do: Map.new(opts)
+  # Secret-wrap the upstream key HERE too (not only in the object init): a host
+  # or test that builds plug opts directly must never leak the raw key through
+  # inspect/crash reports (mm hardening; wrap is idempotent).
+  def init(opts) do
+    opts |> Map.new() |> Map.update(:upstream_api_key, nil, &Genswarms.LlmProxy.Secret.wrap/1)
+  end
 
   @impl Plug
   def call(conn, opts) do
@@ -1439,7 +1458,7 @@ defmodule Genswarms.LlmProxy.Plug do
     # wall-clock time across all attempts, including backoff sleeps.
     started = System.monotonic_time(:millisecond)
 
-    result =
+    {result, discarded} =
       call_with_empty_retry(
         upstream,
         body,
@@ -1452,17 +1471,17 @@ defmodule Genswarms.LlmProxy.Plug do
 
     case result do
       {:ok, status, resp} ->
-        {:ok, status, resp, latency_ms}
+        {:ok, status, resp, latency_ms, discarded}
 
       {:error, status, resp} ->
-        {:ok, status, resp, latency_ms}
+        {:ok, status, resp, latency_ms, discarded}
 
       {:error, reason} ->
         # No bump here: this 502 flows to respond_upstream's non-2xx arm, which bumps
         # llm_proxy_upstream_error exactly once. Bumping here too double-counted transport
         # failures (genuine 5xx and transport-502 must each count once).
         {:ok, 502, %{"error" => %{"message" => inspect(reason), "code" => "upstream_error"}},
-         latency_ms}
+         latency_ms, discarded}
     end
   end
 
@@ -1553,25 +1572,60 @@ defmodule Genswarms.LlmProxy.Plug do
   # times (default 0 — wingston-lineage behavior unchanged unless opted in).
   defp call_with_empty_retry(upstream, body, headers, opts, transport_retries) do
     empties = min(max(Map.get(opts, :empty_completion_retries, 0), 0), 3)
-    do_empty_retry(upstream, body, headers, opts, transport_retries, empties)
+    do_empty_retry(upstream, body, headers, opts, transport_retries, empties, [])
   end
 
-  defp do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left) do
+  # Returns {result, discarded}: every blank 2xx we retried past is kept —
+  # its tokens were consumed upstream, so the caller RECORDS them (status
+  # "empty_retry") against the budget before pricing the final answer.
+  defp do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left, discarded) do
     result = call_with_retry(upstream, body, headers, opts, transport_retries)
 
     case result do
       {:ok, status, resp} when status in 200..299 ->
         if empties_left > 0 and empty_assistant_completion?(resp) do
           bump_metric(opts, "llm_proxy_empty_completion_retry")
-          do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left - 1)
+
+          do_empty_retry(upstream, body, headers, opts, transport_retries, empties_left - 1, [
+            %{status: status, body: resp} | discarded
+          ])
         else
-          result
+          {result, Enum.reverse(discarded)}
         end
 
       other ->
-        other
+        {other, Enum.reverse(discarded)}
     end
   end
+  # Ported with the empty-retry feature from micro-markets: every discarded
+  # blank attempt is a REAL upstream call — bill it (status "empty_retry").
+  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, spent, []), do: spent
+
+  defp record_discarded_attempts(opts, session, request_ctx, request, spent_before, discarded) do
+    Enum.reduce(discarded, spent_before, fn %{body: body}, spent ->
+      usage = Map.get(body, "usage") || %{}
+      upstream_router = upstream_router(Map.get(body, "x_router"))
+      model = served_model(upstream_router, body, request)
+      {cost, _invalid?} = executed_cost_usd(usage, opts.prices, upstream_router, spent, opts.margin_pct)
+      {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+
+      record_budget_call(opts, session, request_ctx, %{
+        request_id: request_id(),
+        model: model,
+        status: "empty_retry",
+        prompt_tokens: usage["prompt_tokens"],
+        completion_tokens: usage["completion_tokens"],
+        total_tokens: usage["total_tokens"],
+        cached_tokens: cached_tokens,
+        non_cached_tokens: non_cached_tokens,
+        cost_usd: cost,
+        provider: Map.get(upstream_router, "provider")
+      })
+
+      Decimal.add(spent, cost)
+    end)
+  end
+
 
   defp empty_assistant_completion?(%{"choices" => [first | _]}) when is_map(first) do
     message = Map.get(first, "message")
