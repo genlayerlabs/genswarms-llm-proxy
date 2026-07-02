@@ -1,0 +1,14 @@
+{
+  "registry": {
+    "scope": "genlayerlabs"
+  },
+  "packages": [
+    {
+      "name": "genswarms-llm-proxy",
+      "dir": ".",
+      "kind": "handler",
+      "description": "LLM metering/budget proxy object: per-conversation daily budgets, global cost ceiling, request quotas, cost/token/cache tracking, opaque agent tokens",
+      "skill": ".claude/skills/genswarms-llm-proxy-use/SKILL.md"
+    }
+  ]
+}
