@@ -1,0 +1,8 @@
+{
+  "module": "Genswarms.LlmProxy",
+  "files": [
+    "lib/genswarms/llm_proxy/curl.ex",
+    "lib/genswarms/llm_proxy/store.ex",
+    "lib/genswarms/llm_proxy.ex"
+  ]
+}
