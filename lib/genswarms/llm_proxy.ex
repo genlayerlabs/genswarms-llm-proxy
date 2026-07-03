@@ -1540,6 +1540,26 @@ defmodule Genswarms.LlmProxy.Plug do
 
   def bump_metric(_opts, _key), do: :ok
 
+  # Display story event (host event canvas). The wire is THIS app's OWN config
+  # key — the proxy never reads another package's app env (dependency
+  # constraint); the default matches the genswarms display convention, so a
+  # host that overrides both app envs (or neither) gets one merged stream.
+  # Must never affect a request: swallows everything, like bump_metric.
+  @doc false
+  def emit_display(meta) when is_map(meta) do
+    wire = Application.get_env(:genswarms_llm_proxy, :display_wire, [:genswarms, :display])
+
+    try do
+      :telemetry.execute(wire, %{}, meta)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    :ok
+  end
+
   # Structured, durable quota metric (mm contract): if the host store exports
   # bump_metric/3, record the block with tags — coexists with the flat object
   # counter above (wingston stores without bump_metric/3 no-op here).
@@ -2038,6 +2058,8 @@ defmodule Genswarms.LlmProxy.Plug do
       )
 
       bump_metric(opts, "llm_proxy_budget_degraded")
+      # one display event per incident (the rescue path above also lands here)
+      emit_display(%{kind: :llm_proxy_degraded, cid: session.conversation_id, path: "budget_status"})
     end
 
     status ||
@@ -2127,6 +2149,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     bump_metric(opts, "llm_proxy_budget_block")
+    emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "budget"})
 
     if streaming? do
       budget_exhausted_sse(conn, request_ctx)
@@ -2152,6 +2175,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     bump_metric(opts, "llm_proxy_request_quota_block")
+    emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "request_quota"})
 
     if streaming? do
       request_quota_exhausted_sse(conn, request_ctx, limit)
@@ -2174,6 +2198,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     bump_metric(opts, "llm_proxy_global_block")
+    emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "global"})
     bump_quota_metric(opts, session, "global_budget_exhausted")
 
     Logger.error(
@@ -2420,6 +2445,8 @@ defmodule Genswarms.LlmProxy.Plug do
       )
 
       bump_metric(opts, "llm_proxy_budget_degraded")
+      # one display event per incident (the rescue path above also lands here)
+      emit_display(%{kind: :llm_proxy_degraded, cid: session.conversation_id, path: "usage_store"})
     end
 
     Proxy.record_usage(opts.state_pid, session, request_ctx.day, request_ctx.session_id, record)
