@@ -682,7 +682,11 @@ defmodule Genswarms.LlmProxy do
     users_by_budget = Keyword.get(opts, :users_by_budget, %{})
     origins_by_budget = Keyword.get(opts, :origins_by_budget, %{})
 
-    if not proxy_state_alive?(state_pid) do
+    # A dead/absent proxy still renders its DURABLE story (today's spend,
+    # per-model breakdown) when a store is provided — a stopped proxy is
+    # exactly when the operator needs the page. Only the live-state overlays
+    # (in-memory usage fallback, live session mapping) go empty.
+    if not proxy_state_alive?(state_pid) and is_nil(Keyword.get(opts, :store_mod)) do
       %{}
     else
       dashboard_extension_for_live_state(
@@ -796,7 +800,7 @@ defmodule Genswarms.LlmProxy do
       Enum.map(model_rows, fn row ->
         %{
           "model" => to_string(Map.get(row, :model) || ""),
-          "spent" => "$" <> money(Map.get(row, :spent_usd)),
+          "spent" => "$" <> money(decimal(Map.get(row, :spent_usd))),
           "tokens" => Map.get(row, :total_tokens, 0),
           "cache" => cache_rate(Map.get(row, :cached_tokens), Map.get(row, :prompt_tokens)),
           "calls" => Map.get(row, :calls, 0)
@@ -878,6 +882,8 @@ defmodule Genswarms.LlmProxy do
     |> collapse_memory_usage()
   rescue
     _ -> []
+  catch
+    _, _ -> []
   end
 
   defp collapse_memory_usage(rows) do
@@ -927,6 +933,8 @@ defmodule Genswarms.LlmProxy do
     end)
   rescue
     _ -> %{}
+  catch
+    _, _ -> %{}
   end
 
   defp proxy_state_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
@@ -946,16 +954,18 @@ defmodule Genswarms.LlmProxy do
     |> Enum.take(100)
     |> Enum.map(fn row ->
       session = Map.get(sessions, row.budget_identity)
+      spent = decimal(Map.get(row, :spent_usd))
+      limit = decimal(Map.get(row, :limit_usd))
 
       %{
         "user" => dashboard_user(row, session, users_by_cid, users_by_budget, origins_by_budget),
         "slot" => (session && session.slot) || "—",
-        "spent" => "$" <> money(row.spent_usd),
-        "limit" => "$" <> money(row.limit_usd),
-        "requests" => row.requests,
-        "tokens" => row.total_tokens,
-        "cache" => cache_rate(row.cached_tokens, row.prompt_tokens),
-        "status" => budget_status(row.spent_usd, row.limit_usd),
+        "spent" => "$" <> money(spent),
+        "limit" => "$" <> money(limit),
+        "requests" => int(Map.get(row, :requests)),
+        "tokens" => int(Map.get(row, :total_tokens)),
+        "cache" => cache_rate(Map.get(row, :cached_tokens), Map.get(row, :prompt_tokens)),
+        "status" => budget_status(spent, limit),
         "budget" => short_budget(row.budget_identity)
       }
     end)
