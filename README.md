@@ -59,6 +59,22 @@ budgets that survive restarts, pass `store_mod:` — any subset of the
 (fail-open: an accounting outage must not take the swarm's LLM path down).
 See `lib/genswarms/llm_proxy/store.ex` for the exact contract.
 
+## Dashboard integration
+
+The proxy is the reference implementation of the swarm-dashboard contract —
+the full three-channel guide is `INTEGRATING.md` in **genswarms-objects**.
+What this package does:
+
+- **Display wire:** `emit_display/1` publishes `llm_proxy_block` (reason:
+  budget/request_quota/global) and `llm_proxy_degraded` on the topic from
+  `Application.get_env(:genswarms_llm_proxy, :display_wire, [:genswarms, :display])`.
+  Note the proxy reads its **own** app env — a host redirecting the wire must
+  set this key *in addition to* `:genswarms_objects`' one.
+- **Probed extension:** `dashboard_extension/1` (`store_mod:` + optional
+  `day/state_pid/users_by_*` opts) returns usage/budget pages in the generic
+  schema-1 page grammar; inert `%{}` without a store.
+- Live emit contract test: `checks/llm_proxy_display_events_test.exs`.
+
 ## Verification
 
 Standalone contract checks (no Postgres, no network — injected seams):
