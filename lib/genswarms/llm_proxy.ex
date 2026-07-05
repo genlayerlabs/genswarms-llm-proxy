@@ -1468,6 +1468,96 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
+  post "/v1/compact" do
+    # Async context seal (subzeroclaw → router /v1/compact). The seal is a REAL
+    # upstream LLM call on the operator's key, so it passes the same three gates as
+    # a chat call; but /v1/compact returns {messages, compacted} with no usage, so
+    # it is recorded as a zero-cost ledger row (model "compact") — that still
+    # advances the per-conversation request quota, so a compact loop is never free.
+    # Block responses are plain JSON (no sender delivery): the agent's splice step
+    # finds no "messages" key and simply skips — compaction degrades silently.
+    opts = conn.private.router_opts
+
+    with {:ok, token} <- bearer(conn),
+         session when not is_nil(session) <-
+           Proxy.lookup_session(opts.state_pid, token),
+         body when is_map(body) <- conn.body_params do
+      request_ctx = request_context(session, opts)
+      budget = budget_status(opts, session, request_ctx)
+
+      cond do
+        global_exhausted?(opts, request_ctx) ->
+          bump_metric(opts, "llm_proxy_compact_block")
+
+          json(conn, 429, %{
+            error: %{
+              message: "operator daily budget exhausted",
+              type: "budget",
+              code: "global_budget_exhausted"
+            }
+          })
+
+        request_quota_exhausted?(opts, budget) ->
+          bump_metric(opts, "llm_proxy_compact_block")
+
+          json(conn, 429, %{
+            error: %{
+              message: "daily request limit reached",
+              type: "budget",
+              code: "request_quota_exhausted"
+            }
+          })
+
+        exhausted?(budget) ->
+          bump_metric(opts, "llm_proxy_compact_block")
+
+          json(conn, 429, %{
+            error: %{
+              message: "daily budget exhausted",
+              type: "budget",
+              code: "budget_exhausted"
+            }
+          })
+
+        true ->
+          bump_metric(opts, "llm_proxy_compact")
+          {status, resp} = compact_upstream(body, opts, request_ctx)
+
+          # status "ok" on success is deliberate: the store's request-quota SQL
+          # only counts status='ok' rows (CASE WHEN status = 'ok'), and a seal
+          # must burn quota. model "compact" keeps it distinguishable in the
+          # ledger; failures record as "compact_error" (visible, quota-free —
+          # same treatment as chat upstream errors).
+          record_budget_call(opts, session, request_ctx, %{
+            request_id: request_id(),
+            model: "compact",
+            status: if(status in 200..299, do: "ok", else: "compact_error")
+          })
+
+          json(conn, status, resp)
+      end
+    else
+      :missing_bearer ->
+        json(conn, 401, %{
+          error: %{message: "missing bearer token", type: "auth", code: "unauthorized"}
+        })
+
+      nil ->
+        json(conn, 401, %{
+          error: %{message: "unknown bearer token", type: "auth", code: "unauthorized"}
+        })
+
+      _ ->
+        json(conn, 400, %{
+          error: %{
+            message: "request body must be a JSON object",
+            type: "invalid_request",
+            code: "invalid_json"
+          }
+        })
+    end
+  end
+
   match _ do
     json(conn, 404, %{error: %{message: "not found", type: "not_found", code: "not_found"}})
   end
@@ -1679,6 +1769,46 @@ defmodule Genswarms.LlmProxy.Plug do
         # failures (genuine 5xx and transport-502 must each count once).
         {:ok, 502, %{"error" => %{"message" => inspect(reason), "code" => "upstream_error"}},
          latency_ms, discarded}
+    end
+  end
+
+  # Forward a /v1/compact body upstream. Reuses the chat transport (same secret
+  # hygiene: bearer + session in a 0600 --config, body in a 0600 tmp file) but
+  # targets the sibling /compact endpoint and skips the chat-only mutations —
+  # no body "session" injection (CompactRequest is a strict schema) and no
+  # prompt-cache marking (the seal deliberately rewrites the aged middle).
+  defp compact_upstream(body, opts, request_ctx) do
+    upstream = Map.get(opts, :upstream, &__MODULE__.http_upstream/3)
+
+    headers = [
+      {"content-type", "application/json"},
+      {"x-unhardcoded-session", request_ctx.session_id}
+    ]
+
+    opts = Map.put(opts, :upstream_endpoint, compact_endpoint(opts.upstream_endpoint))
+
+    case call_with_retry(
+           upstream,
+           body,
+           headers,
+           opts,
+           min(max(Map.get(opts, :max_retries, 1), 0), 3)
+         ) do
+      {:ok, status, resp} -> {status, resp}
+      {:error, status, resp} when is_integer(status) and is_map(resp) -> {status, resp}
+      {:error, reason} -> {502, %{"error" => %{"message" => inspect(reason), "code" => "upstream_error"}}}
+    end
+  end
+
+  # The upstream /v1/compact URL, derived from the configured chat endpoint —
+  # the same derivation subzeroclaw applies to ITS endpoint (compact_url), so
+  # the proxy is transparent: agent hits <proxy>/v1/compact, proxy hits
+  # <upstream>/v1/compact. Exposed @doc false for tests.
+  @doc false
+  def compact_endpoint(chat_endpoint) do
+    case String.split(chat_endpoint, "/chat/completions", parts: 2) do
+      [base, _] -> base <> "/compact"
+      [whole] -> String.trim_trailing(whole, "/") <> "/compact"
     end
   end
 
