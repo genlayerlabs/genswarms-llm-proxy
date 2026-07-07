@@ -34,6 +34,16 @@ defmodule GenswarmsLlmProxyDeadStateExtensionTest do
     assert ext["llm_proxy"]["requests"] == 2
     assert Enum.any?(ext["dashboard_pages"], &(&1["id"] == "proxy-router"))
     assert ext["proxy_router"]["source"] == "postgres"
+
+    # A dead proxy has no live quota Agent to read from — the budget block still
+    # publishes (durable spend + shipped rules) but the ceiling goes inert (0.0)
+    # rather than false-alarming on a config it can no longer see.
+    budget = ext["llm_proxy_budget"]
+    assert budget["v"] == 1
+    assert budget["ceiling_usd"] == 0.0
+    assert budget["spent_usd"] == 0.0012
+    assert budget["default_daily_limit_usd"] == 0.0
+    assert Enum.map(budget["health_rules"], & &1["id"]) == ["budget_guard_75", "budget_guard_90"]
   end
 
   test "dead state and NO store stays empty" do

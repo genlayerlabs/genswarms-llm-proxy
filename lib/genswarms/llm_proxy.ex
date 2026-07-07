@@ -65,6 +65,37 @@ defmodule Genswarms.LlmProxy do
   @default_port 4318
   @default_daily_limit "0.50"
 
+  # Shipped health_rules (v1 structured grammar — see the observability plan) for the
+  # operator-wide daily spend ceiling. Wire contract for the observer's generic rule
+  # evaluator: KEEP byte-identical to the plan's Task 2 Interfaces block. Both rules'
+  # "where" has NO "each" — they evaluate against the "llm_proxy_budget" block itself
+  # (block-relative paths), guarding on ceiling_usd > 0 so a disabled ceiling
+  # (0 = disabled) never false-alarms.
+  @health_rules [
+    %{
+      "id" => "budget_guard_75",
+      "severity" => "info",
+      "card" => "LLM spend at 75% of the daily ceiling",
+      "where" => %{"op" => "gt", "lhs" => %{"path" => "ceiling_usd"}, "rhs" => 0},
+      "when" => %{
+        "op" => "gte",
+        "lhs" => %{"div" => [%{"path" => "spent_usd"}, %{"path" => "ceiling_usd"}]},
+        "rhs" => 0.75
+      }
+    },
+    %{
+      "id" => "budget_guard_90",
+      "severity" => "warn",
+      "card" => "LLM spend at 90% of the daily ceiling — agents hard-block at 100%",
+      "where" => %{"op" => "gt", "lhs" => %{"path" => "ceiling_usd"}, "rhs" => 0},
+      "when" => %{
+        "op" => "gte",
+        "lhs" => %{"div" => [%{"path" => "spent_usd"}, %{"path" => "ceiling_usd"}]},
+        "rhs" => 0.90
+      }
+    }
+  ]
+
   def init(config) do
     port = Map.get(config, :port, @default_port)
 
@@ -122,6 +153,17 @@ defmodule Genswarms.LlmProxy do
           "all agent LLM calls will be blocked by the daily budget"
       )
     end
+
+    # Mirror the ceiling/default-limit config into the state Agent (the same one
+    # dashboard_sessions/2 reads) so the read-only dashboard_extension path — which
+    # only ever sees `state_pid`, never the object's own `quota:`-carrying state —
+    # can publish it. See dashboard_quota/1 below.
+    Agent.update(state_pid, fn s ->
+      Map.put(s, :quota, %{
+        global_daily_limit: plug_opts.global_daily_limit,
+        default_daily_limit: plug_opts.default_daily_limit
+      })
+    end)
 
     # A loopback port race (two boots, or a leftover listener) must NOT crash the
     # object at boot — mirror webhook.ex / run_live's dashboard guard: accept an
@@ -716,6 +758,12 @@ defmodule Genswarms.LlmProxy do
     rows = dashboard_rows(usage_rows, sessions, users_by_cid, users_by_budget, origins_by_budget)
     totals = dashboard_totals(usage_rows)
 
+    quota = dashboard_quota(state_pid)
+    ceiling_usd = quota |> Map.get(:global_daily_limit, Decimal.new("0")) |> decimal() |> Decimal.to_float()
+
+    default_daily_limit_usd =
+      quota |> Map.get(:default_daily_limit, Decimal.new("0")) |> decimal() |> Decimal.to_float()
+
     %{
       # mm vocabulary: uncapped budget count + requests at "llm_proxy" (the table
       # below stays capped at 100 rows for display — count and display differ).
@@ -723,6 +771,16 @@ defmodule Genswarms.LlmProxy do
         "budgets" => length(usage_rows),
         "requests" => totals.requests,
         "spent_usd" => money(totals.spent_usd)
+      },
+      # Machine block (v1) for the observer's generic health_rules evaluator — numeric
+      # twins of the "llm_proxy"/"proxy_router" strings above, PLUS the shipped
+      # budget_guard rules. Additive only: existing keys above are never touched.
+      "llm_proxy_budget" => %{
+        "v" => 1,
+        "ceiling_usd" => ceiling_usd,
+        "spent_usd" => totals.spent_usd |> decimal() |> Decimal.to_float(),
+        "default_daily_limit_usd" => default_daily_limit_usd,
+        "health_rules" => @health_rules
       },
       "proxy_router" => %{
         "day" => Date.to_iso8601(day),
@@ -931,6 +989,17 @@ defmodule Genswarms.LlmProxy do
       |> Map.values()
       |> Map.new(fn session -> {session.budget_identity, session} end)
     end)
+  rescue
+    _ -> %{}
+  catch
+    _, _ -> %{}
+  end
+
+  # Same liveness/timeout guard as dashboard_sessions/1: a dead proxy (durable-only
+  # dashboard path) has nothing live to read, so quota goes empty — the caller
+  # treats a missing key as "disabled/unknown" (0.0), never as a false ceiling.
+  defp dashboard_quota(state_pid) do
+    Agent.get(state_pid, fn state -> Map.get(state, :quota, %{}) end)
   rescue
     _ -> %{}
   catch

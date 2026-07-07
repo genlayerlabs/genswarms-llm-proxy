@@ -587,6 +587,62 @@ check.(
     not String.contains?(dashboard_row["budget"], "tg:123")
 )
 
+budget_health_rules = [
+  %{
+    "id" => "budget_guard_75",
+    "severity" => "info",
+    "card" => "LLM spend at 75% of the daily ceiling",
+    "where" => %{"op" => "gt", "lhs" => %{"path" => "ceiling_usd"}, "rhs" => 0},
+    "when" => %{
+      "op" => "gte",
+      "lhs" => %{"div" => [%{"path" => "spent_usd"}, %{"path" => "ceiling_usd"}]},
+      "rhs" => 0.75
+    }
+  },
+  %{
+    "id" => "budget_guard_90",
+    "severity" => "warn",
+    "card" => "LLM spend at 90% of the daily ceiling — agents hard-block at 100%",
+    "where" => %{"op" => "gt", "lhs" => %{"path" => "ceiling_usd"}, "rhs" => 0},
+    "when" => %{
+      "op" => "gte",
+      "lhs" => %{"div" => [%{"path" => "spent_usd"}, %{"path" => "ceiling_usd"}]},
+      "rhs" => 0.90
+    }
+  }
+]
+
+# A live proxy with an operator-configured global ceiling: the machine block
+# publishes it as a float twin of the existing string-formatted totals.
+Agent.update(state_pid, fn s ->
+  Map.put(s, :quota, %{
+    global_daily_limit: Decimal.new("10"),
+    default_daily_limit: Decimal.new("0.5")
+  })
+end)
+
+budget_dashboard_ext =
+  Proxy.dashboard_extension(
+    state_pid: state_pid,
+    store_mod: nil,
+    day: today,
+    users_by_cid: %{"tg:123:0" => %{handle: "alice", name: "Alice"}}
+  )
+
+budget_block = budget_dashboard_ext["llm_proxy_budget"]
+
+check.(
+  "llm_proxy_budget machine block publishes numeric ceiling/spend/default + the exact shipped health_rules",
+  budget_block["v"] == 1 and
+    budget_block["ceiling_usd"] == 10.0 and
+    budget_block["spent_usd"] == 0.000123 and
+    budget_block["default_daily_limit_usd"] == 0.5 and
+    budget_block["health_rules"] == budget_health_rules and
+    # existing blocks stay untouched (mm vocabulary — additive only)
+    budget_dashboard_ext["llm_proxy"]["spent_usd"] == "0.000123" and
+    budget_dashboard_ext["proxy_router"]["requests"] == 1
+)
+
 {:ok, idle_dashboard_state} = Proxy.start_state_link()
 
 idle_dashboard_ext =
@@ -603,6 +659,13 @@ check.(
   idle_dashboard_ext["proxy_router"]["requests"] == 0 and
     idle_dashboard_page["id"] == "proxy-router" and
     Enum.any?(idle_dashboard_page["sections"], &(&1["type"] == "table" and &1["rows"] == []))
+)
+
+check.(
+  "llm_proxy_budget ceiling defaults to 0.0 (disabled) when no quota was configured on the Agent — the shipped rules stay present, inert via their own where-guard",
+  idle_dashboard_ext["llm_proxy_budget"]["ceiling_usd"] == 0.0 and
+    idle_dashboard_ext["llm_proxy_budget"]["default_daily_limit_usd"] == 0.0 and
+    idle_dashboard_ext["llm_proxy_budget"]["health_rules"] == budget_health_rules
 )
 
 check.(
