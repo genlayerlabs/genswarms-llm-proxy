@@ -75,6 +75,27 @@ What this package does:
   schema-1 page grammar; inert `%{}` without a store.
 - Live emit contract test: `checks/llm_proxy_display_events_test.exs`.
 
+### `llm_proxy_budget` machine block
+
+Alongside the human-facing `"llm_proxy"`/`"proxy_router"` page data, the
+extension also returns `"llm_proxy_budget"` — a machine block (v1) for a
+future observer, not the page renderer:
+
+- `"ceiling_usd"` — the global daily ceiling as a float; `0.0` means the
+  ceiling is disabled.
+- `"spent_usd"` — numeric twin of the display string above (today's spend).
+- `"default_daily_limit_usd"` — the per-conversation default.
+- `"health_rules"` — two shipped `budget_guard` rules (`@health_rules` in
+  `lib/genswarms/llm_proxy.ex`): `budget_guard_75` (info, spend ≥ 75% of
+  ceiling) and `budget_guard_90` (warn, spend ≥ 90%). Both guard on
+  `ceiling_usd > 0`, so a disabled ceiling (proxy dead or `global_daily_limit`
+  unset → `0.0`) makes both rules a no-op rather than a false alarm.
+
+These rules are pure data. Nothing in this repo, or anywhere yet, evaluates
+`health_rules` — there is no generic observer-side rule evaluator. Until a
+host wires one up, `llm_proxy_budget.health_rules` sits inert in the
+dashboard extension like any other unread field.
+
 ## Verification
 
 Standalone contract checks (no Postgres, no network — injected seams):
