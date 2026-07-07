@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.6 - 2026-07-07
 
 - Added `"llm_proxy_budget"` machine block (v1) to `dashboard_extension/1`: numeric
   `ceiling_usd`/`spent_usd`/`default_daily_limit_usd` twins of the existing
