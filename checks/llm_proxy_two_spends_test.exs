@@ -1,0 +1,161 @@
+# TWO spends, deliberately distinct (2026-07-09): what USERS are charged (the
+# operator-SET price — pricing_mode :rate_card_first bills the rate card even
+# when the upstream call was free) vs what the router says the traffic cost
+# (provider_cost_usd per call + the host-synced day estimate on the page).
+#   mix run checks/llm_proxy_two_spends_test.exs
+ExUnit.start()
+
+defmodule RouterCostStore do
+  def llm_router_cost_today, do: %{cost_usd: Decimal.new("0.919472"), estimated: true}
+
+  def llm_usage_days(_days) do
+    [
+      %{
+        day: Date.utc_today(),
+        budgets: 3,
+        requests: 10,
+        prompt_tokens: 1000,
+        total_tokens: 1100,
+        cached_tokens: 0,
+        spent_usd: Decimal.new("0.5"),
+        router_cost_usd: Decimal.new("0.9")
+      },
+      %{
+        day: Date.add(Date.utc_today(), -1),
+        budgets: 1,
+        requests: 5,
+        prompt_tokens: 500,
+        total_tokens: 550,
+        cached_tokens: 0,
+        spent_usd: Decimal.new("0.1"),
+        router_cost_usd: nil
+      }
+    ]
+  end
+end
+
+defmodule NoRouterStore do
+  def list_llm_usage(_limit), do: []
+end
+
+defmodule OneBudgetStore do
+  def list_llm_usage(_limit) do
+    [
+      %{
+        budget_identity: "llmb_x",
+        day: Date.utc_today(),
+        session_id: "llms_x",
+        spent_usd: Decimal.new("0.01"),
+        limit_usd: Decimal.new("0.50"),
+        requests: 2,
+        prompt_tokens: 120,
+        completion_tokens: 30,
+        total_tokens: 150,
+        cached_tokens: 40
+      }
+    ]
+  end
+end
+
+defmodule GenswarmsLlmProxyTwoSpendsTest do
+  use ExUnit.Case, async: false
+  alias Genswarms.LlmProxy, as: Proxy
+  alias Genswarms.LlmProxy.Plug, as: ProxyPlug
+
+  @usage %{"prompt_tokens" => 1_000_000, "completion_tokens" => 0, "total_tokens" => 1_000_000}
+  @prices %{prompt_per_mtok: 2.0, completion_per_mtok: 10.0}
+
+  defp opts(mode), do: %{prices: @prices, margin_pct: 0, pricing_mode: mode}
+
+  test "rate_card_first: the SET price bills even when the router call was free" do
+    {charge, false} =
+      ProxyPlug.executed_cost_usd(@usage, opts(:rate_card_first), %{"cost_usd" => 0}, nil)
+
+    assert Decimal.equal?(charge, Decimal.new("2"))
+
+    # ... and even when the router reports a REAL (different) cost
+    {charge2, false} =
+      ProxyPlug.executed_cost_usd(@usage, opts(:rate_card_first), %{"cost_usd" => 0.3}, nil)
+
+    assert Decimal.equal?(charge2, Decimal.new("2"))
+  end
+
+  test "provider_first (default) keeps legacy cost-plus: router cost wins as the basis" do
+    {charge, false} =
+      ProxyPlug.executed_cost_usd(@usage, opts(:provider_first), %{"cost_usd" => 0.3}, nil)
+
+    assert Decimal.equal?(charge, Decimal.new("0.3"))
+  end
+
+  test "provider_cost_usd records the router's own number verbatim (0 for absent/free)" do
+    assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => 0.3}), Decimal.new("0.3"))
+    assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{}), Decimal.new("0"))
+    assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => "junk"}), Decimal.new("0"))
+  end
+
+  test "pricing_mode config normalizes atoms and JSON-IR strings, defaults legacy" do
+    assert Proxy.pricing_mode(:rate_card_first) == :rate_card_first
+    assert Proxy.pricing_mode("rate_card_first") == :rate_card_first
+    assert Proxy.pricing_mode("anything") == :provider_first
+    assert Proxy.pricing_mode(nil) == :provider_first
+  end
+
+  # ── page: both numbers, clearly labeled ─────────────────────────────────────
+
+  defp dead_state do
+    {:ok, sp} =
+      Agent.start(fn -> %{sessions: %{}, usage: %{}, notified: MapSet.new(), global: %{}} end)
+
+    sp
+  end
+
+  defp page(ext), do: Enum.find(ext["dashboard_pages"], &(&1["id"] == "proxy-router"))
+
+  test "Today shows User spend AND the host-synced Router cost tile" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RouterCostStore)
+    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
+    labels = Enum.map(today["items"], & &1["label"])
+
+    assert "User spend" in labels
+    assert "Router cost" in labels
+    router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
+    assert router["value"] == "$0.919472"
+    assert router["sub"] == "router estimate"
+    refute "Spend" in labels
+  end
+
+  test "a store without llm_router_cost_today/0 contributes no Router-cost tile" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: NoRouterStore)
+    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
+    refute Enum.any?(today["items"], &(&1["label"] == "Router cost"))
+  end
+
+  test "Users rows carry _cid metadata (never a column) for the dashboard's inspector" do
+    ext =
+      Proxy.dashboard_extension(
+        state_pid: dead_state(),
+        store_mod: OneBudgetStore,
+        origins_by_budget: %{"llmb_x" => %{conversation_id: "tg:9:0", kind: "dm"}}
+      )
+
+    users = Enum.find(page(ext)["sections"], &(&1["title"] == "Users"))
+    [row] = users["rows"]
+
+    assert row["_cid"] == "tg:9:0"
+    refute Enum.any?(users["columns"], &(&1["key"] == "_cid"))
+  end
+
+  test "History grows a router column when any day carries router_cost_usd" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RouterCostStore)
+    hist = Enum.find(page(ext)["sections"], &String.starts_with?(&1["title"] || "", "History"))
+
+    assert Enum.any?(hist["columns"], &(&1["key"] == "router"))
+    assert Enum.any?(hist["columns"], &(&1["label"] == "user spent"))
+
+    [today_row, yesterday_row] = hist["rows"]
+    assert today_row["router"] == "$0.900000"
+    assert today_row["spent"] == "$0.500000"
+    # a day the host has no router estimate for renders an em-dash, not $0
+    assert yesterday_row["router"] == "—"
+  end
+end

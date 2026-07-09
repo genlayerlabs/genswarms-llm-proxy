@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.8 - 2026-07-09
+
+- TWO spends, deliberately distinct. New `pricing_mode:` config —
+  `:rate_card_first` bills the USER at the operator-set price (`prices:`)
+  regardless of the router's own cost (a free subscription-served call still
+  charges the set price); default `:provider_first` keeps the legacy cost-plus
+  behavior byte-identical. The router's own per-call number is now recorded
+  verbatim as `provider_cost_usd` alongside the charge in every budget record.
+- Proxy-router page: "Spend" tile renamed "User spend"; new "Router cost" tile
+  via the probed host contract `store_mod.llm_router_cost_today/0`
+  (`%{cost_usd, estimated}` — the host syncs its router's usage-API day
+  estimate). History table: "user spent" label + an optional "router" column
+  when day rows carry `:router_cost_usd` (em-dash for days without an
+  estimate, never a fake $0).
+- Users table rows carry `"_cid"` metadata (live session's conversation id,
+  else the persisted budget origin's) — underscore-prefixed row keys are the
+  page grammar's metadata channel: never rendered as a column, usable by the
+  dashboard to open its conversation inspector.
+
 ## 0.2.7 - 2026-07-09
 
 - `register_static_session/2` + `static_sessions:` object config: sessions under
