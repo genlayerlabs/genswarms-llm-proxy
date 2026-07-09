@@ -165,6 +165,41 @@ defmodule Genswarms.LlmProxy do
       })
     end)
 
+    # Static (pre-shared token) sessions: boot-config agents can't mint a token at
+    # lease time — the host generated one and put it in both places (here and the
+    # agent's config[:api_key]). Per-entry rescue: a malformed entry is an ops
+    # mistake worth a warning, never a boot crash.
+    config
+    |> Map.get(:static_sessions, [])
+    |> List.wrap()
+    |> Enum.each(fn attrs ->
+      result =
+        try do
+          if is_map(attrs) do
+            register_static_session(
+              state_pid,
+              Map.put_new(attrs, :store_mod, plug_opts.store_mod)
+            )
+          else
+            {:error, :not_a_map}
+          end
+        rescue
+          e -> {:error, Exception.message(e)}
+        end
+
+      case result do
+        {:ok, _token} ->
+          Logger.info(
+            "llm_proxy: static session registered for #{inspect(is_map(attrs) && Map.get(attrs, :conversation_id))}"
+          )
+
+        {:error, reason} ->
+          Logger.warning(
+            "llm_proxy: static session REJECTED (#{inspect(reason)}) for #{inspect(is_map(attrs) && Map.get(attrs, :conversation_id))}"
+          )
+      end
+    end)
+
     # A loopback port race (two boots, or a leftover listener) must NOT crash the
     # object at boot — mirror webhook.ex / run_live's dashboard guard: accept an
     # already-started listener and log-and-continue on any other start error.
@@ -309,6 +344,30 @@ defmodule Genswarms.LlmProxy do
   end
 
   def register_session(pid \\ @state_name, attrs) when is_map(attrs) do
+    put_session(pid, token(), attrs)
+  end
+
+  @doc """
+  Register a session under a CALLER-SUPPLIED token.
+
+  For static/boot-config agents: their definition is data evaluated before the
+  proxy object exists, so they cannot mint a token at lease time the way pooled
+  spawns do. The host generates one token, hands it to the proxy here (via the
+  object's `static_sessions:` config, which calls this at init) AND to the
+  agent's `config[:api_key]`. Tokens under 24 bytes are rejected — a static
+  credential must never be silently weak.
+  """
+  def register_static_session(pid \\ @state_name, attrs) when is_map(attrs) do
+    token = attrs |> Map.fetch!(:token) |> to_string()
+
+    if byte_size(token) < 24 do
+      {:error, :token_too_short}
+    else
+      put_session(pid, token, Map.delete(attrs, :token))
+    end
+  end
+
+  defp put_session(pid, token, attrs) do
     session = %{
       conversation_id: Map.fetch!(attrs, :conversation_id),
       slot: attrs |> Map.fetch!(:slot) |> to_string(),
@@ -319,8 +378,6 @@ defmodule Genswarms.LlmProxy do
     }
 
     persist_budget_origin(Map.get(attrs, :store_mod), session)
-
-    token = token()
 
     Agent.update(pid, fn state ->
       sessions =
@@ -830,7 +887,11 @@ defmodule Genswarms.LlmProxy do
               ],
               "rows" => rows
             }
-          ] ++ List.wrap(model_section(dashboard_model_rows(Keyword.get(opts, :store_mod), day)))
+          ] ++
+            List.wrap(model_section(dashboard_model_rows(Keyword.get(opts, :store_mod), day))) ++
+            List.wrap(
+              history_section(dashboard_history_rows(Keyword.get(opts, :store_mod), 14))
+            )
         }
       ]
     }
@@ -850,6 +911,59 @@ defmodule Genswarms.LlmProxy do
   catch
     _, _ -> []
   end
+
+  # Durable day history (newest-first) — probed store contract, host-owned SQL:
+  # `store_mod.llm_usage_days/1` returns day aggregates across ALL budgets
+  # (%{day, budgets, requests, prompt_tokens, total_tokens, cached_tokens,
+  # spent_usd}). Same fail-open discipline as the By-model section: an absent
+  # function or a raising store contributes nothing, never a crashed snapshot.
+  defp dashboard_history_rows(store_mod, days) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_usage_days, 1) do
+      store_mod.llm_usage_days(days)
+    else
+      []
+    end
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp history_section([]), do: nil
+  defp history_section(rows) when not is_list(rows), do: nil
+
+  defp history_section(rows) do
+    rows =
+      Enum.map(rows, fn row ->
+        %{
+          "day" => row |> Map.get(:day) |> day_label(),
+          "budgets" => Map.get(row, :budgets, 0),
+          "req" => Map.get(row, :requests, 0),
+          "tokens" => Map.get(row, :total_tokens, 0),
+          "cache" => cache_rate(Map.get(row, :cached_tokens), Map.get(row, :prompt_tokens)),
+          "spent" => "$" <> money(decimal(Map.get(row, :spent_usd)))
+        }
+      end)
+
+    %{
+      "type" => "table",
+      "title" => "History · last #{length(rows)} days",
+      "meta" => "durable day totals across all budgets — survives restarts",
+      "columns" => [
+        %{"key" => "day", "label" => "day", "mono" => true},
+        %{"key" => "budgets", "label" => "budgets", "align" => "right"},
+        %{"key" => "req", "label" => "req", "align" => "right"},
+        %{"key" => "tokens", "label" => "tokens", "align" => "right"},
+        %{"key" => "cache", "label" => "cache", "align" => "right"},
+        %{"key" => "spent", "label" => "spent", "align" => "right"}
+      ],
+      "rows" => rows
+    }
+  end
+
+  defp day_label(%Date{} = d), do: Date.to_iso8601(d)
+  defp day_label(other), do: to_string(other || "")
 
   defp model_section([]), do: nil
 
