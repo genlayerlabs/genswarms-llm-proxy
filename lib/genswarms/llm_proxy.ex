@@ -119,6 +119,10 @@ defmodule Genswarms.LlmProxy do
       provider: Map.get(config, :provider, "openai-compatible"),
       prices: Map.get(config, :prices, %{}),
       margin_pct: Map.get(config, :margin_pct, 0),
+      # :provider_first (default, legacy cost-plus) | :rate_card_first (the user
+      # charge is the operator-SET price even when the upstream call was free;
+      # the router's own cost is recorded separately as provider_cost_usd).
+      pricing_mode: pricing_mode(Map.get(config, :pricing_mode)),
       store_mod: module_ref(Map.get(config, :store_mod)),
       default_daily_limit: decimal(Map.get(config, :default_daily_limit, @default_daily_limit)),
       # Operator-wide daily USD ceiling across ALL conversations (0 = disabled). Per-conversation
@@ -266,6 +270,12 @@ defmodule Genswarms.LlmProxy do
         {:noreply, state}
     end
   end
+
+  # Config (atom or string, e.g. from JSON IR) → the pricing-mode atom; anything
+  # unrecognized stays on the legacy default.
+  @doc false
+  def pricing_mode(v) when v in [:rate_card_first, "rate_card_first"], do: :rate_card_first
+  def pricing_mode(_), do: :provider_first
 
   def terminate(_reason, state) do
     if is_pid(state.bandit) and Process.alive?(state.bandit), do: GenServer.stop(state.bandit)
@@ -858,17 +868,24 @@ defmodule Genswarms.LlmProxy do
               "type" => "metrics",
               "title" => "Today",
               "meta" => source,
-              "items" => [
-                %{"label" => "Users", "value" => length(rows)},
-                %{"label" => "Budgets", "value" => length(usage_rows)},
-                %{"label" => "Spend", "value" => "$" <> money(totals.spent_usd)},
-                %{"label" => "Requests", "value" => totals.requests},
-                %{"label" => "Tokens", "value" => totals.total_tokens},
-                %{
-                  "label" => "Cache",
-                  "value" => cache_rate(totals.cached_tokens, totals.prompt_tokens)
-                }
-              ]
+              "items" =>
+                [
+                  %{"label" => "Users", "value" => length(rows)},
+                  %{"label" => "Budgets", "value" => length(usage_rows)},
+                  # TWO spends, deliberately distinct: what USERS were charged
+                  # (operator-set price) vs what the router says the traffic
+                  # cost (synced day estimate — probed host contract below).
+                  %{"label" => "User spend", "value" => "$" <> money(totals.spent_usd)}
+                ] ++
+                  List.wrap(router_cost_item(Keyword.get(opts, :store_mod))) ++
+                  [
+                    %{"label" => "Requests", "value" => totals.requests},
+                    %{"label" => "Tokens", "value" => totals.total_tokens},
+                    %{
+                      "label" => "Cache",
+                      "value" => cache_rate(totals.cached_tokens, totals.prompt_tokens)
+                    }
+                  ]
             },
             %{
               "type" => "table",
@@ -877,7 +894,7 @@ defmodule Genswarms.LlmProxy do
               "columns" => [
                 %{"key" => "user", "label" => "user"},
                 %{"key" => "slot", "label" => "slot", "mono" => true},
-                %{"key" => "spent", "label" => "spent", "align" => "right"},
+                %{"key" => "spent", "label" => "user spent", "align" => "right"},
                 %{"key" => "limit", "label" => "limit", "align" => "right"},
                 %{"key" => "requests", "label" => "req", "align" => "right"},
                 %{"key" => "tokens", "label" => "tokens", "align" => "right"},
@@ -912,6 +929,32 @@ defmodule Genswarms.LlmProxy do
     _, _ -> []
   end
 
+  # Today's router-side cost — probed host contract `store_mod.llm_router_cost_today/0`
+  # returning %{cost_usd: Decimal-able, estimated: boolean} | nil. The host owns the
+  # sync from its router's usage API; an absent function/row contributes no tile.
+  defp router_cost_item(store_mod) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_router_cost_today, 0) do
+      case store_mod.llm_router_cost_today() do
+        %{cost_usd: cost} = row ->
+          %{
+            "label" => "Router cost",
+            "value" => "$" <> money(decimal(cost)),
+            "sub" => if(Map.get(row, :estimated, true), do: "router estimate", else: nil)
+          }
+
+        _ ->
+          nil
+      end
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
   # Durable day history (newest-first) — probed store contract, host-owned SQL:
   # `store_mod.llm_usage_days/1` returns day aggregates across ALL budgets
   # (%{day, budgets, requests, prompt_tokens, total_tokens, cached_tokens,
@@ -933,10 +976,15 @@ defmodule Genswarms.LlmProxy do
   defp history_section([]), do: nil
   defp history_section(rows) when not is_list(rows), do: nil
 
-  defp history_section(rows) do
+  defp history_section(day_rows) do
+    # Both spends when the host supplies them: "user spent" (operator-set price,
+    # summed from per-budget accounting) and "router" (the day estimate the host
+    # synced from its router's usage API — optional :router_cost_usd).
+    with_router? = Enum.any?(day_rows, &(not is_nil(Map.get(&1, :router_cost_usd))))
+
     rows =
-      Enum.map(rows, fn row ->
-        %{
+      Enum.map(day_rows, fn row ->
+        base = %{
           "day" => row |> Map.get(:day) |> day_label(),
           "budgets" => Map.get(row, :budgets, 0),
           "req" => Map.get(row, :requests, 0),
@@ -944,20 +992,39 @@ defmodule Genswarms.LlmProxy do
           "cache" => cache_rate(Map.get(row, :cached_tokens), Map.get(row, :prompt_tokens)),
           "spent" => "$" <> money(decimal(Map.get(row, :spent_usd)))
         }
+
+        if with_router? do
+          Map.put(
+            base,
+            "router",
+            case Map.get(row, :router_cost_usd) do
+              nil -> "—"
+              cost -> "$" <> money(decimal(cost))
+            end
+          )
+        else
+          base
+        end
       end)
+
+    router_col =
+      if with_router?,
+        do: [%{"key" => "router", "label" => "router", "align" => "right"}],
+        else: []
 
     %{
       "type" => "table",
       "title" => "History · last #{length(rows)} days",
       "meta" => "durable day totals across all budgets — survives restarts",
-      "columns" => [
-        %{"key" => "day", "label" => "day", "mono" => true},
-        %{"key" => "budgets", "label" => "budgets", "align" => "right"},
-        %{"key" => "req", "label" => "req", "align" => "right"},
-        %{"key" => "tokens", "label" => "tokens", "align" => "right"},
-        %{"key" => "cache", "label" => "cache", "align" => "right"},
-        %{"key" => "spent", "label" => "spent", "align" => "right"}
-      ],
+      "columns" =>
+        [
+          %{"key" => "day", "label" => "day", "mono" => true},
+          %{"key" => "budgets", "label" => "budgets", "align" => "right"},
+          %{"key" => "req", "label" => "req", "align" => "right"},
+          %{"key" => "tokens", "label" => "tokens", "align" => "right"},
+          %{"key" => "cache", "label" => "cache", "align" => "right"},
+          %{"key" => "spent", "label" => "user spent", "align" => "right"}
+        ] ++ router_col,
       "rows" => rows
     }
   end
@@ -1151,7 +1218,22 @@ defmodule Genswarms.LlmProxy do
         "status" => budget_status(spent, limit),
         "budget" => short_budget(row.budget_identity)
       }
+      # NOT a column: the conversation id behind this budget, when known (live
+      # session, else the persisted origin). Underscore-prefixed row keys are
+      # the page grammar's metadata channel — the dashboard renders only
+      # declared columns and may use "_cid" to open its conversation inspector.
+      |> put_row_cid(session, Map.get(origins_by_budget, row.budget_identity))
     end)
+  end
+
+  defp put_row_cid(row, %{conversation_id: cid}, _origin) when is_binary(cid) and cid != "",
+    do: Map.put(row, "_cid", cid)
+
+  defp put_row_cid(row, _session, origin) do
+    case get_any(origin || %{}, :conversation_id) do
+      cid when is_binary(cid) and cid != "" -> Map.put(row, "_cid", cid)
+      _ -> row
+    end
   end
 
   defp dashboard_totals(rows) do
@@ -2132,7 +2214,7 @@ defmodule Genswarms.LlmProxy.Plug do
       usage = normalize_usage_counts(Map.get(body, "usage") || %{})
       upstream_router = upstream_router(Map.get(body, "x_router"))
       model = served_model(upstream_router, body, request)
-      {cost, _invalid?} = executed_cost_usd(usage, opts.prices, upstream_router, spent, opts.margin_pct)
+      {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, spent)
       {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
       record_budget_call(opts, session, request_ctx, %{
@@ -2781,7 +2863,7 @@ defmodule Genswarms.LlmProxy.Plug do
     model = served_model(upstream_router, body, conn.body_params)
 
     {cost, invalid?} =
-      executed_cost_usd(usage, opts.prices, upstream_router, budget.spent_usd, opts.margin_pct)
+      executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
 
     if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
     request_id = request_id()
@@ -2797,6 +2879,7 @@ defmodule Genswarms.LlmProxy.Plug do
       cached_tokens: cached_tokens,
       non_cached_tokens: non_cached_tokens,
       cost_usd: cost,
+      provider_cost_usd: provider_cost_usd(upstream_router),
       provider: Map.get(upstream_router, "provider")
     }
 
@@ -2893,9 +2976,25 @@ defmodule Genswarms.LlmProxy.Plug do
   # durable write), and rounds to 9dp. The direct `cost_usd` branch passes the RAW value
   # (string/number/%Decimal{}) so `sanitize_cost`'s `raw_decimal/1` can SEE "Infinity"/
   # "NaN" before `decimal/1`'s hardening would silently zero them.
-  defp executed_cost_usd(usage, prices, upstream_router, spent_before, margin_pct) do
+  @doc false
+  # Public for the two-spends check: this is the money chokepoint.
+  def executed_cost_usd(usage, opts, upstream_router, spent_before) do
+    prices = Map.get(opts, :prices) || %{}
+    margin_pct = Map.get(opts, :margin_pct, 0)
+
     raw =
       cond do
+        # pricing_mode :rate_card_first — the USER charge is the OPERATOR-SET
+        # price: with a rate card configured, the user is billed at that price
+        # REGARDLESS of the router's own cost (a free subscription-served call
+        # still charges the set price; the router's number is recorded
+        # separately as provider_cost_usd). Default :provider_first keeps the
+        # legacy cost-plus behavior: router-reported cost is the charge basis,
+        # rate card only fills a $0/absent cost (see markup_cost).
+        Map.get(opts, :pricing_mode, :provider_first) == :rate_card_first and
+            prices_set?(prices) ->
+          cost_usd(usage, prices)
+
         decimal_present?(Map.get(upstream_router, "cost_usd")) ->
           Map.get(upstream_router, "cost_usd")
 
@@ -2932,6 +3031,30 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp decimal_present?(_), do: false
+
+  # A rate card counts as "set" when either per-Mtok price is present.
+  defp prices_set?(prices) when is_map(prices) do
+    decimal_present?(Map.get(prices, :prompt_per_mtok) || Map.get(prices, "prompt_per_mtok")) or
+      decimal_present?(
+        Map.get(prices, :completion_per_mtok) || Map.get(prices, "completion_per_mtok")
+      )
+  end
+
+  defp prices_set?(_), do: false
+
+  # The router's OWN cost for this call, recorded verbatim alongside the user
+  # charge (provider_cost_usd). $0 from a subscription-served backend is honest
+  # here — the authoritative "what we owe" day series is synced from the
+  # router's usage API by the host; this per-call figure is the fidelity trail.
+  @doc false
+  def provider_cost_usd(upstream_router) do
+    raw = Map.get(upstream_router, "cost_usd")
+
+    {cost, _invalid?} =
+      if decimal_present?(raw), do: Proxy.sanitize_cost(raw), else: Proxy.sanitize_cost(0)
+
+    cost
+  end
 
   defp x_router(
          opts,
@@ -3305,7 +3428,7 @@ defmodule Genswarms.LlmProxy.Plug do
     model = served_model(router, %{"usage" => usage}, s.req_body)
 
     {cost, invalid?} =
-      executed_cost_usd(usage, s.opts.prices, router, s.budget.spent_usd, s.opts.margin_pct)
+      executed_cost_usd(usage, s.opts, router, s.budget.spent_usd)
 
     if invalid?, do: bump_metric(s.opts, "llm_proxy_cost_invalid")
 
@@ -3378,6 +3501,7 @@ defmodule Genswarms.LlmProxy.Plug do
       cached_tokens: cached_tokens,
       non_cached_tokens: non_cached_tokens,
       cost_usd: cost,
+      provider_cost_usd: provider_cost_usd(router),
       provider: Map.get(router, "provider")
     })
   end
