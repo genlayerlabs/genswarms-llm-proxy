@@ -87,6 +87,55 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert Decimal.equal?(charge, Decimal.new("0.3"))
   end
 
+  # 0.2.10 (micromarkets#450 review): a HALF-configured card must never count
+  # as configured — with the old `or` semantics, rate_card_first billed the
+  # missing leg at $0 while ignoring the real router cost (undercharge, ≈$0
+  # on completion-heavy calls). A half card now falls back to router cost.
+  test "rate_card_first with a HALF card falls back to the router cost (never a $0 bill)" do
+    completion_heavy = %{
+      "prompt_tokens" => 0,
+      "completion_tokens" => 1_000_000,
+      "total_tokens" => 1_000_000
+    }
+
+    for half <- [
+          %{prompt_per_mtok: 2.0},
+          %{prompt_per_mtok: 2.0, completion_per_mtok: nil},
+          %{completion_per_mtok: 10.0},
+          %{"prompt_per_mtok" => 2.0}
+        ] do
+      half_opts = %{prices: half, margin_pct: 0, pricing_mode: :rate_card_first}
+
+      {charge, false} =
+        ProxyPlug.executed_cost_usd(completion_heavy, half_opts, %{"cost_usd" => 0.3}, nil)
+
+      assert Decimal.equal?(charge, Decimal.new("0.3")),
+             "half card #{inspect(half)} must bill router cost, got #{inspect(charge)}"
+    end
+  end
+
+  test "rate_card_first with an EMPTY card falls back to the router cost" do
+    empty_opts = %{prices: %{}, margin_pct: 0, pricing_mode: :rate_card_first}
+
+    {charge, false} =
+      ProxyPlug.executed_cost_usd(@usage, empty_opts, %{"cost_usd" => 0.3}, nil)
+
+    assert Decimal.equal?(charge, Decimal.new("0.3"))
+  end
+
+  test "rate_card_first with BOTH prices (string keys too) still bills the card" do
+    string_opts = %{
+      prices: %{"prompt_per_mtok" => 2.0, "completion_per_mtok" => 10.0},
+      margin_pct: 0,
+      pricing_mode: :rate_card_first
+    }
+
+    {charge, false} =
+      ProxyPlug.executed_cost_usd(@usage, string_opts, %{"cost_usd" => 0.3}, nil)
+
+    assert Decimal.equal?(charge, Decimal.new("2"))
+  end
+
   test "provider_cost_usd records the router's own number verbatim (0 for absent/free)" do
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => 0.3}), Decimal.new("0.3"))
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{}), Decimal.new("0"))
