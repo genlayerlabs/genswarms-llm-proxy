@@ -867,6 +867,7 @@ defmodule Genswarms.LlmProxy do
             %{
               "type" => "metrics",
               "title" => "Today",
+              "span" => "half",
               "meta" => source,
               "items" =>
                 [
@@ -1065,6 +1066,7 @@ defmodule Genswarms.LlmProxy do
         %{
           "type" => "metrics",
           "title" => "All-time",
+          "span" => "half",
           "meta" => since <> "#{Map.get(u, :days, 0)} day(s), durable — the Today block resets at 00:00 UTC",
           "items" =>
             [
