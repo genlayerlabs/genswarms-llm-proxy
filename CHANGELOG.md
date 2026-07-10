@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.9 - 2026-07-10
+
+- Proxy-router page: new "All-time" metrics block (user spend, router cost,
+  requests, tokens, cache rate) via the probed host contracts
+  `store_mod.llm_usage_alltime/0` (%{since, days, budgets, requests,
+  prompt_tokens, total_tokens, cached_tokens, spent_usd} | nil) and the
+  optional `store_mod.llm_router_cost_alltime/0` (%{cost_usd, estimated_any}
+  | nil). Same fail-open discipline as the History/By-model sections: absent
+  contract, nil, or raising store contributes nothing. The Today block stays
+  day-scoped on purpose — it is the budget-enforcement view and quotas reset
+  at 00:00 UTC; All-time is its durable twin.
+- History table window widened: last 14 -> last 30 days.
+
 ## 0.2.8 - 2026-07-09
 
 - TWO spends, deliberately distinct. New `pricing_mode:` config —
