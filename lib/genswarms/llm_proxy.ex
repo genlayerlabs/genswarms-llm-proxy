@@ -3098,9 +3098,16 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp decimal_present?(_), do: false
 
-  # A rate card counts as "set" when either per-Mtok price is present.
+  # A rate card counts as "set" ONLY when BOTH per-Mtok prices are present
+  # (0.2.10, micromarkets#450 review). With `or`, a half-configured card —
+  # one price env silently dropped by a host's parser — counted as
+  # configured: rate_card_first then billed the missing leg at $0 while
+  # IGNORING the real router cost (systematic undercharge, ≈$0 on
+  # completion-heavy calls). A half card now falls through to the router
+  # cost, which never underbills; hosts should additionally reject half
+  # cards at boot (wingston#132 does).
   defp prices_set?(prices) when is_map(prices) do
-    decimal_present?(Map.get(prices, :prompt_per_mtok) || Map.get(prices, "prompt_per_mtok")) or
+    decimal_present?(Map.get(prices, :prompt_per_mtok) || Map.get(prices, "prompt_per_mtok")) and
       decimal_present?(
         Map.get(prices, :completion_per_mtok) || Map.get(prices, "completion_per_mtok")
       )

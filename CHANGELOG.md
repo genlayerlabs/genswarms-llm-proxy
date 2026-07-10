@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.10 - 2026-07-10
+
+- Rate card requires BOTH per-Mtok prices (micromarkets#450 review):
+  `prices_set?` moves from `or` to `and`. Under `pricing_mode
+  :rate_card_first` a half-configured card (one price env silently dropped
+  by a host's parser) counted as configured, billing the missing leg at $0
+  while ignoring the real router cost — a systematic undercharge, ≈$0 on
+  completion-heavy calls. A half card now falls through to the
+  router-reported cost, which never underbills. `provider_first` semantics
+  unchanged (the card was already only a $0-basis fallback there). Hosts
+  should also reject half/malformed cards at boot (wingston#132 does).
+
 ## 0.2.9 - 2026-07-10
 
 - Proxy-router page: new "All-time" metrics block (user spend, router cost,
