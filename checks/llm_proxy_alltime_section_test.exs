@@ -79,6 +79,9 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
 
     sec = section(ext, "All-time")
     assert sec["type"] == "metrics"
+    # summary blocks share a row on wide screens (frontend 0.3.6 span grammar)
+    assert sec["span"] == "half"
+    assert section(ext, "Today")["span"] == "half"
     assert sec["meta"] =~ "since 2026-06-26"
     assert sec["meta"] =~ "14 day"
 

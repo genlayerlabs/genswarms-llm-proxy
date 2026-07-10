@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.12 - 2026-07-10
+
+- Proxy-router page polish (operator feedback): the Today and All-time
+  summary blocks declare `span: "half"` (frontend 0.3.6 grammar) so they sit
+  side by side; the period selector renders in the dashboard's standard
+  range-selector style (frontend 0.3.6).
+
 ## 0.2.11 - 2026-07-10
 
 - Proxy-router page: the Users table becomes a period selector (Today / 7
