@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.10 - 2026-07-10
+## 0.2.11 - 2026-07-10
 
 - Proxy-router page: the Users table becomes a period selector (Today / 7
   days / 30 days / All-time) when the host store exposes the new probed
