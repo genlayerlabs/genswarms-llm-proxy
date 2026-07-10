@@ -890,23 +890,14 @@ defmodule Genswarms.LlmProxy do
           ] ++
             List.wrap(alltime_section(Keyword.get(opts, :store_mod))) ++
             [
-              %{
-              "type" => "table",
-              "title" => "Users",
-              "meta" => "unmapped rows come from budget hashes",
-              "columns" => [
-                %{"key" => "user", "label" => "user"},
-                %{"key" => "slot", "label" => "slot", "mono" => true},
-                %{"key" => "spent", "label" => "user spent", "align" => "right"},
-                %{"key" => "limit", "label" => "limit", "align" => "right"},
-                %{"key" => "requests", "label" => "req", "align" => "right"},
-                %{"key" => "tokens", "label" => "tokens", "align" => "right"},
-                %{"key" => "cache", "label" => "cache", "align" => "right"},
-                %{"key" => "status", "label" => "status"},
-                %{"key" => "budget", "label" => "budget", "mono" => true}
-              ],
-              "rows" => rows
-              }
+              users_section(
+                Keyword.get(opts, :store_mod),
+                rows,
+                sessions,
+                users_by_cid,
+                users_by_budget,
+                origins_by_budget
+              )
             ] ++
             List.wrap(model_section(dashboard_model_rows(Keyword.get(opts, :store_mod), day))) ++
             List.wrap(
@@ -974,6 +965,86 @@ defmodule Genswarms.LlmProxy do
     _ -> []
   catch
     _, _ -> []
+  end
+
+  @today_users_columns [
+    %{"key" => "user", "label" => "user"},
+    %{"key" => "slot", "label" => "slot", "mono" => true},
+    %{"key" => "spent", "label" => "user spent", "align" => "right"},
+    %{"key" => "limit", "label" => "limit", "align" => "right"},
+    %{"key" => "requests", "label" => "req", "align" => "right"},
+    %{"key" => "tokens", "label" => "tokens", "align" => "right"},
+    %{"key" => "cache", "label" => "cache", "align" => "right"},
+    %{"key" => "status", "label" => "status"},
+    %{"key" => "budget", "label" => "budget", "mono" => true}
+  ]
+
+  # Multi-day windows have no meaningful daily limit/status; slot stays (a live
+  # session's slot is still where that user's traffic runs right now).
+  @period_users_columns [
+    %{"key" => "user", "label" => "user"},
+    %{"key" => "slot", "label" => "slot", "mono" => true},
+    %{"key" => "spent", "label" => "user spent", "align" => "right"},
+    %{"key" => "requests", "label" => "req", "align" => "right"},
+    %{"key" => "tokens", "label" => "tokens", "align" => "right"},
+    %{"key" => "cache", "label" => "cache", "align" => "right"},
+    %{"key" => "budget", "label" => "budget", "mono" => true}
+  ]
+
+  @period_tabs [{"7 days", 7}, {"30 days", 30}, {"All-time", :all}]
+
+  # The Users table, as period tabs when the host store exposes
+  # `llm_usage_by_budget_since/2` (days | :all, limit) — Today keeps the live
+  # day's limit/status semantics; 7/30/all-time aggregate the durable history.
+  # Absent contract or a raising store falls back to the classic flat table
+  # (never a crashed snapshot, and never an empty Users panel).
+  defp users_section(store_mod, rows, sessions, users_by_cid, users_by_budget, origins_by_budget) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_usage_by_budget_since, 2) do
+      period_tabs =
+        Enum.map(@period_tabs, fn {label, window} ->
+          usage = store_mod.llm_usage_by_budget_since(window, 100)
+
+          %{
+            "label" => label,
+            "section" =>
+              users_table(
+                dashboard_rows(usage, sessions, users_by_cid, users_by_budget, origins_by_budget),
+                @period_users_columns,
+                "user spend at the operator-set price, summed over the window"
+              )
+          }
+        end)
+
+      %{
+        "type" => "tabs",
+        "title" => "Users",
+        "meta" => "unmapped rows come from budget hashes",
+        "tabs" => [
+          %{"label" => "Today", "section" => users_table(rows, @today_users_columns, "resets 00:00 UTC — the quota view")}
+          | period_tabs
+        ]
+      }
+    else
+      flat_users_table(rows)
+    end
+  rescue
+    _ -> flat_users_table(rows)
+  catch
+    _, _ -> flat_users_table(rows)
+  end
+
+  defp flat_users_table(rows),
+    do: users_table(rows, @today_users_columns, "unmapped rows come from budget hashes")
+
+  defp users_table(rows, columns, meta) do
+    %{
+      "type" => "table",
+      "title" => "Users",
+      "meta" => meta,
+      "columns" => columns,
+      "rows" => rows
+    }
   end
 
   # All-time totals across the whole durable history — probed host contracts

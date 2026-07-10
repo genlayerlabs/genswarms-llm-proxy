@@ -2,6 +2,20 @@
 
 ## 0.2.10 - 2026-07-10
 
+- Proxy-router page: the Users table becomes a period selector (Today / 7
+  days / 30 days / All-time) when the host store exposes the new probed
+  contract `store_mod.llm_usage_by_budget_since/2` (days | :all, limit) —
+  per-budget aggregates over the window, rendered through the dashboard
+  frontend's new `tabs` section type (frontend 0.3.5+). Today keeps the
+  live-day limit/status columns (the quota view); period tabs drop them
+  (a multi-day window has no daily limit) and sort client-side like every
+  extension table. Absent contract or raising store falls back to the
+  classic flat Users table — old frontends render the fallback flat table
+  only when the host lacks the contract; hosts adopting the contract must
+  run frontend >= 0.3.5.
+
+## 0.2.10 - 2026-07-10
+
 - Rate card requires BOTH per-Mtok prices (micromarkets#450 review):
   `prices_set?` moves from `or` to `and`. Under `pricing_mode
   :rate_card_first` a half-configured card (one price env silently dropped
