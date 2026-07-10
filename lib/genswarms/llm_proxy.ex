@@ -886,8 +886,11 @@ defmodule Genswarms.LlmProxy do
                       "value" => cache_rate(totals.cached_tokens, totals.prompt_tokens)
                     }
                   ]
-            },
-            %{
+            }
+          ] ++
+            List.wrap(alltime_section(Keyword.get(opts, :store_mod))) ++
+            [
+              %{
               "type" => "table",
               "title" => "Users",
               "meta" => "unmapped rows come from budget hashes",
@@ -903,11 +906,11 @@ defmodule Genswarms.LlmProxy do
                 %{"key" => "budget", "label" => "budget", "mono" => true}
               ],
               "rows" => rows
-            }
-          ] ++
+              }
+            ] ++
             List.wrap(model_section(dashboard_model_rows(Keyword.get(opts, :store_mod), day))) ++
             List.wrap(
-              history_section(dashboard_history_rows(Keyword.get(opts, :store_mod), 14))
+              history_section(dashboard_history_rows(Keyword.get(opts, :store_mod), 30))
             )
         }
       ]
@@ -971,6 +974,69 @@ defmodule Genswarms.LlmProxy do
     _ -> []
   catch
     _, _ -> []
+  end
+
+  # All-time totals across the whole durable history — probed host contracts
+  # `store_mod.llm_usage_alltime/0` (%{since, days, budgets, requests, prompt_tokens,
+  # total_tokens, cached_tokens, spent_usd} | nil) plus the optional
+  # `store_mod.llm_router_cost_alltime/0` (%{cost_usd, estimated_any} | nil) for the
+  # router-owed twin. Same fail-open discipline as History/By-model: absent
+  # function, nil, or raising store contributes NOTHING (never a crashed snapshot).
+  defp alltime_section(store_mod) do
+    case probe_map(store_mod, :llm_usage_alltime) do
+      %{} = u ->
+        since =
+          case Map.get(u, :since) do
+            %Date{} = d -> "since " <> Date.to_iso8601(d) <> " \u00b7 "
+            _ -> ""
+          end
+
+        %{
+          "type" => "metrics",
+          "title" => "All-time",
+          "meta" => since <> "#{Map.get(u, :days, 0)} day(s), durable — the Today block resets at 00:00 UTC",
+          "items" =>
+            [
+              %{"label" => "User spend", "value" => "$" <> money(decimal(Map.get(u, :spent_usd)))}
+            ] ++
+              List.wrap(router_alltime_item(probe_map(store_mod, :llm_router_cost_alltime))) ++
+              [
+                %{"label" => "Requests", "value" => Map.get(u, :requests, 0)},
+                %{"label" => "Tokens", "value" => Map.get(u, :total_tokens, 0)},
+                %{
+                  "label" => "Cache",
+                  "value" => cache_rate(Map.get(u, :cached_tokens), Map.get(u, :prompt_tokens))
+                }
+              ]
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp router_alltime_item(%{cost_usd: cost} = row) do
+    %{
+      "label" => "Router cost",
+      "value" => "$" <> money(decimal(cost)),
+      "sub" => if(Map.get(row, :estimated_any, true), do: "includes router estimates", else: nil)
+    }
+  end
+
+  defp router_alltime_item(_), do: nil
+
+  # Zero-arity probed-contract read with the section-builders' fail-open discipline.
+  defp probe_map(store_mod, fun) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, fun, 0) do
+      apply(store_mod, fun, [])
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
   end
 
   defp history_section([]), do: nil
