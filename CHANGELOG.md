@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.2.18 - 2026-07-15
+
+- Price `/v1/compact` seals through the same cost chokepoint as chat calls.
+  A new router may additively attach OpenAI-shape `usage` and the chat-shaped
+  `x_router` to `/v1/compact` responses (including `{"compacted": false}`
+  partial failures that followed a billable upstream call); when present, the
+  seal's ledger row now carries the two-spends accounting (`cost_usd`,
+  `provider_cost_usd`, `provider_cost_state`, `charge_basis`, token counts,
+  cache split, provider) instead of a fixed $0 row, so seals advance the
+  per-conversation daily budget and the operator-wide global ceiling.
+- Legacy compatibility preserved: a router that attaches neither key keeps
+  producing the same $0 `model: "compact"` row as before — never a crash,
+  never an invented cost. Status semantics are unchanged (`ok` burns the
+  request quota, `compact_error` stays quota-free) and the response body still
+  passes through verbatim to the agent.
+- Bump a dedicated `llm_proxy_compact_error` metric when the upstream seal
+  call fails (distinct from `llm_proxy_compact_block`), and record any cost
+  the router billed for the failed seal on the `compact_error` row.
+
 ## 0.2.17 - 2026-07-14
 
 - Separate Today and all-time usage from cost accounting so monetary values
