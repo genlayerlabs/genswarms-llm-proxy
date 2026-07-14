@@ -62,6 +62,46 @@ defmodule AlltimeAuthoritativeStore do
   end
 end
 
+defmodule AlltimeUnreconciledStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    %{
+      since: ~D[2026-07-15],
+      days: 1,
+      spent_usd: Decimal.new("13.00"),
+      router_cost_usd: Decimal.new("11.00"),
+      gross_margin_usd: Decimal.new("2.00"),
+      gross_margin_pct: Decimal.new("18.18"),
+      estimated_any: true,
+      ledger_requests: 99,
+      router_requests: 100,
+      mismatched_days: 1,
+      reconciled: false,
+      accounting_scope: "test-production-v1"
+    }
+  end
+end
+
+defmodule AlltimeHistoricalEvidenceStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    %{
+      since: ~D[2026-06-29],
+      days: 16,
+      spent_usd: Decimal.new("0"),
+      router_cost_usd: Decimal.new("0"),
+      lifetime_spent_usd: Decimal.new("133.63"),
+      lifetime_router_cost_usd: Decimal.new("68.49"),
+      authoritative: false,
+      reconciled: false,
+      accounting_scope: "legacy-shared-key",
+      accounting_note: "historical cost evidence · totals are not comparable"
+    }
+  end
+end
+
 defmodule AlltimeEmptyStore do
   def llm_usage_alltime, do: nil
 end
@@ -109,11 +149,11 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert sec["meta"] =~ "since 2026-06-26"
     assert sec["meta"] =~ "14 day"
 
-    assert item(sec, "User spend")["value"] == "$12.50"
-    assert item(sec, "Router cost")["value"] == "$7.25"
-    assert item(sec, "Router cost")["sub"] =~ "estimate"
+    assert item(sec, "Charged users")["value"] == "$12.50"
+    assert item(sec, "Router charged us")["value"] == "$7.25"
+    assert item(sec, "Router charged us")["sub"] =~ "estimate"
     assert item(sec, "Requests")["value"] == 12_345
-    assert item(sec, "Tokens")["value"] == 95_000_000
+    assert item(sec, "Tokens")["value"] == "95M"
     assert item(sec, "Cache")["value"] == "50%"
   end
 
@@ -122,28 +162,66 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
 
     sec = section(ext, "All-time")
     assert sec != nil
-    assert item(sec, "User spend")["value"] == "$0.01"
-    assert item(sec, "Router cost") == nil
+    assert item(sec, "Charged users")["value"] == "$0.01"
+    assert item(sec, "Router charged us") == nil
   end
 
   test "authoritative financial contract separates reconstructed history from same-scope margin" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeAuthoritativeStore)
 
     usage = section(ext, "All-time usage")
-    financials = section(ext, "Financials")
+    financials = section(ext, "Costs")
 
-    assert item(usage, "Repriced spend")["value"] == "$12.50"
-    assert item(usage, "Repriced spend")["sub"] =~ "pre-proxy"
-    assert item(usage, "Router cost") == nil
+    assert item(usage, "Repriced spend") == nil
+    assert item(usage, "Tokens")["value"] == "95M"
+    assert item(usage, "Router charged us") == nil
 
-    assert financials["meta"] =~ "authoritative since 2026-07-15"
+    assert financials["meta"] =~ "authoritative source since 2026-07-15"
+    assert financials["meta"] =~ "reconciled"
     assert financials["meta"] =~ "scope test-production-v1"
-    assert item(financials, "User charges")["value"] == "$13.00"
-    assert item(financials, "Router cost")["value"] == "$10.00"
-    assert item(financials, "Gross margin")["value"] == "$3.00"
-    assert item(financials, "Gross margin")["sub"] == "30.0% of router cost"
+    assert item(financials, "Charged users")["value"] == "$13.00"
+    assert item(financials, "Router charged us")["value"] == "$10.00"
+    assert item(financials, "Cost-plus margin")["value"] == "$3.00"
+
+    assert item(financials, "Cost-plus margin")["sub"] ==
+             "30.0% of comparable router cost since cutover"
+
     assert item(financials, "Request coverage")["value"] == "100/100"
     assert item(financials, "Request coverage")["sub"] == "ledger/router matched"
+  end
+
+  test "unreconciled financials expose raw totals but withhold numeric margin" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeUnreconciledStore)
+    financials = section(ext, "Costs")
+
+    assert financials["meta"] =~ "UNRECONCILED"
+    assert item(financials, "Charged users")["value"] == "$13.00"
+    assert item(financials, "Router charged us")["value"] == "$11.00"
+    assert item(financials, "Cost-plus margin")["value"] == "—"
+    assert item(financials, "Cost-plus margin")["sub"] =~ "withheld"
+    assert item(financials, "Request coverage")["value"] == "99/100"
+    assert item(financials, "Request coverage")["sub"] =~ "mismatch"
+  end
+
+  test "historical evidence shows both lifetime totals without implying comparability" do
+    ext =
+      Proxy.dashboard_extension(
+        state_pid: dead_state(),
+        store_mod: AlltimeHistoricalEvidenceStore
+      )
+
+    usage = section(ext, "All-time usage")
+    costs = section(ext, "Costs")
+
+    assert length(usage["items"]) == 3
+    assert costs["meta"] =~ "not comparable"
+    assert costs["meta"] =~ "legacy-shared-key"
+    assert item(costs, "Charged users")["value"] == "$133.63"
+    assert item(costs, "Charged users")["sub"] =~ "all-time"
+    assert item(costs, "Router charged us")["value"] == "$68.49"
+    assert item(costs, "Router charged us")["sub"] =~ "not comparable"
+    assert item(costs, "Cost-plus margin")["value"] == "—"
+    assert item(costs, "Comparable")["value"] == "No"
   end
 
   test "nil usage (empty / persistence-off store) contributes no all-time section" do
