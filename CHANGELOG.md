@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.2.15 - 2026-07-14
+
+- Keep same-scope user-charge and router-cost totals visible for diagnosis when
+  request/token coverage disagrees, but mark the Costs block `UNRECONCILED`
+  and withhold the numeric cost-plus margin until coverage matches.
+  A mismatched population can no longer present a profit figure as meaningful.
+- Present costs with explicit operator-facing labels (`Charged users` and
+  `Router charged us`). Hosts may provide lifetime historical evidence while
+  marking it non-authoritative; both totals remain visible, but comparability
+  and margin stay withheld until the post-cutover scope reconciles.
+- Compact large headline token counts (`156.8M`) so half-width metric cards do
+  not overlap adjacent cache percentages. Machine payloads and detailed tables
+  retain exact integer counts.
+
 ## 0.2.14 - 2026-07-14
 
 - Fail closed at object boot when `pricing_mode: :cost_plus` has no complete,

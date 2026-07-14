@@ -732,6 +732,34 @@ defmodule Genswarms.LlmProxy do
 
   defp money2(value), do: value |> decimal() |> Decimal.round(2) |> Decimal.to_string(:normal)
 
+  # Metric cards have bounded columns. Keep exact counts in machine payloads and
+  # detail tables, but compact large headline values so Tokens cannot collide
+  # with the adjacent Cache metric (for example 156,813,030 -> 156.8M).
+  defp compact_count(value) when is_integer(value) do
+    magnitude = abs(value)
+
+    cond do
+      magnitude >= 1_000_000_000 -> compact_count_unit(value, 1_000_000_000, "B")
+      magnitude >= 1_000_000 -> compact_count_unit(value, 1_000_000, "M")
+      magnitude >= 100_000 -> compact_count_unit(value, 1_000, "K")
+      true -> value
+    end
+  end
+
+  defp compact_count(value), do: value
+
+  defp compact_count_unit(value, divisor, suffix) do
+    formatted =
+      value
+      |> Decimal.new()
+      |> Decimal.div(Decimal.new(divisor))
+      |> Decimal.round(1)
+      |> Decimal.normalize()
+      |> Decimal.to_string(:normal)
+
+    formatted <> suffix
+  end
+
   # Dashboard detail remains readable for sub-cent activity without showing six
   # decimals everywhere: cents normally, four decimals only for a non-zero value
   # whose magnitude is below one cent.
@@ -965,12 +993,12 @@ defmodule Genswarms.LlmProxy do
                     # TWO spends, deliberately distinct: what USERS were charged
                     # (operator-set price) vs what the router says the traffic
                     # cost (synced day estimate — probed host contract below).
-                    %{"label" => "User spend", "value" => "$" <> money2(totals.spent_usd)}
+                    %{"label" => "Charged users", "value" => "$" <> money2(totals.spent_usd)}
                   ] ++
                     List.wrap(router_cost_item(Keyword.get(opts, :store_mod))) ++
                     [
                       %{"label" => "Requests", "value" => totals.requests},
-                      %{"label" => "Tokens", "value" => totals.total_tokens},
+                      %{"label" => "Tokens", "value" => compact_count(totals.total_tokens)},
                       %{
                         "label" => "Cache",
                         "value" => cache_rate(totals.cached_tokens, totals.prompt_tokens)
@@ -1023,9 +1051,9 @@ defmodule Genswarms.LlmProxy do
       case store_mod.llm_router_cost_today() do
         %{cost_usd: cost} = row ->
           %{
-            "label" => "Router cost",
+            "label" => "Router charged us",
             "value" => "$" <> money2(cost),
-            "sub" => if(Map.get(row, :estimated, true), do: "router estimate", else: nil)
+            "sub" => router_cost_sub(row)
           }
 
         _ ->
@@ -1039,6 +1067,12 @@ defmodule Genswarms.LlmProxy do
   catch
     _, _ -> nil
   end
+
+  defp router_cost_sub(%{authoritative: false}),
+    do: "legacy/shared-key estimate · not comparable"
+
+  defp router_cost_sub(row),
+    do: if(Map.get(row, :estimated, true), do: "router estimate", else: "exact router total")
 
   # Durable day history (newest-first) — probed store contract, host-owned SQL:
   # `store_mod.llm_usage_days/1` returns day aggregates across ALL budgets
@@ -1180,12 +1214,12 @@ defmodule Genswarms.LlmProxy do
           "#{Map.get(u, :days, 0)} day(s), durable — the Today block resets at 00:00 UTC",
       "items" =>
         [
-          %{"label" => "User spend", "value" => "$" <> money2(Map.get(u, :spent_usd))}
+          %{"label" => "Charged users", "value" => "$" <> money2(Map.get(u, :spent_usd))}
         ] ++
           List.wrap(router_alltime_item(probe_map(store_mod, :llm_router_cost_alltime))) ++
           [
             %{"label" => "Requests", "value" => Map.get(u, :requests, 0)},
-            %{"label" => "Tokens", "value" => Map.get(u, :total_tokens, 0)},
+            %{"label" => "Tokens", "value" => compact_count(Map.get(u, :total_tokens, 0))},
             %{
               "label" => "Cache",
               "value" => cache_rate(Map.get(u, :cached_tokens), Map.get(u, :prompt_tokens))
@@ -1207,31 +1241,14 @@ defmodule Genswarms.LlmProxy do
         _ -> ""
       end
 
-    spend_label =
-      case Map.get(u, :spend_label) do
-        label when is_binary(label) and label != "" -> String.slice(label, 0, 40)
-        _ -> "User spend"
-      end
-
-    spend_sub =
-      case Map.get(u, :spend_sub) do
-        sub when is_binary(sub) and sub != "" -> String.slice(sub, 0, 120)
-        _ -> nil
-      end
-
     %{
       "type" => "metrics",
       "title" => "All-time usage",
       "span" => "half",
       "meta" => since <> "#{Map.get(u, :days, 0)} day(s), durable" <> accounting_note,
       "items" => [
-        %{
-          "label" => spend_label,
-          "value" => "$" <> money2(Map.get(u, :spent_usd)),
-          "sub" => spend_sub
-        },
         %{"label" => "Requests", "value" => Map.get(u, :requests, 0)},
-        %{"label" => "Tokens", "value" => Map.get(u, :total_tokens, 0)},
+        %{"label" => "Tokens", "value" => compact_count(Map.get(u, :total_tokens, 0))},
         %{
           "label" => "Cache",
           "value" => cache_rate(Map.get(u, :cached_tokens), Map.get(u, :prompt_tokens))
@@ -1254,11 +1271,22 @@ defmodule Genswarms.LlmProxy do
       |> Decimal.round(1)
       |> Decimal.to_string(:normal)
 
+    reconciled = financials_reconciled?(financials)
+    authoritative = Map.get(financials, :authoritative, true) == true
+
+    charged_users =
+      Map.get(financials, :lifetime_spent_usd, Map.get(financials, :spent_usd, Decimal.new(0)))
+
+    router_charged =
+      Map.get(
+        financials,
+        :lifetime_router_cost_usd,
+        Map.get(financials, :router_cost_usd, Decimal.new(0))
+      )
+
     coverage_item =
       case {Map.get(financials, :ledger_requests), Map.get(financials, :router_requests)} do
         {ledger, router} when is_integer(ledger) and is_integer(router) ->
-          reconciled = Map.get(financials, :reconciled, ledger == router)
-
           %{
             "label" => "Request coverage",
             "value" => "#{ledger}/#{router}",
@@ -1272,6 +1300,13 @@ defmodule Genswarms.LlmProxy do
                       _ -> ""
                     end
               )
+          }
+
+        _ when not authoritative ->
+          %{
+            "label" => "Comparable",
+            "value" => "No",
+            "sub" => "legacy router scope differs from the user ledger"
           }
 
         _ ->
@@ -1289,38 +1324,96 @@ defmodule Genswarms.LlmProxy do
 
     %{
       "type" => "metrics",
-      "title" => "Financials",
+      "title" => "Costs",
       "span" => "half",
-      "meta" =>
-        "authoritative since #{since} · #{Map.get(financials, :days, 0)} same-scope UTC day(s)" <>
-          scope_meta,
+      "meta" => financials_meta(financials, authoritative, reconciled, since, scope_meta),
       "items" =>
         [
           %{
-            "label" => "User charges",
-            "value" => "$" <> money2(Map.get(financials, :spent_usd))
-          },
-          %{
-            "label" => "Router cost",
-            "value" => "$" <> money2(Map.get(financials, :router_cost_usd)),
+            "label" => "Charged users",
+            "value" => "$" <> money2(charged_users),
             "sub" =>
-              if(Map.get(financials, :estimated_any, true),
-                do: "includes router estimates",
-                else: nil
+              if(Map.has_key?(financials, :lifetime_spent_usd),
+                do: "all-time repriced ledger",
+                else: "same-scope ledger since cutover"
               )
           },
           %{
-            "label" => "Gross margin",
-            "value" => "$" <> money2(Map.get(financials, :gross_margin_usd)),
-            "sub" => margin_pct <> "% of router cost"
+            "label" => "Router charged us",
+            "value" => "$" <> money2(router_charged),
+            "sub" =>
+              cond do
+                not authoritative ->
+                  "includes legacy/shared-key estimates · not comparable"
+
+                Map.get(financials, :legacy_router_included, false) ->
+                  "all-time total includes legacy estimates · margin uses cutover scope"
+
+                Map.get(financials, :estimated_any, true) ->
+                  "includes router estimates"
+
+                true ->
+                  "exact router total"
+              end
+          },
+          %{
+            "label" => "Cost-plus margin",
+            "value" =>
+              if(authoritative and reconciled,
+                do: "$" <> money2(Map.get(financials, :gross_margin_usd)),
+                else: "—"
+              ),
+            "sub" =>
+              if(authoritative and reconciled,
+                do: margin_pct <> "% of comparable router cost since cutover",
+                else: "withheld until request/token coverage reconciles"
+              )
           }
         ] ++ List.wrap(coverage_item)
     }
   end
 
+  defp financials_meta(financials, false, _reconciled, _since, scope_meta) do
+    note =
+      case Map.get(financials, :accounting_note) do
+        value when is_binary(value) and value != "" -> String.slice(value, 0, 160)
+        _ -> "historical cost evidence · totals are not comparable"
+      end
+
+    note <> scope_meta
+  end
+
+  defp financials_meta(financials, true, reconciled, since, scope_meta) do
+    totals_prefix =
+      if Map.has_key?(financials, :lifetime_spent_usd) or
+           Map.has_key?(financials, :lifetime_router_cost_usd) do
+        "lifetime totals · authoritative margin source since "
+      else
+        "authoritative source since "
+      end
+
+    totals_prefix <>
+      "#{since} · #{Map.get(financials, :days, 0)} same-scope UTC day(s) · " <>
+      if(reconciled, do: "reconciled", else: "UNRECONCILED") <>
+      scope_meta
+  end
+
+  defp financials_reconciled?(financials) do
+    case Map.get(financials, :reconciled) do
+      value when is_boolean(value) ->
+        value
+
+      _ ->
+        case {Map.get(financials, :ledger_requests), Map.get(financials, :router_requests)} do
+          {ledger, router} when is_integer(ledger) and is_integer(router) -> ledger == router
+          _ -> false
+        end
+    end
+  end
+
   defp router_alltime_item(%{cost_usd: cost} = row) do
     %{
-      "label" => "Router cost",
+      "label" => "Router charged us",
       "value" => "$" <> money2(cost),
       "sub" => if(Map.get(row, :estimated_any, true), do: "includes router estimates", else: nil)
     }

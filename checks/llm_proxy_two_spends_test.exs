@@ -38,6 +38,12 @@ defmodule NoRouterStore do
   def list_llm_usage(_limit), do: []
 end
 
+defmodule LegacyRouterCostStore do
+  def llm_router_cost_today do
+    %{cost_usd: Decimal.new("0.919472"), estimated: true, authoritative: false}
+  end
+end
+
 defmodule OneBudgetStore do
   def list_llm_usage(_limit) do
     [
@@ -212,15 +218,15 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
 
   defp page(ext), do: Enum.find(ext["dashboard_pages"], &(&1["id"] == "proxy-router"))
 
-  test "Today shows User spend AND the host-synced Router cost tile" do
+  test "Today shows Charged users AND the host-synced Router charged us tile" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RouterCostStore)
     today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
     labels = Enum.map(today["items"], & &1["label"])
 
-    assert "User spend" in labels
-    assert "Router cost" in labels
-    user = Enum.find(today["items"], &(&1["label"] == "User spend"))
-    router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
+    assert "Charged users" in labels
+    assert "Router charged us" in labels
+    user = Enum.find(today["items"], &(&1["label"] == "Charged users"))
+    router = Enum.find(today["items"], &(&1["label"] == "Router charged us"))
     assert user["value"] == "$0.00"
     assert router["value"] == "$0.92"
     assert router["sub"] == "router estimate"
@@ -230,7 +236,17 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
   test "a store without llm_router_cost_today/0 contributes no Router-cost tile" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: NoRouterStore)
     today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
-    refute Enum.any?(today["items"], &(&1["label"] == "Router cost"))
+    refute Enum.any?(today["items"], &(&1["label"] == "Router charged us"))
+  end
+
+  test "Today shows legacy router evidence but marks it non-comparable" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: LegacyRouterCostStore)
+    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
+    router = Enum.find(today["items"], &(&1["label"] == "Router charged us"))
+
+    assert router["value"] == "$0.92"
+    assert router["sub"] =~ "legacy/shared-key"
+    assert router["sub"] =~ "not comparable"
   end
 
   test "Users rows carry _cid metadata (never a column) for the dashboard's inspector" do
