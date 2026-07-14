@@ -1278,12 +1278,22 @@ defmodule Genswarms.LlmProxy do
           nil
       end
 
+    scope_meta =
+      case Map.get(financials, :accounting_scope) do
+        scope when is_binary(scope) and scope != "" ->
+          " · scope " <> String.slice(scope, 0, 80)
+
+        _ ->
+          ""
+      end
+
     %{
       "type" => "metrics",
       "title" => "Financials",
       "span" => "half",
       "meta" =>
-        "authoritative since #{since} · #{Map.get(financials, :days, 0)} same-scope UTC day(s)",
+        "authoritative since #{since} · #{Map.get(financials, :days, 0)} same-scope UTC day(s)" <>
+          scope_meta,
       "items" =>
         [
           %{

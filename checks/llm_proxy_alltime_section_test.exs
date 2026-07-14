@@ -56,7 +56,8 @@ defmodule AlltimeAuthoritativeStore do
       ledger_requests: 100,
       router_requests: 100,
       mismatched_days: 0,
-      reconciled: true
+      reconciled: true,
+      accounting_scope: "test-production-v1"
     }
   end
 end
@@ -136,6 +137,7 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert item(usage, "Router cost") == nil
 
     assert financials["meta"] =~ "authoritative since 2026-07-15"
+    assert financials["meta"] =~ "scope test-production-v1"
     assert item(financials, "User charges")["value"] == "$13.00"
     assert item(financials, "Router cost")["value"] == "$10.00"
     assert item(financials, "Gross margin")["value"] == "$3.00"
