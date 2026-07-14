@@ -19,7 +19,21 @@
   passes through verbatim to the agent.
 - Bump a dedicated `llm_proxy_compact_error` metric when the upstream seal
   call fails (distinct from `llm_proxy_compact_block`), and record any cost
-  the router billed for the failed seal on the `compact_error` row.
+  the router billed for the failed seal on the `compact_error` row. Hosts
+  running a closed-allowlist metrics object must allowlist the new key
+  alongside `llm_proxy_compact` / `llm_proxy_compact_block`, or the bumps are
+  silently dropped.
+- Legacy seals do NOT move `llm_proxy_provider_cost_unknown`: the absence of
+  both additive keys is the contract's expected compat arm, not a missing
+  cost signal, so the counter keeps meaning "billable call whose router
+  omitted a cost". A new router that attaches `usage`/`x_router` but omits
+  `cost_usd` still trips it.
+- Chat error-path ledger rows now record billed router cost too: when a
+  non-2xx upstream body proves a billed partial call (OpenAI-shape `usage`,
+  or a known `x_router.cost_usd`), the error row carries the same two-spends
+  accounting as `compact_error` rows and the error `x_router` surfaces the
+  charge — `SUM(cost_usd)` never undercounts. Plain error bodies keep the
+  minimal $0 row with no counter noise.
 
 ## 0.2.17 - 2026-07-14
 
