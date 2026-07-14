@@ -1,6 +1,6 @@
-# TWO spends, deliberately distinct (2026-07-09): what USERS are charged (the
-# operator-SET price — pricing_mode :rate_card_first bills the rate card even
-# when the upstream call was free) vs what the router says the traffic cost
+# TWO spends, deliberately distinct: what USERS are charged (default
+# pricing_mode :cost_plus uses provider cost + margin, with the rate card as a
+# zero/unknown/invalid fallback) vs what the router says the traffic cost
 # (provider_cost_usd per call + the host-synced day estimate on the page).
 #   mix run checks/llm_proxy_two_spends_test.exs
 ExUnit.start()
@@ -65,7 +65,8 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
   @usage %{"prompt_tokens" => 1_000_000, "completion_tokens" => 0, "total_tokens" => 1_000_000}
   @prices %{prompt_per_mtok: 2.0, completion_per_mtok: 10.0}
 
-  defp opts(mode), do: %{prices: @prices, margin_pct: 0, pricing_mode: mode}
+  defp opts(mode, margin_pct \\ 0),
+    do: %{prices: @prices, margin_pct: margin_pct, pricing_mode: mode}
 
   test "rate_card_first: the SET price bills even when the router call was free" do
     {charge, false} =
@@ -80,11 +81,25 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert Decimal.equal?(charge2, Decimal.new("2"))
   end
 
-  test "provider_first (default) keeps legacy cost-plus: router cost wins as the basis" do
+  test "cost_plus charges the direct provider cost plus the configured margin" do
     {charge, false} =
-      ProxyPlug.executed_cost_usd(@usage, opts(:provider_first), %{"cost_usd" => 0.3}, nil)
+      ProxyPlug.executed_cost_usd(@usage, opts(:cost_plus, 30), %{"cost_usd" => 0.3}, nil)
 
-    assert Decimal.equal?(charge, Decimal.new("0.3"))
+    assert Decimal.equal?(charge, Decimal.new("0.39"))
+  end
+
+  test "cost_plus uses rate card plus margin for zero, unknown, invalid, and session-only cost" do
+    routers = [
+      %{"cost_usd" => 0},
+      %{},
+      %{"cost_usd" => "junk"},
+      %{"session_acc" => %{"cost_usd" => 99}}
+    ]
+
+    for router <- routers do
+      {charge, false} = ProxyPlug.executed_cost_usd(@usage, opts(:cost_plus, 30), router, nil)
+      assert Decimal.equal?(charge, Decimal.new("2.6"))
+    end
   end
 
   # 0.2.10 (micromarkets#450 review): a HALF-configured card must never count
@@ -136,17 +151,28 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert Decimal.equal?(charge, Decimal.new("2"))
   end
 
-  test "provider_cost_usd records the router's own number verbatim (0 for absent/free)" do
+  test "provider cost classification preserves known zero and distinguishes bad data" do
+    assert ProxyPlug.provider_cost_result(%{"cost_usd" => 0}) == {:known, Decimal.new("0")}
+    assert ProxyPlug.provider_cost_result(%{}) == :unknown
+    assert ProxyPlug.provider_cost_result(%{"cost_usd" => nil}) == :unknown
+    assert ProxyPlug.provider_cost_result(%{"cost_usd" => "junk"}) == :invalid
+    assert ProxyPlug.provider_cost_result(%{"cost_usd" => -1}) == :invalid
+    assert ProxyPlug.provider_cost_result(%{"cost_usd" => "Infinity"}) == :invalid
+
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => 0.3}), Decimal.new("0.3"))
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{}), Decimal.new("0"))
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => "junk"}), Decimal.new("0"))
   end
 
-  test "pricing_mode config normalizes atoms and JSON-IR strings, defaults legacy" do
+  test "pricing_mode config canonicalizes cost-plus aliases and defaults cost-plus" do
     assert Proxy.pricing_mode(:rate_card_first) == :rate_card_first
     assert Proxy.pricing_mode("rate_card_first") == :rate_card_first
-    assert Proxy.pricing_mode("anything") == :provider_first
-    assert Proxy.pricing_mode(nil) == :provider_first
+    assert Proxy.pricing_mode(:cost_plus) == :cost_plus
+    assert Proxy.pricing_mode("cost_plus") == :cost_plus
+    assert Proxy.pricing_mode(:provider_first) == :cost_plus
+    assert Proxy.pricing_mode("provider_first") == :cost_plus
+    assert Proxy.pricing_mode("anything") == :cost_plus
+    assert Proxy.pricing_mode(nil) == :cost_plus
   end
 
   # ── page: both numbers, clearly labeled ─────────────────────────────────────
@@ -167,8 +193,10 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
 
     assert "User spend" in labels
     assert "Router cost" in labels
+    user = Enum.find(today["items"], &(&1["label"] == "User spend"))
     router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
-    assert router["value"] == "$0.919472"
+    assert user["value"] == "$0.00"
+    assert router["value"] == "$0.92"
     assert router["sub"] == "router estimate"
     refute "Spend" in labels
   end

@@ -16,8 +16,10 @@ implementations it unifies — micro-markets carried the other).
   as `max(durable, in-memory)` so it holds even when the store is down.
 - **Per-identity daily request quota** (blocks before upstream).
 - **Cost tracking** per model: spend, prompt/completion tokens, cached tokens
-  (router `x_router.tokens_cached` canonical, Anthropic/OpenAI shapes as fallback),
-  optional cost margin (`margin_pct`).
+  (router `x_router.tokens_cached` canonical, Anthropic/OpenAI shapes as fallback).
+  Default `pricing_mode: :cost_plus` charges the direct per-call provider cost plus
+  `margin_pct`; a zero, missing, or invalid provider cost falls back to the complete
+  operator rate card plus margin.
 - **Streaming gate** (`allow_streaming`) and **prompt-cache marking** (`prompt_cache`).
 - Upstream via curl with the key in a private tempfile config — never argv.
 
@@ -31,7 +33,9 @@ implementations it unifies — micro-markets carried the other).
     upstream_endpoint: "https://router.example/v1/chat/completions",
     upstream_api_key: System.fetch_env!("LLM_PROXY_UPSTREAM_API_KEY"),
     provider: "openai-compatible",
-    prices: %{"model-a" => %{prompt: "3.00", completion: "15.00"}},
+    prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
+    margin_pct: "30",
+    pricing_mode: :cost_plus,
     default_daily_limit: "0.50",
     global_daily_limit: "25.00",
     daily_request_limit: 200,

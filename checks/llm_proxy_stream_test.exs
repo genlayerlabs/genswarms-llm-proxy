@@ -426,7 +426,8 @@ defmodule Genswarms.LlmProxy.StreamStub do
 
       "session-acc-stream" ->
         # per-chunk x_router.cost_usd on the deltas + a FINAL x_router carrying session_acc
-        # (cumulative) but NO cost_usd → bill the session_acc (0.05), not the per-chunk sum.
+        # (cumulative) but NO per-call cost_usd. The cumulative session value is not a
+        # safe per-call basis; with no configured card this is unmetered and loud.
         conn = conn |> put_resp_content_type("text/event-stream") |> send_chunked(200)
 
         frames = [
@@ -830,15 +831,18 @@ check.(
     length(Genswarms.LlmProxy.StreamRecStore.events()) == 1
 )
 
-# ── per-chunk cost + final session_acc → record the session_acc, not the per-chunk sum ──
+# ── final session_acc is not treated as a per-call cost ──
 Genswarms.LlmProxy.StreamRecStore.reset()
+Agent.update(metrics_agent, fn _ -> [] end)
 _ = rec_post.(%{"model" => "session-acc-stream", "messages" => [], "stream" => true})
 _ = wait_events.(1)
 
 check.(
-  "stream accounting: final session_acc.cost_usd recorded (0.05), NOT the per-chunk costs (0.02)",
+  "stream accounting: session_acc-only cost is unknown and unmetered when no rate card is configured",
   length(Genswarms.LlmProxy.StreamRecStore.events()) == 1 and
-    Decimal.equal?(Genswarms.LlmProxy.StreamRecStore.usage(acct_identity, acct_day).spent_usd, Decimal.new("0.05"))
+    Decimal.equal?(Genswarms.LlmProxy.StreamRecStore.usage(acct_identity, acct_day).spent_usd, Decimal.new("0")) and
+    metric_seen?.("llm_proxy_provider_cost_unknown") and
+    metric_seen?.("llm_proxy_stream_unmetered")
 )
 
 # ── truncation (clean EOF, no [DONE]) → llm_proxy_stream_truncated + row STILL written ──

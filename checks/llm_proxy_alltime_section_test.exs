@@ -85,8 +85,8 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert sec["meta"] =~ "since 2026-06-26"
     assert sec["meta"] =~ "14 day"
 
-    assert item(sec, "User spend")["value"] == "$12.500000"
-    assert item(sec, "Router cost")["value"] == "$7.250000"
+    assert item(sec, "User spend")["value"] == "$12.50"
+    assert item(sec, "Router cost")["value"] == "$7.25"
     assert item(sec, "Router cost")["sub"] =~ "estimate"
     assert item(sec, "Requests")["value"] == 12_345
     assert item(sec, "Tokens")["value"] == 95_000_000
@@ -98,7 +98,7 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
 
     sec = section(ext, "All-time")
     assert sec != nil
-    assert item(sec, "User spend")["value"] == "$0.010000"
+    assert item(sec, "User spend")["value"] == "$0.01"
     assert item(sec, "Router cost") == nil
   end
 

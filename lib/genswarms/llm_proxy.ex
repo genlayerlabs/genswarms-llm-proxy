@@ -119,9 +119,10 @@ defmodule Genswarms.LlmProxy do
       provider: Map.get(config, :provider, "openai-compatible"),
       prices: Map.get(config, :prices, %{}),
       margin_pct: Map.get(config, :margin_pct, 0),
-      # :provider_first (default, legacy cost-plus) | :rate_card_first (the user
-      # charge is the operator-SET price even when the upstream call was free;
-      # the router's own cost is recorded separately as provider_cost_usd).
+      # :cost_plus (default; :provider_first remains a compatibility alias) |
+      # :rate_card_first (the user charge is the operator-SET price even when
+      # the upstream call was free; the router's own cost is recorded
+      # separately as provider_cost_usd).
       pricing_mode: pricing_mode(Map.get(config, :pricing_mode)),
       store_mod: module_ref(Map.get(config, :store_mod)),
       default_daily_limit: decimal(Map.get(config, :default_daily_limit, @default_daily_limit)),
@@ -271,11 +272,15 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
-  # Config (atom or string, e.g. from JSON IR) → the pricing-mode atom; anything
-  # unrecognized stays on the legacy default.
+  # Config (atom or string, e.g. from JSON IR) → the pricing-mode atom.
+  # :provider_first is retained as a compatibility alias for the explicit
+  # :cost_plus name; anything unrecognized stays on that safe default.
   @doc false
   def pricing_mode(v) when v in [:rate_card_first, "rate_card_first"], do: :rate_card_first
-  def pricing_mode(_), do: :provider_first
+  def pricing_mode(v) when v in [:cost_plus, "cost_plus", :provider_first, "provider_first"],
+    do: :cost_plus
+
+  def pricing_mode(_), do: :cost_plus
 
   def terminate(_reason, state) do
     if is_pid(state.bandit) and Process.alive?(state.bandit), do: GenServer.stop(state.bandit)
@@ -876,7 +881,7 @@ defmodule Genswarms.LlmProxy do
                   # TWO spends, deliberately distinct: what USERS were charged
                   # (operator-set price) vs what the router says the traffic
                   # cost (synced day estimate — probed host contract below).
-                  %{"label" => "User spend", "value" => "$" <> money(totals.spent_usd)}
+                  %{"label" => "User spend", "value" => "$" <> money2(totals.spent_usd)}
                 ] ++
                   List.wrap(router_cost_item(Keyword.get(opts, :store_mod))) ++
                   [
@@ -934,7 +939,7 @@ defmodule Genswarms.LlmProxy do
         %{cost_usd: cost} = row ->
           %{
             "label" => "Router cost",
-            "value" => "$" <> money(decimal(cost)),
+            "value" => "$" <> money2(cost),
             "sub" => if(Map.get(row, :estimated, true), do: "router estimate", else: nil)
           }
 
@@ -1070,7 +1075,7 @@ defmodule Genswarms.LlmProxy do
           "meta" => since <> "#{Map.get(u, :days, 0)} day(s), durable — the Today block resets at 00:00 UTC",
           "items" =>
             [
-              %{"label" => "User spend", "value" => "$" <> money(decimal(Map.get(u, :spent_usd)))}
+              %{"label" => "User spend", "value" => "$" <> money2(Map.get(u, :spent_usd))}
             ] ++
               List.wrap(router_alltime_item(probe_map(store_mod, :llm_router_cost_alltime))) ++
               [
@@ -1091,7 +1096,7 @@ defmodule Genswarms.LlmProxy do
   defp router_alltime_item(%{cost_usd: cost} = row) do
     %{
       "label" => "Router cost",
-      "value" => "$" <> money(decimal(cost)),
+      "value" => "$" <> money2(cost),
       "sub" => if(Map.get(row, :estimated_any, true), do: "includes router estimates", else: nil)
     }
   end
@@ -1632,8 +1637,8 @@ defmodule Genswarms.LlmProxy do
   def finite_decimal?(%Decimal{}), do: false
   def finite_decimal?(_), do: false
 
-  # User-facing cost markup. `base` is the upstream's reported cost (router cost_usd
-  # or session_acc delta — string/number/%Decimal{}); `rate_card_cost` is the
+  # User-facing cost markup. `base` is the upstream's direct per-call cost
+  # (router cost_usd — string/number/%Decimal{}); `rate_card_cost` is the
   # hardcoded token×price cost the operator charges; `margin_pct` is a percentage
   # markup (env `LLM_PROXY_COST_MARGIN_PCT`).
   #
@@ -2366,6 +2371,7 @@ defmodule Genswarms.LlmProxy.Plug do
         cached_tokens: cached_tokens,
         non_cached_tokens: non_cached_tokens,
         cost_usd: cost,
+        provider_cost_usd: provider_cost_usd(upstream_router),
         provider: Map.get(upstream_router, "provider")
       })
 
@@ -3109,56 +3115,38 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   # Returns `{Decimal.t(), invalid? :: boolean}`. The cost chokepoint: every cost the
-  # ledger ever sees flows through `Proxy.sanitize_cost/1` here — it floors negatives at
-  # 0, rejects non-finite (Inf/NaN → {0, true}), CLAMPS to NUMERIC(18,9) (a finite
-  # >999999999.999999999 from a trusted-but-buggy router can no longer overflow the
-  # durable write), and rounds to 9dp. The direct `cost_usd` branch passes the RAW value
-  # (string/number/%Decimal{}) so `sanitize_cost`'s `raw_decimal/1` can SEE "Infinity"/
-  # "NaN" before `decimal/1`'s hardening would silently zero them.
+  # ledger ever sees flows through `Proxy.sanitize_cost/1` here. In :cost_plus mode a
+  # valid per-call provider cost is authoritative and receives the configured margin;
+  # a known zero, missing, or invalid provider cost falls back to the complete rate
+  # card. A cumulative `session_acc.cost_usd` is deliberately NOT used as a per-call
+  # basis: subtracting the user's already-marked-up spend mixes units and can silently
+  # turn a real provider cost into zero.
   @doc false
   # Public for the two-spends check: this is the money chokepoint.
-  def executed_cost_usd(usage, opts, upstream_router, spent_before) do
+  def executed_cost_usd(usage, opts, upstream_router, _spent_before) do
     prices = Map.get(opts, :prices) || %{}
     margin_pct = Map.get(opts, :margin_pct, 0)
+    rate_card_cost = cost_usd(usage, prices)
+    provider_cost = provider_cost_result(upstream_router)
+
+    track_provider_cost(opts, provider_cost)
 
     raw =
       cond do
-        # pricing_mode :rate_card_first — the USER charge is the OPERATOR-SET
-        # price: with a rate card configured, the user is billed at that price
-        # REGARDLESS of the router's own cost (a free subscription-served call
-        # still charges the set price; the router's number is recorded
-        # separately as provider_cost_usd). Default :provider_first keeps the
-        # legacy cost-plus behavior: router-reported cost is the charge basis,
-        # rate card only fills a $0/absent cost (see markup_cost).
-        Map.get(opts, :pricing_mode, :provider_first) == :rate_card_first and
+        Proxy.pricing_mode(Map.get(opts, :pricing_mode)) == :rate_card_first and
             prices_set?(prices) ->
-          cost_usd(usage, prices)
+          rate_card_cost
 
-        decimal_present?(Map.get(upstream_router, "cost_usd")) ->
-          Map.get(upstream_router, "cost_usd")
-
-        decimal_present?(get_in(upstream_router, ["session_acc", "cost_usd"])) ->
-          # raw_decimal (NOT decimal/1) so a non-finite session_acc cost survives to
-          # sanitize_cost below and is FLAGGED (llm_proxy_cost_invalid) instead of being
-          # silently zeroed by decimal/1's hardening before it can be detected.
-          sa = Proxy.raw_decimal(get_in(upstream_router, ["session_acc", "cost_usd"]))
-
-          if Proxy.finite_decimal?(sa) do
-            Decimal.sub(sa, spent_before || Decimal.new("0"))
-          else
-            sa
-          end
+        match?({:known, _}, provider_cost) ->
+          {:known, cost} = provider_cost
+          cost
 
         true ->
-          cost_usd(usage, prices)
+          rate_card_cost
       end
 
-    # Apply the operator markup: a free/$0 upstream cost falls back to the rate card,
-    # then the (finite) basis is marked up by margin_pct. A non-finite `raw` passes
-    # through untouched so sanitize_cost still flags it. Default (margin 0 + no prices)
-    # is a no-op, so this is byte-identical to the un-marked-up cost.
     raw
-    |> Proxy.markup_cost(cost_usd(usage, prices), margin_pct)
+    |> Proxy.markup_cost(rate_card_cost, margin_pct)
     |> Proxy.sanitize_cost()
   end
 
@@ -3188,18 +3176,79 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp prices_set?(_), do: false
 
-  # The router's OWN cost for this call, recorded verbatim alongside the user
-  # charge (provider_cost_usd). $0 from a subscription-served backend is honest
-  # here — the authoritative "what we owe" day series is synced from the
-  # router's usage API by the host; this per-call figure is the fidelity trail.
+  # Preserve provider-cost knownness internally. The current durable schema still
+  # stores a Decimal only, so provider_cost_usd/1 maps unknown/invalid to zero for
+  # compatibility while explicit metrics retain the distinction. The v4 envelope
+  # can migrate this result directly to its planned knownness fields.
+  @doc false
+  def provider_cost_result(upstream_router) when is_map(upstream_router) do
+    case Map.fetch(upstream_router, "cost_usd") do
+      :error -> :unknown
+      {:ok, nil} -> :unknown
+      {:ok, raw} -> classify_provider_cost(raw)
+    end
+  end
+
+  def provider_cost_result(_), do: :unknown
+
+  defp classify_provider_cost(raw)
+       when is_integer(raw) or is_float(raw) or is_binary(raw) or is_struct(raw, Decimal) do
+    parsed =
+      cond do
+        is_struct(raw, Decimal) -> {:ok, raw}
+        is_integer(raw) -> {:ok, Decimal.new(raw)}
+        is_float(raw) -> {:ok, Decimal.from_float(raw)}
+
+        is_binary(raw) ->
+          case Decimal.parse(raw) do
+            {value, ""} -> {:ok, value}
+            _ -> :error
+          end
+      end
+
+    case parsed do
+      {:ok, value} ->
+        cond do
+          not Proxy.finite_decimal?(value) ->
+            :invalid
+
+          Decimal.compare(value, 0) == :lt ->
+            :invalid
+
+          true ->
+            case Proxy.sanitize_cost(value) do
+              {_cost, true} -> :invalid
+              {cost, false} -> {:known, cost}
+            end
+        end
+
+      :error ->
+        :invalid
+    end
+  rescue
+    _ -> :invalid
+  end
+
+  defp classify_provider_cost(_), do: :invalid
+
   @doc false
   def provider_cost_usd(upstream_router) do
-    raw = Map.get(upstream_router, "cost_usd")
+    case provider_cost_result(upstream_router) do
+      {:known, cost} -> cost
+      _ -> Decimal.new(0)
+    end
+  end
 
-    {cost, _invalid?} =
-      if decimal_present?(raw), do: Proxy.sanitize_cost(raw), else: Proxy.sanitize_cost(0)
+  defp track_provider_cost(_opts, {:known, _cost}), do: :ok
 
-    cost
+  defp track_provider_cost(opts, :unknown) do
+    bump_metric(opts, "llm_proxy_provider_cost_unknown")
+  end
+
+  defp track_provider_cost(opts, :invalid) do
+    bump_metric(opts, "llm_proxy_provider_cost_unknown")
+    bump_metric(opts, "llm_proxy_provider_cost_invalid")
+    bump_metric(opts, "llm_proxy_cost_invalid")
   end
 
   defp x_router(
