@@ -3491,7 +3491,7 @@ defmodule Genswarms.LlmProxy.Plug do
     )
   end
 
-  defp respond_upstream(conn, status, body, latency_ms, session, request_ctx, _budget, opts) do
+  defp respond_upstream(conn, status, body, latency_ms, session, request_ctx, budget, opts) do
     bump_metric(opts, "llm_proxy_upstream_error")
     err = Map.get(body, "error") || %{}
     code = Map.get(err, "code") || "upstream_error"
@@ -3500,12 +3500,54 @@ defmodule Genswarms.LlmProxy.Plug do
     model = served_model(upstream_router, %{}, conn.body_params)
     request_id = request_id()
 
-    record_budget_call(opts, session, request_ctx, %{
+    # Money the router billed is never invisible — the same invariant
+    # compact_record/4 holds for failed seals. A router can bill a partial call
+    # and still answer non-2xx; when the error body PROVES a billed call
+    # (OpenAI-shape "usage", or a known x_router cost) the row is priced through
+    # the executed_cost_usd chokepoint and carries the two-spends accounting, so
+    # SUM(cost_usd) never undercounts real spend. Status stays the error code
+    # (the request quota is not burned), only the dollar budget advances. A bare
+    # error body — the overwhelmingly common 5xx — keeps the minimal legacy row:
+    # no invented cost, and no llm_proxy_provider_cost_unknown noise (that
+    # counter means "billable call missing router cost", not "upstream errored").
+    billed? =
+      Map.has_key?(body, "usage") or
+        match?({:known, _}, provider_cost_result(upstream_router))
+
+    base_record = %{
       request_id: request_id,
       model: model,
       status: code,
       provider: Map.get(upstream_router, "provider")
-    })
+    }
+
+    {record, usage, cost} =
+      if billed? do
+        usage = normalize_usage_counts(Map.get(body, "usage") || %{})
+        {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+        if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
+        {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+
+        record =
+          Map.merge(base_record, %{
+            prompt_tokens: usage["prompt_tokens"],
+            completion_tokens: usage["completion_tokens"],
+            total_tokens: usage["total_tokens"],
+            cached_tokens: cached_tokens,
+            non_cached_tokens: non_cached_tokens,
+            cost_usd: cost,
+            provider_cost_usd: provider_cost_usd(upstream_router),
+            provider_cost_state: provider_cost_state(upstream_router),
+            charge_basis: charge_basis(opts, upstream_router),
+            pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1")
+          })
+
+        {record, usage, cost}
+      else
+        {base_record, %{}, nil}
+      end
+
+    record_budget_call(opts, session, request_ctx, record)
 
     json(conn, status, %{
       error: %{
@@ -3519,9 +3561,9 @@ defmodule Genswarms.LlmProxy.Plug do
           request_ctx,
           request_id,
           model,
-          %{},
+          usage,
           latency_ms,
-          nil,
+          cost,
           message,
           upstream_router
         )
