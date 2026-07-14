@@ -85,9 +85,9 @@ defmodule GenswarmsLlmProxyPeriodTabsTest do
     refute "status" in keys
 
     [top, second] = seven["rows"]
-    assert top["spent"] == "$0.400000"
+    assert top["spent"] == "$0.40"
     assert top["budget"] == "llmb_alpha00000"
-    assert second["spent"] == "$0.020000"
+    assert second["spent"] == "$0.02"
     assert top["cache"] == "50%"
 
     # the flat Users table is REPLACED by the tabs section, not duplicated

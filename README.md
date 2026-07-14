@@ -19,7 +19,8 @@ implementations it unifies — micro-markets carried the other).
   (router `x_router.tokens_cached` canonical, Anthropic/OpenAI shapes as fallback).
   Default `pricing_mode: :cost_plus` charges the direct per-call provider cost plus
   `margin_pct`; a zero, missing, or invalid provider cost falls back to the complete
-  operator rate card plus margin.
+  operator rate card plus margin. Cost-plus refuses to boot without both valid
+  fallback prices and a finite non-negative margin.
 - **Streaming gate** (`allow_streaming`) and **prompt-cache marking** (`prompt_cache`).
 - Upstream via curl with the key in a private tempfile config — never argv.
 
@@ -76,7 +77,9 @@ What this package does:
   set this key *in addition to* `:genswarms_objects`' one.
 - **Probed extension:** `dashboard_extension/1` (`store_mod:` + optional
   `day/state_pid/users_by_*` opts) returns usage/budget pages in the generic
-  schema-1 page grammar; inert `%{}` without a store.
+  schema-1 page grammar; inert `%{}` without a store. Hosts may expose
+  `llm_financials_alltime/0` to split same-scope charges, router cost, and gross
+  margin from reconstructed or otherwise non-comparable historical usage.
 - Live emit contract test: `checks/llm_proxy_display_events_test.exs`.
 
 ### `llm_proxy_budget` machine block
@@ -106,7 +109,7 @@ Standalone contract checks (no Postgres, no network — injected seams):
 
 ```sh
 mix deps.get
-./checks/run.sh        # 11 checks, each `mix run checks/<file>.exs`
+./checks/run.sh        # every `checks/llm_proxy_*.exs` contract check
 ```
 
 Host-side integration tests against a REAL store (Postgres) live in the host

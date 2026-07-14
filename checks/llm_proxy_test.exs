@@ -534,6 +534,9 @@ check.(
   xr["provider"] == "openrouter" and xr["model_family"] == "deepseek-v3" and
     xr["served_model_id"] == "deepseek/deepseek-chat" and
     xr["served_model"] == "deepseek/deepseek-chat" and xr["cost_usd"] == 0.000123 and
+    xr["user_charge_usd"] == 0.000123 and xr["provider_cost_usd"] == 0.000123 and
+    xr["provider_cost_state"] == "known" and xr["charge_basis"] == "provider_cost" and
+    xr["pricing_version"] == "cost_plus_v1" and
     xr["price_in"] == 0.14 and xr["price_out"] == 0.28 and
     get_in(xr, ["decision_trace", "decision_path"]) != nil and
     xr["request_id"] != nil and xr["session_id"] == today_session and
@@ -582,7 +585,7 @@ check.(
     dashboard_table["meta"] == "unmapped rows come from budget hashes" and
     dashboard_page["id"] == "proxy-router" and
     dashboard_row["user"] == "@alice · Alice" and
-    dashboard_row["spent"] == "$0.000123" and
+    dashboard_row["spent"] == "$0.0001" and
     String.starts_with?(dashboard_row["budget"], "llmb_") and
     not String.contains?(dashboard_row["budget"], "tg:123")
 )
@@ -695,7 +698,7 @@ check.(
   "dashboard extension can label durable Postgres rows after proxy restart via budget identity map",
   durable_dashboard_ext["proxy_router"]["source"] == "postgres" and
     durable_dashboard_row["user"] == "@alice · Alice" and
-    durable_dashboard_row["spent"] == "$0.000123"
+    durable_dashboard_row["spent"] == "$0.0001"
 )
 
 group_budget_identity =
@@ -1649,6 +1652,7 @@ check.(
     Decimal.equal?(b1_usage1.spent_usd, Decimal.new("0.000001")) and
     "llm_proxy_cost_invalid" in Agent.get(b1_metrics, & &1) and
     "llm_proxy_provider_cost_invalid" in Agent.get(b1_metrics, & &1) and
+    not ("llm_proxy_provider_cost_unknown" in Agent.get(b1_metrics, & &1)) and
     b1_conn2.status == 200 and
     Decimal.equal?(b1_usage2.spent_usd, Decimal.new("0.001001")) and
     b1_usage2.requests == 2
