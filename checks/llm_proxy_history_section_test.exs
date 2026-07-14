@@ -69,7 +69,7 @@ defmodule GenswarmsLlmProxyHistorySectionTest do
     assert today_row["budgets"] == 36
     # cache rate derived from cached/prompt, spend rendered as money
     assert is_binary(today_row["cache"])
-    assert yesterday_row["spent"] == "$0.250000"
+    assert yesterday_row["spent"] == "$0.25"
   end
 
   test "a store without llm_usage_days/1 contributes no history section" do

@@ -76,6 +76,7 @@ defmodule GenswarmsLlmProxyStaticSessionsTest do
         port: port,
         upstream_endpoint: "http://127.0.0.1:9/never",
         upstream_api_key: "k",
+        prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
         static_sessions: [
           %{
             token: @token,

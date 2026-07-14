@@ -42,6 +42,7 @@ boot_config = %{
   port: boot_port,
   upstream_endpoint: "https://llm.example/v1/chat/completions",
   upstream_api_key: "sk-boot-smoke-key",
+  prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
   # ≤ 0 default_daily_limit → exercises the warning branch in init/1 (must NOT crash).
   default_daily_limit: "0",
   # 50 → clamped to 3 in plug_opts (min(max(50,0),3)); init must accept it without crashing.

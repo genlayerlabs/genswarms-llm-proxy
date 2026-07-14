@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.2.14 - 2026-07-14
+
+- Fail closed at object boot when `pricing_mode: :cost_plus` has no complete,
+  finite, non-negative prompt/completion fallback rate card or has a malformed
+  margin. Provider zero, missing, or invalid cost can no longer silently lose
+  its configured fallback because pricing configuration was omitted or bad.
+- Publish explicit `user_charge_usd`, `provider_cost_usd`,
+  `provider_cost_state`, and `charge_basis` fields in the returned `x_router`
+  envelope while retaining `cost_usd` as the compatibility user-charge field.
+  The same state/basis metadata is passed to durable store callbacks.
+- Make provider-cost telemetry disjoint: missing cost bumps `unknown`; malformed
+  cost bumps `invalid` plus the legacy invalid counter, but no longer also bumps
+  `unknown`.
+- Format dashboard detail money adaptively: cents normally and four decimals
+  only for non-zero sub-cent values. Durable/API accounting precision remains
+  nine/six decimals as before.
+- Support an optional same-scope `llm_financials_alltime/0` host contract that
+  separates authoritative charges/router cost/gross margin and reconciliation
+  coverage from non-comparable historical usage.
+
 ## 0.2.13 - 2026-07-14
 
 - Make the default provider-first policy explicit as `pricing_mode: :cost_plus`

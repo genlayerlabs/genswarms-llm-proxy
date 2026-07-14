@@ -150,6 +150,7 @@ check.(
 config = %{
   upstream_endpoint: "http://127.0.0.1:1/x",
   upstream_api_key: sentinel,
+  prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
   port: 0
 }
 

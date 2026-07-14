@@ -16,7 +16,10 @@ defmodule AlltimeStore do
       prompt_tokens: 90_000_000,
       total_tokens: 95_000_000,
       cached_tokens: 45_000_000,
-      spent_usd: Decimal.new("12.5")
+      spent_usd: Decimal.new("12.5"),
+      accounting_note: "legacy spend reconstructed",
+      spend_label: "Repriced spend",
+      spend_sub: "includes archive-backed pre-proxy pricing"
     }
   end
 
@@ -34,6 +37,26 @@ defmodule AlltimeNoRouterStore do
       total_tokens: 1100,
       cached_tokens: 0,
       spent_usd: Decimal.new("0.01")
+    }
+  end
+end
+
+defmodule AlltimeAuthoritativeStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    %{
+      since: ~D[2026-07-15],
+      days: 2,
+      spent_usd: Decimal.new("13.00"),
+      router_cost_usd: Decimal.new("10.00"),
+      gross_margin_usd: Decimal.new("3.00"),
+      gross_margin_pct: Decimal.new("30.0"),
+      estimated_any: false,
+      ledger_requests: 100,
+      router_requests: 100,
+      mismatched_days: 0,
+      reconciled: true
     }
   end
 end
@@ -100,6 +123,25 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert sec != nil
     assert item(sec, "User spend")["value"] == "$0.01"
     assert item(sec, "Router cost") == nil
+  end
+
+  test "authoritative financial contract separates reconstructed history from same-scope margin" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeAuthoritativeStore)
+
+    usage = section(ext, "All-time usage")
+    financials = section(ext, "Financials")
+
+    assert item(usage, "Repriced spend")["value"] == "$12.50"
+    assert item(usage, "Repriced spend")["sub"] =~ "pre-proxy"
+    assert item(usage, "Router cost") == nil
+
+    assert financials["meta"] =~ "authoritative since 2026-07-15"
+    assert item(financials, "User charges")["value"] == "$13.00"
+    assert item(financials, "Router cost")["value"] == "$10.00"
+    assert item(financials, "Gross margin")["value"] == "$3.00"
+    assert item(financials, "Gross margin")["sub"] == "30.0% of router cost"
+    assert item(financials, "Request coverage")["value"] == "100/100"
+    assert item(financials, "Request coverage")["sub"] == "ledger/router matched"
   end
 
   test "nil usage (empty / persistence-off store) contributes no all-time section" do

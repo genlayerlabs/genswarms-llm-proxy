@@ -162,6 +162,32 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => 0.3}), Decimal.new("0.3"))
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{}), Decimal.new("0"))
     assert Decimal.equal?(ProxyPlug.provider_cost_usd(%{"cost_usd" => "junk"}), Decimal.new("0"))
+    assert ProxyPlug.provider_cost_state(%{"cost_usd" => 0.3}) == "known"
+    assert ProxyPlug.provider_cost_state(%{"cost_usd" => 0}) == "zero"
+    assert ProxyPlug.provider_cost_state(%{}) == "missing"
+    assert ProxyPlug.provider_cost_state(%{"cost_usd" => "junk"}) == "invalid"
+    assert ProxyPlug.charge_basis(opts(:cost_plus), %{"cost_usd" => 0.3}) == "provider_cost"
+    assert ProxyPlug.charge_basis(opts(:cost_plus), %{}) == "rate_card"
+  end
+
+  test "cost-plus boot contract requires a complete valid fallback card" do
+    assert :ok = Proxy.validate_pricing_config!(:cost_plus, @prices)
+    assert :ok = Proxy.validate_pricing_config!(:rate_card_first, %{})
+
+    for bad <- [
+          %{},
+          %{prompt_per_mtok: 2.0},
+          %{prompt_per_mtok: -1, completion_per_mtok: 2},
+          %{prompt_per_mtok: "junk", completion_per_mtok: 2}
+        ] do
+      assert_raise ArgumentError, fn -> Proxy.validate_pricing_config!(:cost_plus, bad) end
+    end
+
+    for bad_margin <- [-1, "junk", "Infinity"] do
+      assert_raise ArgumentError, fn ->
+        Proxy.validate_pricing_config!(:cost_plus, @prices, bad_margin)
+      end
+    end
   end
 
   test "pricing_mode config canonicalizes cost-plus aliases and defaults cost-plus" do
@@ -230,8 +256,8 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert Enum.any?(hist["columns"], &(&1["label"] == "user spent"))
 
     [today_row, yesterday_row] = hist["rows"]
-    assert today_row["router"] == "$0.900000"
-    assert today_row["spent"] == "$0.500000"
+    assert today_row["router"] == "$0.90"
+    assert today_row["spent"] == "$0.50"
     # a day the host has no router estimate for renders an em-dash, not $0
     assert yesterday_row["router"] == "—"
   end
