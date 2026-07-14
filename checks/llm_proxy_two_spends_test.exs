@@ -6,7 +6,14 @@
 ExUnit.start()
 
 defmodule RouterCostStore do
-  def llm_router_cost_today, do: %{cost_usd: Decimal.new("0.919472"), estimated: true}
+  def llm_router_cost_today do
+    %{
+      cost_usd: Decimal.new("0.919472"),
+      estimated: true,
+      authoritative: true,
+      fetched_at: ~U[2026-07-15 13:42:00Z]
+    }
+  end
 
   def llm_usage_days(_days) do
     [
@@ -40,7 +47,12 @@ end
 
 defmodule LegacyRouterCostStore do
   def llm_router_cost_today do
-    %{cost_usd: Decimal.new("0.919472"), estimated: true, authoritative: false}
+    %{
+      cost_usd: Decimal.new("0.919472"),
+      estimated: true,
+      authoritative: false,
+      fetched_at: ~U[2026-07-14 12:05:00Z]
+    }
   end
 end
 
@@ -218,34 +230,42 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
 
   defp page(ext), do: Enum.find(ext["dashboard_pages"], &(&1["id"] == "proxy-router"))
 
-  test "Today shows Charged users AND the host-synced Router cost tile" do
+  test "Today separates usage from user charges and the fresh router cost" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RouterCostStore)
-    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
-    labels = Enum.map(today["items"], & &1["label"])
+    usage = Enum.find(page(ext)["sections"], &(&1["title"] == "Today usage"))
+    costs = Enum.find(page(ext)["sections"], &(&1["title"] == "Today costs"))
+    usage_labels = Enum.map(usage["items"], & &1["label"])
+    cost_labels = Enum.map(costs["items"], & &1["label"])
 
-    assert "Charged users" in labels
-    assert "Router cost" in labels
-    user = Enum.find(today["items"], &(&1["label"] == "Charged users"))
-    router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
+    refute "User charges" in usage_labels
+    refute "Router cost" in usage_labels
+    assert "User charges" in cost_labels
+    assert "Router cost" in cost_labels
+    assert costs["columns"] == 2
+    assert costs["meta"] == "same-scope UTC day"
+    user = Enum.find(costs["items"], &(&1["label"] == "User charges"))
+    router = Enum.find(costs["items"], &(&1["label"] == "Router cost"))
     assert user["value"] == "$0.00"
     assert router["value"] == "$0.92"
-    assert router["sub"] == "router estimate"
-    refute "Spend" in labels
+    assert router["sub"] == "router estimate · updated 13:42 UTC"
+    assert router["wrap_sub"] == true
   end
 
   test "a store without llm_router_cost_today/0 contributes no Router-cost tile" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: NoRouterStore)
-    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
-    refute Enum.any?(today["items"], &(&1["label"] == "Router cost"))
+    costs = Enum.find(page(ext)["sections"], &(&1["title"] == "Today costs"))
+    refute Enum.any?(costs["items"], &(&1["label"] == "Router cost"))
+    assert costs["meta"] == "router cost unavailable"
   end
 
   test "Today shows legacy router evidence but marks it non-comparable" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: LegacyRouterCostStore)
-    today = Enum.find(page(ext)["sections"], &(&1["title"] == "Today"))
-    router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
+    costs = Enum.find(page(ext)["sections"], &(&1["title"] == "Today costs"))
+    router = Enum.find(costs["items"], &(&1["label"] == "Router cost"))
 
     assert router["value"] == "$0.92"
-    assert router["sub"] == "legacy · not comparable"
+    assert router["sub"] == "router estimate · updated 12:05 UTC"
+    assert costs["meta"] == "legacy shared key · not comparable"
   end
 
   test "Users rows carry _cid metadata (never a column) for the dashboard's inspector" do

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.17 - 2026-07-14
+
+- Separate Today and all-time usage from cost accounting so monetary values
+  have an explicit scope instead of sharing a telemetry card.
+- Present legacy lifetime values as non-comparable historical evidence, while
+  authoritative same-scope user charges, router cost, cost-plus margin, and
+  request/token coverage live in their own reconciliation card.
+- Carry router snapshot freshness into the Today cost explanation when the host
+  provides `fetched_at`, and opt accounting sections into readable responsive
+  columns and wrapping notes.
+
 ## 0.2.16 - 2026-07-14
 
 - Give the four-column Costs section the full dashboard width so its labels and

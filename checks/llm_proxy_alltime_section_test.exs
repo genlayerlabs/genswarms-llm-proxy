@@ -55,8 +55,11 @@ defmodule AlltimeAuthoritativeStore do
       estimated_any: false,
       ledger_requests: 100,
       router_requests: 100,
+      ledger_tokens: 95_000_000,
+      router_tokens: 95_000_000,
       mismatched_days: 0,
       reconciled: true,
+      authoritative: true,
       accounting_scope: "test-production-v1"
     }
   end
@@ -76,8 +79,11 @@ defmodule AlltimeUnreconciledStore do
       estimated_any: true,
       ledger_requests: 99,
       router_requests: 100,
+      ledger_tokens: 94_000_000,
+      router_tokens: 95_000_000,
       mismatched_days: 1,
       reconciled: false,
+      authoritative: true,
       accounting_scope: "test-production-v1"
     }
   end
@@ -99,6 +105,51 @@ defmodule AlltimeHistoricalEvidenceStore do
       accounting_scope: "legacy-shared-key",
       accounting_note: "historical cost evidence · totals are not comparable"
     }
+  end
+end
+
+defmodule AlltimeMixedScopeStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    %{
+      since: ~D[2026-07-15],
+      days: 1,
+      spent_usd: Decimal.new("1.30"),
+      router_cost_usd: Decimal.new("1.00"),
+      gross_margin_usd: Decimal.new("0.30"),
+      gross_margin_pct: Decimal.new("30"),
+      estimated_any: true,
+      ledger_requests: 10,
+      router_requests: 10,
+      ledger_tokens: 1_000,
+      router_tokens: 1_000,
+      reconciled: true,
+      authoritative: true,
+      accounting_scope: "wingston-production-v1",
+      lifetime_spent_usd: Decimal.new("136.61"),
+      lifetime_router_cost_usd: Decimal.new("71.54"),
+      legacy_router_included: true
+    }
+  end
+end
+
+defmodule AlltimeUnmarkedFinancialStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    AlltimeAuthoritativeStore.llm_financials_alltime()
+    |> Map.delete(:authoritative)
+  end
+end
+
+defmodule AlltimeContradictoryCoverageStore do
+  defdelegate llm_usage_alltime(), to: AlltimeStore
+
+  def llm_financials_alltime do
+    AlltimeAuthoritativeStore.llm_financials_alltime()
+    |> Map.put(:ledger_tokens, 94_999_999)
+    |> Map.put(:reconciled, true)
   end
 end
 
@@ -138,70 +189,77 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
 
   defp item(sec, label), do: Enum.find(sec["items"], &(&1["label"] == label))
 
-  test "all-time metrics section renders both spends from the probed contracts" do
+  test "legacy all-time contracts separate usage from lifetime cost evidence" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeStore)
 
-    sec = section(ext, "All-time")
-    assert sec["type"] == "metrics"
+    usage = section(ext, "All-time usage")
+    costs = section(ext, "Lifetime costs")
+    assert usage["type"] == "metrics"
     # summary blocks share a row on wide screens (frontend 0.3.6 span grammar)
-    assert sec["span"] == "half"
+    assert usage["span"] == "half"
     assert section(ext, "Today")["span"] == "half"
-    assert sec["meta"] =~ "since 2026-06-26"
-    assert sec["meta"] =~ "14 day"
+    assert usage["meta"] =~ "since 2026-06-26"
+    assert usage["meta"] =~ "14 day"
 
-    assert item(sec, "Charged users")["value"] == "$12.50"
-    assert item(sec, "Router charged us")["value"] == "$7.25"
-    assert item(sec, "Router charged us")["sub"] =~ "estimate"
-    assert item(sec, "Requests")["value"] == 12_345
-    assert item(sec, "Tokens")["value"] == "95M"
-    assert item(sec, "Cache")["value"] == "50%"
+    assert item(usage, "Requests")["value"] == 12_345
+    assert item(usage, "Tokens")["value"] == "95M"
+    assert item(usage, "Cache")["value"] == "50%"
+    assert costs["columns"] == 2
+    assert costs["meta"] =~ "comparability unverified"
+    assert item(costs, "Repriced user total")["value"] == "$12.50"
+    assert item(costs, "Router evidence")["value"] == "$7.25"
+    assert item(costs, "Router evidence")["sub"] =~ "estimate"
   end
 
   test "router tile is omitted when the host has no router-total contract" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeNoRouterStore)
 
-    sec = section(ext, "All-time")
-    assert sec != nil
-    assert item(sec, "Charged users")["value"] == "$0.01"
-    assert item(sec, "Router charged us") == nil
+    usage = section(ext, "All-time usage")
+    costs = section(ext, "Lifetime costs")
+    assert usage != nil
+    assert item(costs, "Reported user total")["value"] == "$0.01"
+    assert item(costs, "Router evidence") == nil
   end
 
   test "authoritative financial contract separates reconstructed history from same-scope margin" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeAuthoritativeStore)
 
     usage = section(ext, "All-time usage")
-    financials = section(ext, "Costs")
+    financials = section(ext, "Comparable accounting")
 
     assert financials["span"] == "full"
+    assert financials["columns"] == 4
     assert item(usage, "Repriced spend") == nil
     assert item(usage, "Tokens")["value"] == "95M"
-    assert item(usage, "Router charged us") == nil
+    assert item(usage, "Router cost") == nil
+    assert section(ext, "Historical evidence") == nil
 
-    assert financials["meta"] =~ "authoritative source since 2026-07-15"
-    assert financials["meta"] =~ "reconciled"
+    assert financials["meta"] =~ "since 2026-07-15"
     assert financials["meta"] =~ "scope test-production-v1"
-    assert item(financials, "Charged users")["value"] == "$13.00"
-    assert item(financials, "Router charged us")["value"] == "$10.00"
+    assert item(financials, "User charges")["value"] == "$13.00"
+    assert item(financials, "Router cost")["value"] == "$10.00"
     assert item(financials, "Cost-plus margin")["value"] == "$3.00"
 
-    assert item(financials, "Cost-plus margin")["sub"] ==
-             "30.0% of comparable router cost since cutover"
+    assert item(financials, "Cost-plus margin")["sub"] == "30.0% of router cost"
 
-    assert item(financials, "Request coverage")["value"] == "100/100"
-    assert item(financials, "Request coverage")["sub"] == "ledger/router matched"
+    assert item(financials, "Coverage")["value"] == "Reconciled"
+    assert item(financials, "Coverage")["sub"] == "req 100/100 · tokens 95M/95M"
+
+    assert item(financials, "Coverage")["title"] ==
+             "Requests 100/100; tokens 95000000/95000000"
   end
 
   test "unreconciled financials expose raw totals but withhold numeric margin" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeUnreconciledStore)
-    financials = section(ext, "Costs")
+    financials = section(ext, "Comparable accounting")
 
-    assert financials["meta"] =~ "UNRECONCILED"
-    assert item(financials, "Charged users")["value"] == "$13.00"
-    assert item(financials, "Router charged us")["value"] == "$11.00"
+    assert item(financials, "User charges")["value"] == "$13.00"
+    assert item(financials, "Router cost")["value"] == "$11.00"
     assert item(financials, "Cost-plus margin")["value"] == "—"
     assert item(financials, "Cost-plus margin")["sub"] =~ "withheld"
-    assert item(financials, "Request coverage")["value"] == "99/100"
-    assert item(financials, "Request coverage")["sub"] =~ "mismatch"
+    assert item(financials, "Coverage")["value"] == "Mismatch"
+    assert item(financials, "Coverage")["sub"] == "req 99/100 · tokens 94M/95M"
+    assert item(financials, "Coverage")["tone"] == "warn"
   end
 
   test "historical evidence shows both lifetime totals without implying comparability" do
@@ -212,17 +270,50 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
       )
 
     usage = section(ext, "All-time usage")
-    costs = section(ext, "Costs")
+    costs = section(ext, "Historical evidence")
 
     assert length(usage["items"]) == 3
     assert costs["meta"] =~ "not comparable"
-    assert costs["meta"] =~ "legacy-shared-key"
-    assert item(costs, "Charged users")["value"] == "$133.63"
-    assert item(costs, "Charged users")["sub"] =~ "all-time"
-    assert item(costs, "Router charged us")["value"] == "$68.49"
-    assert item(costs, "Router charged us")["sub"] =~ "not comparable"
-    assert item(costs, "Cost-plus margin")["value"] == "—"
-    assert item(costs, "Comparable")["value"] == "No"
+    assert costs["meta"] =~ "legacy shared key"
+    assert costs["columns"] == 2
+    assert item(costs, "Repriced user total")["value"] == "$133.63"
+    assert item(costs, "Repriced user total")["sub"] =~ "archive-backed"
+    assert item(costs, "Router evidence")["value"] == "$68.49"
+    assert item(costs, "Router evidence")["sub"] =~ "legacy shared-key"
+    assert section(ext, "Comparable accounting") == nil
+  end
+
+  test "mixed history never places lifetime totals inside the comparable margin card" do
+    ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeMixedScopeStore)
+    history = section(ext, "Historical evidence")
+    comparable = section(ext, "Comparable accounting")
+
+    assert item(history, "Repriced user total")["value"] == "$136.61"
+    assert item(history, "Router evidence")["value"] == "$71.54"
+    assert item(comparable, "User charges")["value"] == "$1.30"
+    assert item(comparable, "Router cost")["value"] == "$1.00"
+    assert item(comparable, "Cost-plus margin")["value"] == "$0.30"
+    assert item(comparable, "Coverage")["value"] == "Reconciled"
+  end
+
+  test "an unmarked financial contract is historical evidence, never comparable accounting" do
+    ext =
+      Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeUnmarkedFinancialStore)
+
+    assert section(ext, "Historical evidence") != nil
+    assert section(ext, "Comparable accounting") == nil
+  end
+
+  test "observed token mismatch overrides a contradictory reconciled flag" do
+    ext =
+      Proxy.dashboard_extension(
+        state_pid: dead_state(),
+        store_mod: AlltimeContradictoryCoverageStore
+      )
+
+    comparable = section(ext, "Comparable accounting")
+    assert item(comparable, "Cost-plus margin")["value"] == "—"
+    assert item(comparable, "Coverage")["value"] == "Mismatch"
   end
 
   test "nil usage (empty / persistence-off store) contributes no all-time section" do
