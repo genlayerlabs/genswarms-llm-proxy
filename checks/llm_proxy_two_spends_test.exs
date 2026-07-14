@@ -245,8 +245,7 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     router = Enum.find(today["items"], &(&1["label"] == "Router cost"))
 
     assert router["value"] == "$0.92"
-    assert router["sub"] =~ "legacy"
-    assert router["sub"] =~ "not comparable"
+    assert router["sub"] == "legacy · not comparable"
   end
 
   test "Users rows carry _cid metadata (never a column) for the dashboard's inspector" do
