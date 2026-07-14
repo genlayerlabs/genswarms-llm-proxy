@@ -4,7 +4,7 @@ defmodule GenswarmsLlmProxy.MixProject do
   def project do
     [
       app: :genswarms_llm_proxy,
-      version: "0.2.15",
+      version: "0.2.16",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       source_url: "https://github.com/genlayerlabs/genswarms-llm-proxy",
