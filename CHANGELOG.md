@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+## 0.2.13 - 2026-07-14
+
+- Make the default provider-first policy explicit as `pricing_mode: :cost_plus`
+  (`:provider_first` remains a compatibility alias). A valid direct per-call
+  provider cost is charged with `margin_pct`; provider zero, missing, malformed,
+  negative, non-finite, or out-of-range cost falls back to the complete rate card
+  with the same margin.
+- Stop deriving per-call cost from cumulative `x_router.session_acc.cost_usd`.
+  That path subtracted already-marked-up user spend from raw provider cost, mixing
+  units and allowing real calls to be recorded as free. Session-acc-only responses
+  now use the rate-card fallback.
+- Add `llm_proxy_provider_cost_unknown` and
+  `llm_proxy_provider_cost_invalid` telemetry. The legacy
+  `llm_proxy_cost_invalid` metric also fires for invalid provider data.
+- Proxy-router Today and All-time headline spend tiles now render currency to
+  cents. Per-user, per-model, and per-day tables retain six-decimal precision
+  so small charges remain visible.
+
 ## 0.2.12 - 2026-07-10
 
 - Proxy-router page polish (operator feedback): the Today and All-time

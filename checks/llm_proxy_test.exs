@@ -1122,8 +1122,9 @@ session_acc_conn =
 usage = ProxyCheck.TestLLMProxyStore.usage(budget_identity, today)
 
 check.(
-  "exact cost can be recorded from x_router.session_acc when per-call cost is absent",
-  session_acc_conn.status == 200 and Decimal.equal?(usage.spent_usd, Decimal.new("0.0002")) and
+  "session_acc-only cost falls back to the per-call rate card (never subtracts marked-up spend from provider cumulative)",
+  session_acc_conn.status == 200 and
+    Decimal.equal?(usage.spent_usd, Decimal.new("0.00012525")) and
     usage.requests == 2
 )
 
@@ -1496,12 +1497,11 @@ check.(
     get_in(decode_err_body, ["error", "code"]) == "upstream_invalid_json"
 )
 
-# ── Fix 4: negative upstream cost_usd is floored to 0 (ledger defense) ───────
+# ── Invalid negative provider cost falls back safely (ledger defense) ───────
 #
 # A buggy or misconfigured upstream returning a negative x_router.cost_usd
-# must NOT decrement the budget (spent_usd). The direct cost branch in
-# executed_cost_usd/4 now applies the same max_decimal(..., 0) floor as the
-# session_acc delta branch.
+# must NOT decrement the budget. It is classified as invalid and the complete
+# rate card becomes the charge basis.
 
 ProxyCheck.TestLLMProxyStore.reset()
 
@@ -1547,10 +1547,10 @@ neg_cost_conn =
 neg_cost_usage = ProxyCheck.TestLLMProxyStore.usage(negative_cost_identity, today)
 
 check.(
-  "negative upstream x_router.cost_usd is floored to 0 (spent_usd never decrements)",
+  "negative upstream x_router.cost_usd falls back to the rate card (spent_usd never decrements)",
   neg_cost_conn.status == 200 and
     neg_cost_usage != nil and
-    Decimal.equal?(neg_cost_usage.spent_usd, Decimal.new("0")) and
+    Decimal.equal?(neg_cost_usage.spent_usd, Decimal.new("0.0000035")) and
     neg_cost_usage.requests == 1
 )
 
@@ -1591,10 +1591,9 @@ end
 
 # ── B1 ⚠️ HARD GATE — sanitize_cost wired into the production (buffered) cost path ──
 #
-# A finite >1e9 cost from a trusted-but-buggy router must be CLAMPED to NUMERIC(18,9)
-# (else the durable insert overflows, guard/1 swallows it, and the in-memory mirror is
-# poisoned → false-block). The clamp must fire `llm_proxy_cost_invalid`, and a follow-up
-# call on the same (non-exhausted) budget must still be served normally.
+# A finite >1e9 cost from a trusted-but-buggy router is invalid provider data. It
+# must fall back to the complete rate card, fire the invalid metrics, and leave
+# the budget usable for a follow-up call.
 
 ProxyCheck.TestLLMProxyStore.reset()
 
@@ -1645,15 +1644,13 @@ b1_conn2 =
 b1_usage2 = ProxyCheck.TestLLMProxyStore.usage(b1_identity, today)
 
 check.(
-  "B1 overflow: >1e9 cost CLAMPED to NUMERIC(18,9) max 999999999.999999999, llm_proxy_cost_invalid fires, NO overflow, follow-up call still served",
+  "B1 overflow: >1e9 provider cost falls back to rate card, invalid metrics fire, follow-up call still served",
   b1_conn1.status == 200 and
-    Decimal.equal?(b1_usage1.spent_usd, Decimal.new("999999999.999999999")) and
+    Decimal.equal?(b1_usage1.spent_usd, Decimal.new("0.000001")) and
     "llm_proxy_cost_invalid" in Agent.get(b1_metrics, & &1) and
+    "llm_proxy_provider_cost_invalid" in Agent.get(b1_metrics, & &1) and
     b1_conn2.status == 200 and
-    Decimal.equal?(
-      b1_usage2.spent_usd,
-      Decimal.add(Decimal.new("999999999.999999999"), Decimal.new("0.001"))
-    ) and
+    Decimal.equal?(b1_usage2.spent_usd, Decimal.new("0.001001")) and
     b1_usage2.requests == 2
 )
 
@@ -1698,9 +1695,9 @@ b1_case = fn label, cost_value, expect_spent, expect_invalid? ->
 end
 
 b1_case.(
-  "B1 \"Infinity\" cost → recorded 0 + llm_proxy_cost_invalid",
+  "B1 \"Infinity\" cost → rate-card fallback + llm_proxy_cost_invalid",
   "Infinity",
-  Decimal.new("0"),
+  Decimal.new("0.000001"),
   true
 )
 
@@ -1712,16 +1709,15 @@ b1_case.(
 )
 
 b1_case.(
-  "B1 negative -3.0 → floored to 0, NOT flagged invalid (floor, not invalid)",
+  "B1 negative -3.0 → rate-card fallback + invalid metric",
   -3.0,
-  Decimal.new("0"),
-  false
+  Decimal.new("0.000001"),
+  true
 )
 
-# ── Item 9: non-finite x_router.session_acc.cost_usd is FLAGGED, not silently zeroed ──
-# The session_acc cost branch now feeds sanitize_cost a value it can still detect as
-# non-finite (raw_decimal, not decimal/1) → cost stays a clean 0 AND llm_proxy_cost_invalid
-# fires (previously decimal/1 zeroed "Infinity" before it could be flagged).
+# ── session_acc is cumulative metadata, never a per-call provider cost ──
+# With direct cost_usd absent, even a session_acc value is classified as unknown
+# and the charge falls back to the per-call rate card.
 ProxyCheck.TestLLMProxyStore.reset()
 
 sa_inf_attrs = %{
@@ -1773,10 +1769,11 @@ sa_inf_conn =
 sa_inf_usage = ProxyCheck.TestLLMProxyStore.usage(sa_inf_identity, today)
 
 check.(
-  "item9: non-finite session_acc.cost_usd → recorded 0 + llm_proxy_cost_invalid fires (no longer silently zeroed)",
+  "session_acc-only cost → rate-card fallback + provider-cost-unknown metric",
   sa_inf_conn.status == 200 and sa_inf_usage != nil and
-    Decimal.equal?(sa_inf_usage.spent_usd, Decimal.new("0")) and
-    "llm_proxy_cost_invalid" in Agent.get(sa_inf_metrics, & &1)
+    Decimal.equal?(sa_inf_usage.spent_usd, Decimal.new("0.000001")) and
+    "llm_proxy_provider_cost_unknown" in Agent.get(sa_inf_metrics, & &1) and
+    not ("llm_proxy_cost_invalid" in Agent.get(sa_inf_metrics, & &1))
 )
 
 # ── B2 ⚠️ HARD GATE — retry bills ONCE end-to-end (through record_budget_call/store) ──
