@@ -2596,7 +2596,23 @@ defmodule Genswarms.LlmProxy.Plug do
     usage = normalize_usage_counts(Map.get(resp, "usage") || %{})
     upstream_router = upstream_router(Map.get(resp, "x_router"))
 
-    {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+    # Legacy shape (NEITHER additive key present) skips the chokepoint entirely:
+    # the $0 row is the contract's expected compat arm, not a missing cost
+    # signal. Routing it through executed_cost_usd would bump
+    # llm_proxy_provider_cost_unknown once per seal, and that counter's standing
+    # meaning is "billable chat call whose router omitted a cost" (it feeds the
+    # router-cost-signal investigation). A NEW router that attaches usage or
+    # x_router but omits cost_usd still goes through the chokepoint — there the
+    # bump is a genuinely missing cost on a priced seal.
+    legacy? = not (Map.has_key?(resp, "usage") or Map.has_key?(resp, "x_router"))
+
+    {cost, invalid?} =
+      if legacy? do
+        {Decimal.new(0), false}
+      else
+        executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+      end
+
     if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
     {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 

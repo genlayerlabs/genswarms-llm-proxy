@@ -402,8 +402,66 @@ check.(
 
 check.(
   "costed seal body still passes through verbatim (usage/x_router additive, untouched)",
-  costed_conn.status == 200 and costed_body["compacted"] == true and
-    costed_body["usage"] == seal_usage and costed_body["x_router"] == seal_x_router
+  costed_conn.status == 200 and costed_body["usage"] == seal_usage and
+    costed_body["compacted"] == true and costed_body["x_router"] == seal_x_router
+)
+
+# ── legacy seal must NOT move llm_proxy_provider_cost_unknown ─────────────────
+#
+# That counter's standing meaning is "billable chat call whose router omitted a
+# cost signal" — it feeds the router-cost-signal investigation. A legacy router
+# attaching NEITHER usage NOR x_router is EXPECTED to carry no cost (that is the
+# wire contract's compat arm), so a legacy seal must record its $0 row without
+# masquerading as a missing chat cost signal.
+
+legacy_metrics_conn =
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token2}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(
+    ProxyPlug.init(
+      base_opts
+      |> Map.merge(%{upstream: ok_upstream, metrics: :metrics, deliver_fn: metric_deliver})
+    )
+  )
+
+legacy_metrics = drain_metrics.(drain_metrics)
+
+check.(
+  "legacy seal (no usage/x_router) bumps llm_proxy_compact, NOT provider_cost_unknown",
+  legacy_metrics_conn.status == 200 and "llm_proxy_compact" in legacy_metrics and
+    "llm_proxy_provider_cost_unknown" not in legacy_metrics
+)
+
+# ...while a NEW router that DOES attach keys but omits the cost still trips the
+# signal: x_router without cost_usd on a priced seal is a genuinely missing cost.
+
+no_cost_upstream = fn _body, _headers, _cfg ->
+  {:ok, 200,
+   %{
+     "messages" => [%{"role" => "system", "content" => "[sealed]"}],
+     "compacted" => true,
+     "usage" => seal_usage,
+     "x_router" => %{"provider" => "anthropic"}
+   }}
+end
+
+no_cost_conn =
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token2}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(
+    ProxyPlug.init(
+      base_opts
+      |> Map.merge(%{upstream: no_cost_upstream, metrics: :metrics, deliver_fn: metric_deliver})
+    )
+  )
+
+no_cost_metrics = drain_metrics.(drain_metrics)
+
+check.(
+  "new-router seal WITH usage/x_router but no cost_usd still bumps provider_cost_unknown",
+  no_cost_conn.status == 200 and "llm_proxy_provider_cost_unknown" in no_cost_metrics
 )
 
 # ── upstream failure with a billed x_router: compact_error metric + cost row ─
