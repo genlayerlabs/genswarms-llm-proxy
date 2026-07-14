@@ -7,10 +7,19 @@
 #   * forward the body UNCHANGED (no "session" injection — CompactRequest is a
 #     strict schema — and no prompt-cache marking) to the sibling /compact URL
 #     derived from the configured chat endpoint;
-#   * pass the response through verbatim ({messages, compacted});
-#   * record a zero-cost status-"ok" / model-"compact" ledger row so the seal
-#     burns the per-conversation request quota (the store's quota SQL counts
-#     only status='ok') — a compact loop is never free;
+#   * pass the response through verbatim ({messages, compacted}, plus any
+#     additive "usage"/"x_router" a new router attaches);
+#   * record a status-"ok" / model-"compact" ledger row so the seal burns the
+#     per-conversation request quota (the store's quota SQL counts only
+#     status='ok') — a compact loop is never free;
+#   * price the seal through the SAME cost chokepoint as a chat call when the
+#     upstream response carries OpenAI-shape "usage" and/or the chat-shaped
+#     "x_router" (two-spends: user charge + provider cost) — and keep recording
+#     the $0 legacy row when BOTH are absent (legacy router compat, no crash);
+#   * advance the per-conversation dollar budget AND the operator-wide global
+#     ceiling with the seal's cost — the seal is never invisible money;
+#   * bump llm_proxy_compact_error (distinct from _block) on upstream failure,
+#     recording any x_router cost the new router billed for the failed seal;
 #   * answer plain-JSON 429s on the budget gates (no sender delivery — the
 #     agent's splice step finds no "messages" and skips, degrading silently).
 
@@ -75,7 +84,7 @@ defmodule CompactCheck.Store do
     end)
   end
 
-  def record_llm_call(identity, day, session_id, attrs) do
+  def record_llm_call(identity, day, session_id, attrs, default_limit \\ "0.50") do
     Agent.get_and_update(@name, fn state ->
       key = {identity, day}
       status = to_string(attrs[:status] || "ok")
@@ -87,15 +96,37 @@ defmodule CompactCheck.Store do
             day: day,
             session_id: session_id,
             spent_usd: Decimal.new("0"),
-            limit_usd: Decimal.new("0.50"),
+            limit_usd: dec(default_limit),
             requests: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0
           }
 
-      row = %{row | requests: row.requests + if(status == "ok", do: 1, else: 0)}
-      event = Map.merge(Map.take(attrs, [:request_id, :status, :model]), %{identity: identity})
+      row = %{
+        row
+        | requests: row.requests + if(status == "ok", do: 1, else: 0),
+          spent_usd: Decimal.add(row.spent_usd, dec(attrs[:cost_usd] || 0))
+      }
+
+      event =
+        Map.merge(
+          Map.take(attrs, [
+            :request_id,
+            :status,
+            :model,
+            :cost_usd,
+            :provider_cost_usd,
+            :provider_cost_state,
+            :charge_basis,
+            :prompt_tokens,
+            :completion_tokens,
+            :total_tokens,
+            :provider
+          ]),
+          %{identity: identity}
+        )
+
       {row, %{state | daily: Map.put(state.daily, key, row), events: [event | state.events]}}
     end)
   end
@@ -208,6 +239,21 @@ check.(
     CompactCheck.Store.usage(session.budget_identity, ~D[2026-07-05]).requests == 1
 )
 
+# EXPLICIT legacy compat (not the only truth anymore): a router that attaches
+# no usage/x_router keeps producing the $0 row — never crash, never invent cost.
+[legacy_event] = events
+
+check.(
+  "legacy router (no usage/x_router) → $0 row: zero user charge, zero/missing provider cost",
+  Decimal.compare(legacy_event.cost_usd, Decimal.new("0")) == :eq and
+    Decimal.compare(legacy_event.provider_cost_usd, Decimal.new("0")) == :eq and
+    legacy_event.provider_cost_state == "missing" and
+    Decimal.compare(
+      CompactCheck.Store.usage(session.budget_identity, ~D[2026-07-05]).spent_usd,
+      Decimal.new("0")
+    ) == :eq
+)
+
 # ── upstream failure: passthrough status, quota-free compact_error row ───────
 
 err_upstream = fn _body, _headers, _cfg ->
@@ -266,6 +312,239 @@ check.(
   "exhausted request quota → 429 request_quota_exhausted (a compact loop is never free)",
   quota_blocked.status == 429 and
     json.(quota_blocked)["error"]["code"] == "request_quota_exhausted"
+)
+
+# ── NEW router: usage + x_router on the seal → two-spends cost accounting ────
+#
+# The wire contract is additive: a new router MAY attach OpenAI-shape "usage"
+# and the chat-shaped "x_router" to /v1/compact responses. The proxy prices the
+# seal through executed_cost_usd (the single money chokepoint) and records BOTH
+# spends; the body still passes through verbatim (the agent's splice reads only
+# "messages").
+
+metric_deliver = fn _swarm, :metrics, :llm_proxy, payload ->
+  send(seen, {:metric, Jason.decode!(payload)["key"]})
+  :ok
+end
+
+drain_metrics = fn drain ->
+  receive do
+    {:metric, key} -> [key | drain.(drain)]
+  after
+    50 -> []
+  end
+end
+
+{:ok, token2} =
+  Proxy.register_session(state_pid, %{
+    conversation_id: "tg:88:0",
+    slot: :agent_1,
+    kind: :dm,
+    workspace_key: "default"
+  })
+
+session2 = Proxy.lookup_session(state_pid, token2)
+
+seal_usage = %{"prompt_tokens" => 40_000, "completion_tokens" => 2_000, "total_tokens" => 42_000}
+seal_x_router = %{"cost_usd" => "0.0123", "provider" => "anthropic", "served_model_id" => "claude-h"}
+
+costed_upstream = fn _body, _headers, _cfg ->
+  {:ok, 200,
+   %{
+     "messages" => [%{"role" => "system", "content" => "[sealed]"}],
+     "compacted" => true,
+     "usage" => seal_usage,
+     "x_router" => seal_x_router
+   }}
+end
+
+costed_opts =
+  base_opts
+  |> Map.merge(%{
+    upstream: costed_upstream,
+    pricing_mode: :rate_card_first,
+    metrics: :metrics,
+    deliver_fn: metric_deliver
+  })
+
+costed_conn =
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token2}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(ProxyPlug.init(costed_opts))
+
+costed_body = json.(costed_conn)
+costed_event = CompactCheck.Store.events() |> List.last()
+_ = drain_metrics.(drain_metrics)
+
+# rate_card_first + complete card: charge = rate card over the seal's tokens
+# (40k × 0.25/Mtok + 2k × 0.75/Mtok = 0.0115), NOT the router's provider cost.
+check.(
+  "costed seal → two-spends row: rate-card user charge AND router provider cost, both > 0",
+  costed_event.status == "ok" and costed_event.model == "compact" and
+    Decimal.compare(costed_event.cost_usd, Decimal.new("0.0115")) == :eq and
+    Decimal.compare(costed_event.provider_cost_usd, Decimal.new("0.0123")) == :eq and
+    costed_event.provider_cost_state == "known" and
+    costed_event.charge_basis == "rate_card" and
+    costed_event.prompt_tokens == 40_000 and
+    costed_event.completion_tokens == 2_000 and
+    costed_event.total_tokens == 42_000 and
+    costed_event.provider == "anthropic"
+)
+
+check.(
+  "costed seal advances the per-conversation dollar budget in the durable store",
+  Decimal.compare(
+    CompactCheck.Store.usage(session2.budget_identity, ~D[2026-07-05]).spent_usd,
+    Decimal.new("0.0115")
+  ) == :eq
+)
+
+check.(
+  "costed seal body still passes through verbatim (usage/x_router additive, untouched)",
+  costed_conn.status == 200 and costed_body["compacted"] == true and
+    costed_body["usage"] == seal_usage and costed_body["x_router"] == seal_x_router
+)
+
+# ── upstream failure with a billed x_router: compact_error metric + cost row ─
+
+billed_err_upstream = fn _body, _headers, _cfg ->
+  {:ok, 500,
+   %{
+     "error" => %{"message" => "seal blew", "code" => "upstream_error"},
+     "x_router" => %{"cost_usd" => "0.002", "provider" => "openai"}
+   }}
+end
+
+requests_before_err =
+  CompactCheck.Store.usage(session2.budget_identity, ~D[2026-07-05]).requests
+
+billed_err_conn =
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token2}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(
+    ProxyPlug.init(
+      base_opts
+      |> Map.merge(%{
+        upstream: billed_err_upstream,
+        metrics: :metrics,
+        deliver_fn: metric_deliver
+      })
+    )
+  )
+
+err_metrics = drain_metrics.(drain_metrics)
+billed_err_event = CompactCheck.Store.events() |> List.last()
+
+check.(
+  "upstream failure bumps llm_proxy_compact_error (distinct from _block)",
+  billed_err_conn.status == 500 and "llm_proxy_compact_error" in err_metrics and
+    "llm_proxy_compact_block" not in err_metrics
+)
+
+# cost_plus default: the router's known cost for the failed seal is authoritative
+# — the row records what the router billed, while staying quota-free.
+check.(
+  "billed compact_error row records the router's cost, stays quota-free",
+  billed_err_event.status == "compact_error" and
+    Decimal.compare(billed_err_event.provider_cost_usd, Decimal.new("0.002")) == :eq and
+    billed_err_event.provider_cost_state == "known" and
+    Decimal.compare(billed_err_event.cost_usd, Decimal.new("0.002")) == :eq and
+    CompactCheck.Store.usage(session2.budget_identity, ~D[2026-07-05]).requests ==
+      requests_before_err
+)
+
+# ── the seal's cost EXHAUSTS the per-conversation budget eventually ──────────
+#
+# Also pins the partial-failure shape: {"compacted": false} 2xx responses that
+# followed a billable upstream call carry usage/x_router and MUST be priced.
+
+{:ok, token3} =
+  Proxy.register_session(state_pid, %{
+    conversation_id: "tg:99:0",
+    slot: :agent_2,
+    kind: :dm,
+    workspace_key: "default"
+  })
+
+partial_upstream = fn _body, _headers, _cfg ->
+  {:ok, 200,
+   %{"messages" => [], "compacted" => false, "usage" => seal_usage, "x_router" => seal_x_router}}
+end
+
+budget_opts =
+  base_opts
+  |> Map.merge(%{
+    upstream: partial_upstream,
+    pricing_mode: :rate_card_first,
+    default_daily_limit: Decimal.new("0.02")
+  })
+
+seal = fn ->
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token3}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(ProxyPlug.init(budget_opts))
+end
+
+first = seal.()
+first_event = CompactCheck.Store.events() |> List.last()
+second = seal.()
+third = seal.()
+
+check.(
+  "a compacted:false partial-failure 2xx is still priced (usage/x_router present)",
+  first.status == 200 and
+    Decimal.compare(first_event.cost_usd, Decimal.new("0.0115")) == :eq
+)
+
+check.(
+  "seal cost advances the daily budget until exhausted? blocks (0.0115 + 0.0115 ≥ 0.02)",
+  first.status == 200 and second.status == 200 and third.status == 429 and
+    json.(third)["error"]["code"] == "budget_exhausted"
+)
+
+# ── the seal's cost moves the operator-wide GLOBAL ceiling ────────────────────
+#
+# Fresh state pid: the in-memory global accumulator must advance from the
+# seal's recorded cost alone (the fake store's llm_usage_today is always $0,
+# so only the accumulator can trip the ceiling — the exact hole being closed).
+
+{:ok, state_pid2} = Proxy.start_state_link()
+
+{:ok, token4} =
+  Proxy.register_session(state_pid2, %{
+    conversation_id: "tg:111:0",
+    slot: :agent_0,
+    kind: :dm,
+    workspace_key: "default"
+  })
+
+global_opts =
+  base_opts
+  |> Map.merge(%{
+    state_pid: state_pid2,
+    upstream: costed_upstream,
+    pricing_mode: :rate_card_first,
+    global_daily_limit: Decimal.new("0.02")
+  })
+
+global_seal = fn ->
+  conn(:post, "/v1/compact", Jason.encode!(compact_body))
+  |> put_req_header("authorization", "Bearer #{token4}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(ProxyPlug.init(global_opts))
+end
+
+g1 = global_seal.()
+g2 = global_seal.()
+g3 = global_seal.()
+
+check.(
+  "seal cost moves the global ceiling: third seal blocked global_budget_exhausted",
+  g1.status == 200 and g2.status == 200 and g3.status == 429 and
+    json.(g3)["error"]["code"] == "global_budget_exhausted"
 )
 
 failures_list = Agent.get(failures, & &1)

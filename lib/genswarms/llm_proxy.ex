@@ -2238,9 +2238,12 @@ defmodule Genswarms.LlmProxy.Plug do
   post "/v1/compact" do
     # Async context seal (subzeroclaw → router /v1/compact). The seal is a REAL
     # upstream LLM call on the operator's key, so it passes the same three gates as
-    # a chat call; but /v1/compact returns {messages, compacted} with no usage, so
-    # it is recorded as a zero-cost ledger row (model "compact") — that still
-    # advances the per-conversation request quota, so a compact loop is never free.
+    # a chat call, and it is priced like one when the upstream response carries the
+    # additive "usage"/"x_router" keys (see compact_record/4); a legacy router that
+    # returns only {messages, compacted} still records the $0 row (model "compact").
+    # Either way the row advances the per-conversation request quota, so a compact
+    # loop is never free. The response body passes through verbatim — the agent's
+    # splice step reads only "messages", so the extra keys are invisible to it.
     # Block responses are plain JSON (no sender delivery): the agent's splice step
     # finds no "messages" key and simply skips — compaction degrades silently.
     opts = conn.private.router_opts
@@ -2290,16 +2293,18 @@ defmodule Genswarms.LlmProxy.Plug do
           bump_metric(opts, "llm_proxy_compact")
           {status, resp} = compact_upstream(body, opts, request_ctx)
 
+          if status not in 200..299 do
+            # Distinct from llm_proxy_compact_block: the gates passed but the
+            # upstream seal itself failed.
+            bump_metric(opts, "llm_proxy_compact_error")
+          end
+
           # status "ok" on success is deliberate: the store's request-quota SQL
           # only counts status='ok' rows (CASE WHEN status = 'ok'), and a seal
           # must burn quota. model "compact" keeps it distinguishable in the
           # ledger; failures record as "compact_error" (visible, quota-free —
           # same treatment as chat upstream errors).
-          record_budget_call(opts, session, request_ctx, %{
-            request_id: request_id(),
-            model: "compact",
-            status: if(status in 200..299, do: "ok", else: "compact_error")
-          })
+          record_budget_call(opts, session, request_ctx, compact_record(status, resp, budget, opts))
 
           json(conn, status, resp)
       end
@@ -2573,6 +2578,44 @@ defmodule Genswarms.LlmProxy.Plug do
       {:error, reason} ->
         {502, %{"error" => %{"message" => inspect(reason), "code" => "upstream_error"}}}
     end
+  end
+
+  # Ledger row for the seal, mirroring respond_upstream/8's cost accounting: a
+  # NEW router MAY additively attach OpenAI-shape "usage" and the chat-shaped
+  # "x_router" to /v1/compact responses (on every response that followed a
+  # billable upstream call, including {"compacted": false}); when present the
+  # seal is priced through the same money chokepoint as a chat call
+  # (executed_cost_usd — two-spends: user charge + provider cost), so the seal
+  # advances the per-conversation budget and the global ceiling. ABSENCE of
+  # both keys = legacy router = the same $0 row as before (compat: never crash,
+  # never invent cost). model "compact" and the status semantics are preserved:
+  # "ok" burns the request quota, "compact_error" stays quota-free — but a
+  # compact_error row still records any cost a new router billed for the
+  # failed seal.
+  defp compact_record(status, resp, budget, opts) do
+    usage = normalize_usage_counts(Map.get(resp, "usage") || %{})
+    upstream_router = upstream_router(Map.get(resp, "x_router"))
+
+    {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+    if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
+    {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+
+    %{
+      request_id: request_id(),
+      model: "compact",
+      status: if(status in 200..299, do: "ok", else: "compact_error"),
+      prompt_tokens: usage["prompt_tokens"],
+      completion_tokens: usage["completion_tokens"],
+      total_tokens: usage["total_tokens"],
+      cached_tokens: cached_tokens,
+      non_cached_tokens: non_cached_tokens,
+      cost_usd: cost,
+      provider_cost_usd: provider_cost_usd(upstream_router),
+      provider_cost_state: provider_cost_state(upstream_router),
+      charge_basis: charge_basis(opts, upstream_router),
+      pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
+      provider: Map.get(upstream_router, "provider")
+    }
   end
 
   # The upstream /v1/compact URL, derived from the configured chat endpoint —
