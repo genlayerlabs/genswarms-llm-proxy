@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.16 - 2026-07-14
+
+- Give the four-column Costs section the full dashboard width so its labels and
+  reconciliation notes do not truncate while half of the row sits unused.
+- Shorten the half-width Today router label and legacy status copy to `Router
+  cost` and `legacy · not comparable`, preserving the same accounting meaning
+  without ellipses.
+
 ## 0.2.15 - 2026-07-14
 
 - Keep same-scope user-charge and router-cost totals visible for diagnosis when

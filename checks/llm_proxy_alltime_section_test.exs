@@ -172,6 +172,7 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     usage = section(ext, "All-time usage")
     financials = section(ext, "Costs")
 
+    assert financials["span"] == "full"
     assert item(usage, "Repriced spend") == nil
     assert item(usage, "Tokens")["value"] == "95M"
     assert item(usage, "Router charged us") == nil

@@ -1051,7 +1051,7 @@ defmodule Genswarms.LlmProxy do
       case store_mod.llm_router_cost_today() do
         %{cost_usd: cost} = row ->
           %{
-            "label" => "Router charged us",
+            "label" => "Router cost",
             "value" => "$" <> money2(cost),
             "sub" => router_cost_sub(row)
           }
@@ -1069,7 +1069,7 @@ defmodule Genswarms.LlmProxy do
   end
 
   defp router_cost_sub(%{authoritative: false}),
-    do: "legacy/shared-key estimate · not comparable"
+    do: "legacy · not comparable"
 
   defp router_cost_sub(row),
     do: if(Map.get(row, :estimated, true), do: "router estimate", else: "exact router total")
@@ -1325,7 +1325,9 @@ defmodule Genswarms.LlmProxy do
     %{
       "type" => "metrics",
       "title" => "Costs",
-      "span" => "half",
+      # Four financial columns need the page width. On a half-width card the
+      # renderer's fixed md:grid-cols-4 contract truncates every useful label.
+      "span" => "full",
       "meta" => financials_meta(financials, authoritative, reconciled, since, scope_meta),
       "items" =>
         [
