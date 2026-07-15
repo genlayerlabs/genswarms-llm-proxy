@@ -1904,6 +1904,104 @@ check.(
   b3b_conn.status == 502 and "llm_proxy_upstream_error" in Agent.get(b3b_metrics, & &1)
 )
 
+# B3c: BILLED upstream error — money the router billed is never invisible. A
+# router can bill a partial call and still answer non-2xx (with usage and/or a
+# known x_router.cost_usd on the error body); the error-path ledger row must
+# carry the same two-spends accounting as compact_error rows, so SUM(cost_usd)
+# never undercounts real spend. The status stays the error code — the request
+# quota is NOT burned — but the dollar budget advances by what was billed.
+ProxyCheck.TestLLMProxyStore.reset()
+b3c_attrs = %{conversation_id: "tg:b3c:0", slot: :agent_b3c, kind: :dm, workspace_key: "b3cws"}
+b3c_identity = Proxy.budget_identity(b3c_attrs)
+{:ok, b3c_token} = Proxy.register_session(state_pid, b3c_attrs)
+{:ok, b3c_metrics} = Agent.start_link(fn -> [] end)
+
+b3c_conn =
+  conn(:post, "/v1/chat/completions", Jason.encode!(body))
+  |> put_req_header("authorization", "Bearer #{b3c_token}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(
+    ProxyPlug.init(
+      Map.merge(base_opts, %{
+        deliver_fn: metric_capture.(b3c_metrics),
+        upstream: fn _b, _h, _o ->
+          {:ok, 500,
+           %{
+             "error" => %{
+               "message" => "partial blowup",
+               "type" => "server_error",
+               "code" => "upstream_error"
+             },
+             "usage" => %{
+               "prompt_tokens" => 40_000,
+               "completion_tokens" => 0,
+               "total_tokens" => 40_000
+             },
+             "x_router" => %{"cost_usd" => "0.002", "provider" => "openai"}
+           }}
+        end
+      })
+    )
+  )
+
+b3c_body = json.(b3c_conn)
+[b3c_event] = ProxyCheck.TestLLMProxyStore.events()
+b3c_usage = ProxyCheck.TestLLMProxyStore.usage(b3c_identity, today)
+
+# default :cost_plus, margin 0: the router's known cost is authoritative.
+check.(
+  "B3c billed 5xx → error row records the router's cost + tokens (quota-free, budget moves)",
+  b3c_conn.status == 500 and b3c_event.status == "upstream_error" and
+    Decimal.compare(b3c_event.cost_usd, Decimal.new("0.002")) == :eq and
+    b3c_event.prompt_tokens == 40_000 and b3c_event.provider == "openai" and
+    b3c_usage.requests == 0 and
+    Decimal.compare(b3c_usage.spent_usd, Decimal.new("0.002")) == :eq
+)
+
+check.(
+  "B3c error x_router surfaces the recorded charge (user charge == ledger row, provider cost kept)",
+  get_in(b3c_body, ["x_router", "cost_usd"]) == 0.002 and
+    get_in(b3c_body, ["x_router", "provider_cost_usd"]) == 0.002 and
+    "llm_proxy_provider_cost_unknown" not in Agent.get(b3c_metrics, & &1)
+)
+
+# B3d: a PLAIN error body (no usage, no x_router — the overwhelmingly common
+# 5xx) keeps the legacy minimal row: no invented cost, and NO
+# llm_proxy_provider_cost_unknown noise (that counter means "billable call
+# missing router cost", not "upstream errored").
+ProxyCheck.TestLLMProxyStore.reset()
+b3d_attrs = %{conversation_id: "tg:b3d:0", slot: :agent_b3d, kind: :dm, workspace_key: "b3dws"}
+b3d_identity = Proxy.budget_identity(b3d_attrs)
+{:ok, b3d_token} = Proxy.register_session(state_pid, b3d_attrs)
+{:ok, b3d_metrics} = Agent.start_link(fn -> [] end)
+
+b3d_conn =
+  conn(:post, "/v1/chat/completions", Jason.encode!(body))
+  |> put_req_header("authorization", "Bearer #{b3d_token}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(
+    ProxyPlug.init(
+      Map.merge(base_opts, %{
+        deliver_fn: metric_capture.(b3d_metrics),
+        upstream: fn _b, _h, _o ->
+          {:ok, 503,
+           %{"error" => %{"message" => "overloaded", "type" => "server_error", "code" => "503"}}}
+        end
+      })
+    )
+  )
+
+[b3d_event] = ProxyCheck.TestLLMProxyStore.events()
+b3d_usage = ProxyCheck.TestLLMProxyStore.usage(b3d_identity, today)
+
+check.(
+  "B3d plain 5xx keeps the $0 minimal error row and NO provider_cost_unknown noise",
+  b3d_conn.status == 503 and b3d_event.status == "503" and
+    Decimal.compare(b3d_event.cost_usd, Decimal.new("0")) == :eq and
+    Decimal.compare(b3d_usage.spent_usd, Decimal.new("0")) == :eq and
+    "llm_proxy_provider_cost_unknown" not in Agent.get(b3d_metrics, & &1)
+)
+
 # ── L4 — only status:"ok" events burn the daily request quota (LENIENT policy) ──
 # Self-contained (own reset + identity): B3a/B3b's store rows don't survive each
 # other's `reset()`, so this exercises the SAME 5xx/transport-error → ok sequence

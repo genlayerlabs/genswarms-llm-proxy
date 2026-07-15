@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## 0.2.18 - 2026-07-15
+
+- Price `/v1/compact` seals through the same cost chokepoint as chat calls.
+  A new router may additively attach OpenAI-shape `usage` and the chat-shaped
+  `x_router` to `/v1/compact` responses (including `{"compacted": false}`
+  partial failures that followed a billable upstream call); when present, the
+  seal's ledger row now carries the two-spends accounting (`cost_usd`,
+  `provider_cost_usd`, `provider_cost_state`, `charge_basis`, token counts,
+  cache split, provider) instead of a fixed $0 row, so seals advance the
+  per-conversation daily budget and the operator-wide global ceiling.
+- Legacy compatibility preserved: a router that attaches neither key keeps
+  producing the same $0 `model: "compact"` row as before — never a crash,
+  never an invented cost. Status semantics are unchanged (`ok` burns the
+  request quota, `compact_error` stays quota-free) and the response body still
+  passes through verbatim to the agent.
+- Bump a dedicated `llm_proxy_compact_error` metric when the upstream seal
+  call fails (distinct from `llm_proxy_compact_block`), and record any cost
+  the router billed for the failed seal on the `compact_error` row. Hosts
+  running a closed-allowlist metrics object must allowlist the new key
+  alongside `llm_proxy_compact` / `llm_proxy_compact_block`, or the bumps are
+  silently dropped.
+- Legacy seals do NOT move `llm_proxy_provider_cost_unknown`: the absence of
+  both additive keys is the contract's expected compat arm, not a missing
+  cost signal, so the counter keeps meaning "billable call whose router
+  omitted a cost". A new router that attaches `usage`/`x_router` but omits
+  `cost_usd` still trips it.
+- Chat error-path ledger rows now record billed router cost too: when a
+  non-2xx upstream body proves a billed partial call (OpenAI-shape `usage`,
+  or a known `x_router.cost_usd`), the error row carries the same two-spends
+  accounting as `compact_error` rows and the error `x_router` surfaces the
+  charge — `SUM(cost_usd)` never undercounts. Plain error bodies keep the
+  minimal $0 row with no counter noise.
+
 ## 0.2.17 - 2026-07-14
 
 - Separate Today and all-time usage from cost accounting so monetary values

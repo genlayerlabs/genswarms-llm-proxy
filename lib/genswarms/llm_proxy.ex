@@ -2238,9 +2238,12 @@ defmodule Genswarms.LlmProxy.Plug do
   post "/v1/compact" do
     # Async context seal (subzeroclaw → router /v1/compact). The seal is a REAL
     # upstream LLM call on the operator's key, so it passes the same three gates as
-    # a chat call; but /v1/compact returns {messages, compacted} with no usage, so
-    # it is recorded as a zero-cost ledger row (model "compact") — that still
-    # advances the per-conversation request quota, so a compact loop is never free.
+    # a chat call, and it is priced like one when the upstream response carries the
+    # additive "usage"/"x_router" keys (see compact_record/4); a legacy router that
+    # returns only {messages, compacted} still records the $0 row (model "compact").
+    # Either way the row advances the per-conversation request quota, so a compact
+    # loop is never free. The response body passes through verbatim — the agent's
+    # splice step reads only "messages", so the extra keys are invisible to it.
     # Block responses are plain JSON (no sender delivery): the agent's splice step
     # finds no "messages" key and simply skips — compaction degrades silently.
     opts = conn.private.router_opts
@@ -2290,16 +2293,18 @@ defmodule Genswarms.LlmProxy.Plug do
           bump_metric(opts, "llm_proxy_compact")
           {status, resp} = compact_upstream(body, opts, request_ctx)
 
+          if status not in 200..299 do
+            # Distinct from llm_proxy_compact_block: the gates passed but the
+            # upstream seal itself failed.
+            bump_metric(opts, "llm_proxy_compact_error")
+          end
+
           # status "ok" on success is deliberate: the store's request-quota SQL
           # only counts status='ok' rows (CASE WHEN status = 'ok'), and a seal
           # must burn quota. model "compact" keeps it distinguishable in the
           # ledger; failures record as "compact_error" (visible, quota-free —
           # same treatment as chat upstream errors).
-          record_budget_call(opts, session, request_ctx, %{
-            request_id: request_id(),
-            model: "compact",
-            status: if(status in 200..299, do: "ok", else: "compact_error")
-          })
+          record_budget_call(opts, session, request_ctx, compact_record(status, resp, budget, opts))
 
           json(conn, status, resp)
       end
@@ -2572,6 +2577,64 @@ defmodule Genswarms.LlmProxy.Plug do
 
       {:error, reason} ->
         {502, %{"error" => %{"message" => inspect(reason), "code" => "upstream_error"}}}
+    end
+  end
+
+  # Ledger row for the seal, mirroring respond_upstream/8's cost accounting: a
+  # NEW router MAY additively attach OpenAI-shape "usage" and the chat-shaped
+  # "x_router" to /v1/compact responses (on every response that followed a
+  # billable upstream call, including {"compacted": false}); when present the
+  # seal is priced through the same money chokepoint as a chat call
+  # (executed_cost_usd — two-spends: user charge + provider cost), so the seal
+  # advances the per-conversation budget and the global ceiling. ABSENCE of
+  # both keys = legacy router = the same $0 row as before (compat: never crash,
+  # never invent cost). model "compact" and the status semantics are preserved:
+  # "ok" burns the request quota, "compact_error" stays quota-free — but a
+  # compact_error row still records any cost a new router billed for the
+  # failed seal.
+  defp compact_record(status, resp, budget, opts) do
+    usage = normalize_usage_counts(Map.get(resp, "usage") || %{})
+    upstream_router = upstream_router(Map.get(resp, "x_router"))
+
+    # Legacy shape (NEITHER additive key present) skips the chokepoint entirely:
+    # the $0 row is the contract's expected compat arm, not a missing cost
+    # signal. Routing it through executed_cost_usd would bump
+    # llm_proxy_provider_cost_unknown once per seal, and that counter's standing
+    # meaning is "billable chat call whose router omitted a cost" (it feeds the
+    # router-cost-signal investigation). A NEW router that attaches usage or
+    # x_router but omits cost_usd still goes through the chokepoint — there the
+    # bump is a genuinely missing cost on a priced seal.
+    legacy? = not (Map.has_key?(resp, "usage") or Map.has_key?(resp, "x_router"))
+
+    row_status = if(status in 200..299, do: "ok", else: "compact_error")
+
+    if legacy? do
+      # The pre-0.2.18 record, byte-identical: a minimal map with NO accounting
+      # labels, so durable stores keep stamping their own legacy defaults
+      # ('legacy' provider_cost_state etc.) — a $0 seal row from an old router
+      # must be indistinguishable from one written by 0.2.17.
+      %{request_id: request_id(), model: "compact", status: row_status}
+    else
+      {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+      if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
+      {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+
+      %{
+        request_id: request_id(),
+        model: "compact",
+        status: row_status,
+        prompt_tokens: usage["prompt_tokens"],
+        completion_tokens: usage["completion_tokens"],
+        total_tokens: usage["total_tokens"],
+        cached_tokens: cached_tokens,
+        non_cached_tokens: non_cached_tokens,
+        cost_usd: cost,
+        provider_cost_usd: provider_cost_usd(upstream_router),
+        provider_cost_state: provider_cost_state(upstream_router),
+        charge_basis: charge_basis(opts, upstream_router),
+        pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
+        provider: Map.get(upstream_router, "provider")
+      }
     end
   end
 
@@ -3432,7 +3495,7 @@ defmodule Genswarms.LlmProxy.Plug do
     )
   end
 
-  defp respond_upstream(conn, status, body, latency_ms, session, request_ctx, _budget, opts) do
+  defp respond_upstream(conn, status, body, latency_ms, session, request_ctx, budget, opts) do
     bump_metric(opts, "llm_proxy_upstream_error")
     err = Map.get(body, "error") || %{}
     code = Map.get(err, "code") || "upstream_error"
@@ -3441,12 +3504,54 @@ defmodule Genswarms.LlmProxy.Plug do
     model = served_model(upstream_router, %{}, conn.body_params)
     request_id = request_id()
 
-    record_budget_call(opts, session, request_ctx, %{
+    # Money the router billed is never invisible — the same invariant
+    # compact_record/4 holds for failed seals. A router can bill a partial call
+    # and still answer non-2xx; when the error body PROVES a billed call
+    # (OpenAI-shape "usage", or a known x_router cost) the row is priced through
+    # the executed_cost_usd chokepoint and carries the two-spends accounting, so
+    # SUM(cost_usd) never undercounts real spend. Status stays the error code
+    # (the request quota is not burned), only the dollar budget advances. A bare
+    # error body — the overwhelmingly common 5xx — keeps the minimal legacy row:
+    # no invented cost, and no llm_proxy_provider_cost_unknown noise (that
+    # counter means "billable call missing router cost", not "upstream errored").
+    billed? =
+      Map.has_key?(body, "usage") or
+        match?({:known, _}, provider_cost_result(upstream_router))
+
+    base_record = %{
       request_id: request_id,
       model: model,
       status: code,
       provider: Map.get(upstream_router, "provider")
-    })
+    }
+
+    {record, usage, cost} =
+      if billed? do
+        usage = normalize_usage_counts(Map.get(body, "usage") || %{})
+        {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+        if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
+        {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+
+        record =
+          Map.merge(base_record, %{
+            prompt_tokens: usage["prompt_tokens"],
+            completion_tokens: usage["completion_tokens"],
+            total_tokens: usage["total_tokens"],
+            cached_tokens: cached_tokens,
+            non_cached_tokens: non_cached_tokens,
+            cost_usd: cost,
+            provider_cost_usd: provider_cost_usd(upstream_router),
+            provider_cost_state: provider_cost_state(upstream_router),
+            charge_basis: charge_basis(opts, upstream_router),
+            pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1")
+          })
+
+        {record, usage, cost}
+      else
+        {base_record, %{}, nil}
+      end
+
+    record_budget_call(opts, session, request_ctx, record)
 
     json(conn, status, %{
       error: %{
@@ -3460,9 +3565,9 @@ defmodule Genswarms.LlmProxy.Plug do
           request_ctx,
           request_id,
           model,
-          %{},
+          usage,
           latency_ms,
-          nil,
+          cost,
           message,
           upstream_router
         )
