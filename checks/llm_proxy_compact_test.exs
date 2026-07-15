@@ -240,14 +240,20 @@ check.(
 )
 
 # EXPLICIT legacy compat (not the only truth anymore): a router that attaches
-# no usage/x_router keeps producing the $0 row — never crash, never invent cost.
+# no usage/x_router keeps producing the PRE-0.2.18 record byte-identical — the
+# minimal 3-key map with NO accounting labels, so durable stores stamp their
+# own legacy defaults exactly as they did for 0.2.17 rows. Pinning key ABSENCE
+# (not provider_cost_state == "missing") is the point: a 'missing' label here
+# would leak the missing-cost-signal noise into the ledger once per legacy seal.
 [legacy_event] = events
 
 check.(
-  "legacy router (no usage/x_router) → $0 row: zero user charge, zero/missing provider cost",
-  Decimal.compare(legacy_event.cost_usd, Decimal.new("0")) == :eq and
-    Decimal.compare(legacy_event.provider_cost_usd, Decimal.new("0")) == :eq and
-    legacy_event.provider_cost_state == "missing" and
+  "legacy router (no usage/x_router) → pre-0.2.18 minimal row: no accounting labels, no spend",
+  legacy_event.model == "compact" and legacy_event.status == "ok" and
+    not Map.has_key?(legacy_event, :cost_usd) and
+    not Map.has_key?(legacy_event, :provider_cost_usd) and
+    not Map.has_key?(legacy_event, :provider_cost_state) and
+    not Map.has_key?(legacy_event, :charge_basis) and
     Decimal.compare(
       CompactCheck.Store.usage(session.budget_identity, ~D[2026-07-05]).spent_usd,
       Decimal.new("0")

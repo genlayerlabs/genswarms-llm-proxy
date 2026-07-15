@@ -2606,32 +2606,36 @@ defmodule Genswarms.LlmProxy.Plug do
     # bump is a genuinely missing cost on a priced seal.
     legacy? = not (Map.has_key?(resp, "usage") or Map.has_key?(resp, "x_router"))
 
-    {cost, invalid?} =
-      if legacy? do
-        {Decimal.new(0), false}
-      else
-        executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
-      end
+    row_status = if(status in 200..299, do: "ok", else: "compact_error")
 
-    if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
-    {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
+    if legacy? do
+      # The pre-0.2.18 record, byte-identical: a minimal map with NO accounting
+      # labels, so durable stores keep stamping their own legacy defaults
+      # ('legacy' provider_cost_state etc.) — a $0 seal row from an old router
+      # must be indistinguishable from one written by 0.2.17.
+      %{request_id: request_id(), model: "compact", status: row_status}
+    else
+      {cost, invalid?} = executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
+      if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
+      {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
-    %{
-      request_id: request_id(),
-      model: "compact",
-      status: if(status in 200..299, do: "ok", else: "compact_error"),
-      prompt_tokens: usage["prompt_tokens"],
-      completion_tokens: usage["completion_tokens"],
-      total_tokens: usage["total_tokens"],
-      cached_tokens: cached_tokens,
-      non_cached_tokens: non_cached_tokens,
-      cost_usd: cost,
-      provider_cost_usd: provider_cost_usd(upstream_router),
-      provider_cost_state: provider_cost_state(upstream_router),
-      charge_basis: charge_basis(opts, upstream_router),
-      pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
-      provider: Map.get(upstream_router, "provider")
-    }
+      %{
+        request_id: request_id(),
+        model: "compact",
+        status: row_status,
+        prompt_tokens: usage["prompt_tokens"],
+        completion_tokens: usage["completion_tokens"],
+        total_tokens: usage["total_tokens"],
+        cached_tokens: cached_tokens,
+        non_cached_tokens: non_cached_tokens,
+        cost_usd: cost,
+        provider_cost_usd: provider_cost_usd(upstream_router),
+        provider_cost_state: provider_cost_state(upstream_router),
+        charge_basis: charge_basis(opts, upstream_router),
+        pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
+        provider: Map.get(upstream_router, "provider")
+      }
+    end
   end
 
   # The upstream /v1/compact URL, derived from the configured chat endpoint —
