@@ -212,7 +212,11 @@ defmodule Genswarms.LlmProxy do
       allow_streaming: Map.get(config, :allow_streaming, false),
       prompt_cache: Map.get(config, :prompt_cache, true),
       max_retries: min(max(Map.get(config, :max_retries, 1), 0), 3),
-      empty_completion_retries: min(max(Map.get(config, :empty_completion_retries, 0), 0), 3)
+      empty_completion_retries: min(max(Map.get(config, :empty_completion_retries, 0), 0), 3),
+      # Minimum interval between repeated block notices to the SAME conversation
+      # for the SAME cap type on the same UTC day (default 4h). 0 or nil = legacy
+      # once-per-day.
+      notice_repeat_ms: Map.get(config, :notice_repeat_ms, @default_notice_repeat_ms)
     }
 
     if Decimal.compare(plug_opts.default_daily_limit, Decimal.new("0")) != :gt do
@@ -2441,6 +2445,9 @@ defmodule Genswarms.LlmProxy.Plug do
       |> Map.put_new(:prompt_cache, true)
       |> Map.put_new(:max_retries, 1)
       |> Map.put_new(:empty_completion_retries, 0)
+      # put_new (not Map.get default at the call site) so an EXPLICIT nil/0 keeps
+      # meaning legacy once-per-day while an absent key gets the 4h default.
+      |> Map.put_new(:notice_repeat_ms, Proxy.default_notice_repeat_ms())
       |> Map.update!(:daily_request_limit, &Proxy.request_limit/1)
 
     conn
@@ -3167,31 +3174,76 @@ defmodule Genswarms.LlmProxy.Plug do
     _ -> Decimal.new("0")
   end
 
+  # Deliver the Telegram block notice for THIS blocked request — or not. Returns
+  # what actually happened so the synthetic completion content can tell the truth:
+  #
+  #   :sent       — a notice went out on this request
+  #   :suppressed — rate-limited: this identity was already notified for this cap
+  #                 type earlier today (within notice_repeat_ms)
+  #   :skipped    — the session was registered with notify: false (background
+  #                 work); it neither delivers nor consumes/advances the notice
+  #                 timestamp, so it can't starve the user-facing session's notice
+  defp block_notice_delivery(opts, session, request_ctx, reason, notice) do
+    cond do
+      not session_notify?(session) ->
+        :skipped
+
+      Proxy.notice_due?(opts.state_pid, session.budget_identity, reason, request_ctx.day,
+        now: Map.get(opts, :clock, &DateTime.utc_now/0).(),
+        repeat_ms: Map.get(opts, :notice_repeat_ms, Proxy.default_notice_repeat_ms())
+      ) ->
+        msg = Jason.encode!(%{action: "slot_reply", slot: session.slot, content: notice})
+        opts.deliver_fn.(opts.swarm_name, opts.sender, :llm_proxy, msg)
+        :sent
+
+      true ->
+        :suppressed
+    end
+  end
+
+  # Sessions registered with notify: false (background work, e.g. summarizers)
+  # must never target the user with a block notice. Map.get: sessions registered
+  # by an older proxy build carry no :notify key — default true.
+  defp session_notify?(session), do: Map.get(session, :notify, true) != false
+
+  # The agent-facing synthetic completion must describe what THIS request did —
+  # claiming "a notice was sent" when dedup suppressed it makes the agent stay
+  # silent while the user was never told anything on this request.
+  defp synthetic_block_content(reason, delivery) do
+    lead =
+      case reason do
+        :budget -> "The daily LLM limit for this conversation was reached."
+        :request_quota -> "This chat reached today's AI usage limit."
+        :global -> "The service-wide daily LLM budget was reached."
+      end
+
+    tail =
+      case delivery do
+        :sent -> "A deterministic Telegram notice was sent; do not send a separate user reply."
+        :suppressed -> "The user was already notified earlier today; do not send a separate user reply."
+        :skipped -> "No user notice was sent by this path."
+      end
+
+    lead <> " " <> tail
+  end
+
   defp budget_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
     bump_quota_metric(opts, session, "budget_exhausted")
     notice = budget_notice(request_ctx, budget)
 
-    msg =
-      Jason.encode!(%{
-        action: "slot_reply",
-        slot: session.slot,
-        content: notice
-      })
-
     # Deterministic Telegram delivery + block metrics are mode-independent; only the
     # HTTP response body differs (SSE chunk vs buffered JSON).
-    if Proxy.notice_once?(opts.state_pid, session.budget_identity, request_ctx.day) do
-      opts.deliver_fn.(opts.swarm_name, opts.sender, :llm_proxy, msg)
-      bump_metric(opts, "llm_proxy_budget_block_notified")
-    end
+    delivery = block_notice_delivery(opts, session, request_ctx, :budget, notice)
+    if delivery == :sent, do: bump_metric(opts, "llm_proxy_budget_block_notified")
 
     bump_metric(opts, "llm_proxy_budget_block")
     emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "budget"})
+    content = synthetic_block_content(:budget, delivery)
 
     if streaming? do
-      budget_exhausted_sse(conn, request_ctx)
+      budget_exhausted_sse(conn, request_ctx, content)
     else
-      budget_exhausted_json(conn, request_ctx, budget, opts)
+      budget_exhausted_json(conn, request_ctx, budget, opts, content)
     end
   end
 
@@ -3199,40 +3251,27 @@ defmodule Genswarms.LlmProxy.Plug do
     bump_quota_metric(opts, session, "request_quota_exhausted")
     limit = request_quota_limit(opts)
     notice = request_quota_notice(request_ctx, limit)
-
-    msg =
-      Jason.encode!(%{
-        action: "slot_reply",
-        slot: session.slot,
-        content: notice
-      })
-
-    if Proxy.notice_once?(opts.state_pid, session.budget_identity, request_ctx.day) do
-      opts.deliver_fn.(opts.swarm_name, opts.sender, :llm_proxy, msg)
-    end
+    delivery = block_notice_delivery(opts, session, request_ctx, :request_quota, notice)
 
     bump_metric(opts, "llm_proxy_request_quota_block")
     emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "request_quota"})
+    content = synthetic_block_content(:request_quota, delivery)
 
     if streaming? do
-      request_quota_exhausted_sse(conn, request_ctx, limit)
+      request_quota_exhausted_sse(conn, request_ctx, limit, content)
     else
-      request_quota_exhausted_json(conn, request_ctx, budget, opts, limit)
+      request_quota_exhausted_json(conn, request_ctx, budget, opts, limit, content)
     end
   end
 
   @global_notice "⏳ The service daily LLM budget is exhausted. Please try again tomorrow at 00:00 UTC. 🪶"
 
   # Operator-wide ceiling block. Mirrors budget_exhausted_response: deterministic Telegram
-  # notice (once per conversation per UTC day), a durable block metric the operator can ALERT
-  # on, an error log, and the synthetic SSE/JSON body — but framed as a service-wide cap.
+  # notice (rate-limited per conversation per cap type per UTC day), a durable block metric
+  # the operator can ALERT on, an error log, and the synthetic SSE/JSON body — but framed
+  # as a service-wide cap.
   defp global_exhausted_response(conn, session, request_ctx, opts, streaming?) do
-    msg =
-      Jason.encode!(%{action: "slot_reply", slot: session.slot, content: @global_notice})
-
-    if Proxy.notice_once?(opts.state_pid, session.budget_identity, request_ctx.day) do
-      opts.deliver_fn.(opts.swarm_name, opts.sender, :llm_proxy, msg)
-    end
+    delivery = block_notice_delivery(opts, session, request_ctx, :global, @global_notice)
 
     bump_metric(opts, "llm_proxy_global_block")
     emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "global"})
@@ -3242,14 +3281,16 @@ defmodule Genswarms.LlmProxy.Plug do
       "llm_proxy: GLOBAL daily budget ceiling reached — blocking all conversations until 00:00 UTC"
     )
 
+    content = synthetic_block_content(:global, delivery)
+
     if streaming? do
-      budget_exhausted_sse(conn, request_ctx)
+      budget_exhausted_sse(conn, request_ctx, content)
     else
-      global_exhausted_json(conn, request_ctx, opts, global_status(opts, request_ctx))
+      global_exhausted_json(conn, request_ctx, opts, global_status(opts, request_ctx), content)
     end
   end
 
-  defp global_exhausted_json(conn, request_ctx, opts, global) do
+  defp global_exhausted_json(conn, request_ctx, opts, global, content) do
     request_id = request_id()
 
     json(conn, 200, %{
@@ -3262,8 +3303,7 @@ defmodule Genswarms.LlmProxy.Plug do
           "index" => 0,
           "message" => %{
             "role" => "assistant",
-            "content" =>
-              "The service-wide daily LLM budget was reached. A deterministic Telegram notice was sent; do not send a separate user reply."
+            "content" => content
           },
           "finish_reason" => "stop"
         }
@@ -3290,7 +3330,7 @@ defmodule Genswarms.LlmProxy.Plug do
   # `chat.completion.chunk` (model "llm-proxy-budget") then `[DONE]` over a chunked
   # text/event-stream — never the upstream, never a positive cost. A chunk write failure
   # (client already gone) just returns the conn.
-  defp budget_exhausted_sse(conn, request_ctx) do
+  defp budget_exhausted_sse(conn, request_ctx, content) do
     conn =
       conn
       |> Plug.Conn.put_resp_content_type("text/event-stream")
@@ -3308,8 +3348,7 @@ defmodule Genswarms.LlmProxy.Plug do
               "index" => 0,
               "delta" => %{
                 "role" => "assistant",
-                "content" =>
-                  "The daily LLM limit for this conversation was reached. A deterministic Telegram notice was sent; do not send a separate user reply."
+                "content" => content
               },
               "finish_reason" => "stop"
             }
@@ -3329,7 +3368,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
-  defp request_quota_exhausted_sse(conn, request_ctx, limit) do
+  defp request_quota_exhausted_sse(conn, request_ctx, limit, content) do
     conn =
       conn
       |> Plug.Conn.put_resp_content_type("text/event-stream")
@@ -3347,8 +3386,7 @@ defmodule Genswarms.LlmProxy.Plug do
               "index" => 0,
               "delta" => %{
                 "role" => "assistant",
-                "content" =>
-                  "This chat reached today's AI usage limit. A deterministic Telegram notice was sent; do not send a separate user reply."
+                "content" => content
               },
               "finish_reason" => "stop"
             }
@@ -3369,7 +3407,7 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
-  defp budget_exhausted_json(conn, request_ctx, budget, opts) do
+  defp budget_exhausted_json(conn, request_ctx, budget, opts, content) do
     request_id = request_id()
 
     json(conn, 200, %{
@@ -3382,8 +3420,7 @@ defmodule Genswarms.LlmProxy.Plug do
           "index" => 0,
           "message" => %{
             "role" => "assistant",
-            "content" =>
-              "The daily LLM limit for this conversation was reached. A deterministic Telegram notice was sent; do not send a separate user reply."
+            "content" => content
           },
           "finish_reason" => "stop"
         }
@@ -3404,7 +3441,7 @@ defmodule Genswarms.LlmProxy.Plug do
     })
   end
 
-  defp request_quota_exhausted_json(conn, request_ctx, budget, opts, limit) do
+  defp request_quota_exhausted_json(conn, request_ctx, budget, opts, limit, content) do
     request_id = request_id()
 
     json(conn, 200, %{
@@ -3417,8 +3454,7 @@ defmodule Genswarms.LlmProxy.Plug do
           "index" => 0,
           "message" => %{
             "role" => "assistant",
-            "content" =>
-              "This chat reached today's AI usage limit. A deterministic Telegram notice was sent; do not send a separate user reply."
+            "content" => content
           },
           "finish_reason" => "stop"
         }

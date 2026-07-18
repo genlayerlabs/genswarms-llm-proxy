@@ -171,6 +171,284 @@ check.(
 
 Agent.stop(cc)
 
+# ────────────────────────────────────────────────────────────────────────────
+# Plug-level harness: fake store + mutable clock + delivery capture
+# ────────────────────────────────────────────────────────────────────────────
+
+defmodule LLM.NoticeUxStore do
+  @name __MODULE__
+
+  def start_link do
+    case Agent.start_link(fn -> %{} end, name: @name) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+      err -> err
+    end
+  end
+
+  # Seed the budget row the plug sees for (identity, day). `spent`/`limit` drive the
+  # dollar block; `requests` drives the request-quota block.
+  def seed(identity, day, attrs \\ %{}) do
+    Agent.update(@name, fn state ->
+      Map.put(
+        state,
+        {identity, day},
+        Map.merge(
+          %{
+            budget_identity: identity,
+            day: day,
+            session_id: "seed",
+            spent_usd: Decimal.new("0.30"),
+            limit_usd: Decimal.new("0.01"),
+            requests: 1,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0
+          },
+          attrs
+        )
+      )
+    end)
+  end
+
+  def llm_budget_status(identity, day, session_id, _default_limit) do
+    Agent.get(@name, fn state ->
+      case Map.get(state, {identity, day}) do
+        nil -> nil
+        row -> %{row | session_id: session_id}
+      end
+    end)
+  end
+
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{}
+end
+
+{:ok, _} = LLM.NoticeUxStore.start_link()
+
+{:ok, clock_state} = Agent.start_link(fn -> ~U[2026-07-01 08:00:00Z] end)
+set_clock = fn %DateTime{} = dt -> Agent.update(clock_state, fn _ -> dt end) end
+clock = fn -> Agent.get(clock_state, & &1) end
+
+{:ok, captured} = Agent.start_link(fn -> [] end)
+
+deliver_fn = fn _swarm, to, _from, content ->
+  Agent.update(captured, &[{to, Jason.decode!(content)} | &1])
+  :ok
+end
+
+slot_replies = fn ->
+  Agent.get(captured, fn msgs ->
+    msgs
+    |> Enum.filter(fn {to, msg} -> to == :sender and msg["action"] == "slot_reply" end)
+    |> Enum.map(fn {_to, msg} -> msg["content"] end)
+    |> Enum.reverse()
+  end)
+end
+
+reset_captured = fn -> Agent.update(captured, fn _ -> [] end) end
+
+{:ok, state_pid} = Proxy.start_state_link()
+
+base_opts = %{
+  state_pid: state_pid,
+  upstream_endpoint: "https://llm.example/v1/chat/completions",
+  upstream_api_key: "test-key",
+  provider: "unit",
+  prices: %{},
+  store_mod: LLM.NoticeUxStore,
+  clock: clock,
+  swarm_name: "testswarm",
+  sender: :sender,
+  deliver_fn: deliver_fn,
+  metrics: :metrics_cap
+}
+
+post = fn token, opts, body ->
+  conn(:post, "/v1/chat/completions", Jason.encode!(body))
+  |> put_req_header("authorization", "Bearer #{token}")
+  |> put_req_header("content-type", "application/json")
+  |> ProxyPlug.call(ProxyPlug.init(opts))
+end
+
+content_of = fn conn ->
+  conn.resp_body
+  |> Jason.decode!()
+  |> get_in(["choices", Access.at(0), "message", "content"])
+end
+
+sse_content_of = fn conn ->
+  case Regex.run(~r/^data: (\{.*\})/m, conn.resp_body) do
+    [_, json] -> json |> Jason.decode!() |> get_in(["choices", Access.at(0), "delta", "content"])
+    _ -> nil
+  end
+end
+
+sent_tail = "A deterministic Telegram notice was sent; do not send a separate user reply."
+suppressed_tail = "The user was already notified earlier today; do not send a separate user reply."
+
+# ────────────────────────────────────────────────────────────────────────────
+# Section 2: truthful synthetic content (sent vs suppressed vs repeat)
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 2: truthful synthetic content]")
+
+tc_attrs = %{conversation_id: "tg:truth:0", slot: :truth_agent, kind: :dm, workspace_key: "default"}
+tc_identity = Proxy.budget_identity(tc_attrs)
+{:ok, tc_token} = Proxy.register_session(state_pid, tc_attrs)
+LLM.NoticeUxStore.seed(tc_identity, today)
+
+set_clock.(t0)
+c1 = post.(tc_token, base_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "budget block #1 delivers the Telegram notice and the content says it was sent",
+  length(slot_replies.()) == 1 and
+    content_of.(c1) == "The daily LLM limit for this conversation was reached. " <> sent_tail
+)
+
+set_clock.(DateTime.add(t0, 60, :second))
+c2 = post.(tc_token, base_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "budget block #2 (1min later): NO new notice, content says user was ALREADY notified — never claims a notice was sent",
+  length(slot_replies.()) == 1 and
+    content_of.(c2) == "The daily LLM limit for this conversation was reached. " <> suppressed_tail and
+    not String.contains?(content_of.(c2), "was sent")
+)
+
+set_clock.(DateTime.add(t0, 4 * 3600, :second))
+c3 = post.(tc_token, base_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "budget block 4h later: notice REPEATS (2 total) and content says sent again",
+  length(slot_replies.()) == 2 and
+    content_of.(c3) == "The daily LLM limit for this conversation was reached. " <> sent_tail
+)
+
+# SSE variant: suppressed content must be truthful in the streamed chunk too
+set_clock.(DateTime.add(t0, 4 * 3600 + 60, :second))
+sse_opts = Map.put(base_opts, :allow_streaming, true)
+c4 = post.(tc_token, sse_opts, %{"model" => "m", "messages" => [], "stream" => true})
+
+check.(
+  "budget block SSE (suppressed): chunk content says already notified, no new notice",
+  length(slot_replies.()) == 2 and
+    sse_content_of.(c4) == "The daily LLM limit for this conversation was reached. " <> suppressed_tail
+)
+
+# request-quota variant
+reset_captured.()
+rq_attrs = %{conversation_id: "tg:rq:0", slot: :rq_agent, kind: :dm, workspace_key: "default"}
+rq_identity = Proxy.budget_identity(rq_attrs)
+{:ok, rq_token} = Proxy.register_session(state_pid, rq_attrs)
+LLM.NoticeUxStore.seed(rq_identity, today, %{spent_usd: Decimal.new("0.00"), limit_usd: Decimal.new("1"), requests: 99})
+rq_opts = Map.put(base_opts, :daily_request_limit, 5)
+
+set_clock.(t0)
+q1 = post.(rq_token, rq_opts, %{"model" => "m", "messages" => []})
+set_clock.(DateTime.add(t0, 60, :second))
+q2 = post.(rq_token, rq_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "request-quota block: #1 says sent, #2 says already notified (no new notice)",
+  length(slot_replies.()) == 1 and
+    content_of.(q1) == "This chat reached today's AI usage limit. " <> sent_tail and
+    content_of.(q2) == "This chat reached today's AI usage limit. " <> suppressed_tail
+)
+
+# global-ceiling variant (fresh state pid so the in-memory global spend is isolated)
+{:ok, g_state} = Proxy.start_state_link()
+g_attrs = %{conversation_id: "tg:glob:0", slot: :glob_agent, kind: :dm, workspace_key: "default"}
+{:ok, g_token} = Proxy.register_session(g_state, g_attrs)
+
+Proxy.record_usage(g_state, %{budget_identity: "other-conv"}, today, "s1", %{
+  model: "m",
+  status: "ok",
+  cost_usd: "10"
+})
+
+g_opts =
+  base_opts
+  |> Map.put(:state_pid, g_state)
+  |> Map.put(:global_daily_limit, Decimal.new("1"))
+
+reset_captured.()
+set_clock.(t0)
+g1 = post.(g_token, g_opts, %{"model" => "m", "messages" => []})
+set_clock.(DateTime.add(t0, 60, :second))
+g2 = post.(g_token, g_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "global block: #1 says sent, #2 says already notified (no new notice)",
+  length(slot_replies.()) == 1 and
+    content_of.(g1) == "The service-wide daily LLM budget was reached. " <> sent_tail and
+    content_of.(g2) == "The service-wide daily LLM budget was reached. " <> suppressed_tail
+)
+
+# global streaming block: the chunk must carry the service-wide (truthful) framing,
+# not the per-conversation budget text
+set_clock.(DateTime.add(t0, 2 * 60, :second))
+g3 = post.(g_token, Map.put(g_opts, :allow_streaming, true), %{"model" => "m", "messages" => [], "stream" => true})
+
+check.(
+  "global block SSE: chunk content is the service-wide message (suppressed variant)",
+  sse_content_of.(g3) == "The service-wide daily LLM budget was reached. " <> suppressed_tail
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Section 3: independent notice keys per cap type (same identity)
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 3: per-cap-type notice independence]")
+
+{:ok, x_state} = Proxy.start_state_link()
+x_attrs = %{conversation_id: "tg:xcap:0", slot: :xcap_agent, kind: :dm, workspace_key: "default"}
+x_identity = Proxy.budget_identity(x_attrs)
+{:ok, x_token} = Proxy.register_session(x_state, x_attrs)
+x_opts = Map.put(base_opts, :state_pid, x_state)
+
+# 1) dollar-budget block → budget notice delivered
+LLM.NoticeUxStore.seed(x_identity, today)
+reset_captured.()
+set_clock.(t0)
+_ = post.(x_token, x_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "same identity: budget block delivers the budget notice",
+  match?([one], slot_replies.()) and String.contains?(hd(slot_replies.()), "daily LLM limit")
+)
+
+# 2) minutes later the REQUEST-QUOTA cap trips → its notice must NOT be silenced
+#    by the earlier budget notice
+LLM.NoticeUxStore.seed(x_identity, today, %{spent_usd: Decimal.new("0"), limit_usd: Decimal.new("1"), requests: 99})
+set_clock.(DateTime.add(t0, 5 * 60, :second))
+_ = post.(x_token, Map.put(x_opts, :daily_request_limit, 5), %{"model" => "m", "messages" => []})
+
+check.(
+  "same identity: a later request-quota block still notifies (2nd notice, quota text)",
+  match?([_, _], slot_replies.()) and
+    String.contains?(Enum.at(slot_replies.(), 1), "request limit")
+)
+
+# 3) minutes later the GLOBAL ceiling trips → its notice must NOT be silenced either
+Proxy.record_usage(x_state, %{budget_identity: "someone-else"}, today, "s1", %{
+  model: "m",
+  status: "ok",
+  cost_usd: "10"
+})
+
+set_clock.(DateTime.add(t0, 10 * 60, :second))
+
+_ =
+  post.(x_token, Map.put(x_opts, :global_daily_limit, Decimal.new("1")), %{
+    "model" => "m",
+    "messages" => []
+  })
+
+check.(
+  "same identity: a later global-ceiling block still notifies (3rd notice, service-wide text)",
+  match?([_, _, _], slot_replies.()) and
+    String.contains?(Enum.at(slot_replies.(), 2), "service daily LLM budget")
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 failed = Agent.get(failures, & &1)
