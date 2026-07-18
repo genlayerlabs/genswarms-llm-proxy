@@ -49,6 +49,12 @@ defmodule Genswarms.LlmProxy do
       usable `:httpc`, see `Genswarms.LlmProxy.Curl`), keeping the API key +
       identity OUT of argv;
     * in-memory usage mirror is pruned on day-rollover so it can't grow unbounded;
+    * blocked requests deliver a deterministic Telegram notice, rate-limited per
+      {budget_identity, cap type, UTC day} (default: repeat every 4h, see
+      `notice_repeat_ms`; the state is day-pruned and per process lifetime). The
+      synthetic 200 completion tells the agent what THIS request did — notice
+      sent, user already notified earlier, or (for `notify: false` background
+      sessions) that no user notice is sent by this path;
     * Bandit start tolerates `:eaddrinuse`/`:already_started` (log-and-continue);
     * `dm_module` (optional, exports `dm?/1`) classifies a conversation id as
       DM vs group for per-kind budgets — absent, unlabeled sessions are "group".
@@ -64,6 +70,10 @@ defmodule Genswarms.LlmProxy do
   @bandit_name __MODULE__.Bandit
   @default_port 4318
   @default_daily_limit "0.50"
+  # Minimum interval between repeated block notices for the same
+  # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
+  # `notice_repeat_ms` config/opt; 0 or nil = legacy once-per-day.
+  @default_notice_repeat_ms 4 * 60 * 60 * 1000
 
   @doc false
   def rate_card_complete?(prices) when is_map(prices) do
@@ -300,6 +310,7 @@ defmodule Genswarms.LlmProxy do
          default_daily_limit: plug_opts.default_daily_limit,
          daily_request_limit: plug_opts.daily_request_limit,
          global_daily_limit: plug_opts.global_daily_limit,
+         notice_repeat_ms: plug_opts.notice_repeat_ms,
          clock: Map.get(config, :clock, fn -> DateTime.utc_now() end),
          dm_module: module_ref(Map.get(config, :dm_module))
        }
@@ -401,11 +412,6 @@ defmodule Genswarms.LlmProxy do
     )
   end
 
-  # Minimum interval between repeated block notices for the same
-  # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
-  # `notice_repeat_ms` config/opt; 0 or nil = legacy once-per-day.
-  @default_notice_repeat_ms 4 * 60 * 60 * 1000
-
   @doc "Default minimum interval (ms) between repeated block notices — 4 hours."
   def default_notice_repeat_ms, do: @default_notice_repeat_ms
 
@@ -486,6 +492,16 @@ defmodule Genswarms.LlmProxy do
     notice_due?(pid, budget_identity, :budget, day, [])
   end
 
+  @doc """
+  Register a session and mint its opaque bearer token.
+
+  Recognized attrs: `:conversation_id`, `:slot`, `:kind` (required),
+  `:workspace_key` (default `"default"`), `:daily_limit_usd`, and `:notify`
+  (default `true`) — pass `notify: false` for background sessions (e.g. a
+  summarizer slot sharing the conversation's budget identity) so a block
+  neither sends the user a Telegram notice nor consumes the notice timestamp
+  of the user-facing session.
+  """
   def register_session(pid \\ @state_name, attrs) when is_map(attrs) do
     put_session(pid, token(), attrs)
   end

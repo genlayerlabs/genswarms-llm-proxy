@@ -518,6 +518,38 @@ check.(
     content_of.(s1) == "The daily LLM limit for this conversation was reached. No user notice was sent by this path."
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+# Section 5: object-level config path — init/1 wires notice_repeat_ms
+# (regression: the default must be 4h, not nil/once-per-day)
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 5: init/1 notice_repeat_ms wiring]")
+
+# The linked Bandit listener's start errors must not kill this process (see
+# checks/llm_proxy_boot_test.exs for the full boot-guard suite).
+Process.flag(:trap_exit, true)
+
+boot_config = %{
+  port: 24_319,
+  upstream_endpoint: "https://llm.example/v1/chat/completions",
+  upstream_api_key: "sk-notice-ux-smoke-key",
+  prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"}
+}
+
+{:ok, boot_state} = Proxy.init(boot_config)
+
+check.(
+  "init/1 without notice_repeat_ms defaults to 4h (14_400_000 ms)",
+  boot_state.quota.notice_repeat_ms == 14_400_000 and
+    Proxy.default_notice_repeat_ms() == 14_400_000
+)
+
+{:ok, boot_state2} = Proxy.init(Map.put(boot_config, :notice_repeat_ms, 5_000))
+
+check.(
+  "init/1 with notice_repeat_ms: 5_000 carries the configured value",
+  boot_state2.quota.notice_repeat_ms == 5_000
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 failed = Agent.get(failures, & &1)

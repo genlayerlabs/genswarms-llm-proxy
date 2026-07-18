@@ -24,6 +24,25 @@ implementations it unifies — micro-markets carried the other).
 - **Streaming gate** (`allow_streaming`) and **prompt-cache marking** (`prompt_cache`).
 - Upstream via curl with the key in a private tempfile config — never argv.
 
+## Block notices
+
+Every blocked request returns a synthetic 200 completion to the agent and
+(for user-facing sessions) delivers a deterministic Telegram notice via the
+`sender` object. Notices are rate-limited per
+`{budget_identity, cap type, UTC day}`: the first block of the day notifies,
+repeats are suppressed until `notice_repeat_ms` has elapsed (default 4 hours;
+`0`/`nil` = at most once per UTC day). Each cap type — per-conversation
+dollar budget, request quota, global ceiling — notifies independently. The
+notice state is in-memory (a proxy restart may re-notify) and pruned to the
+current day.
+
+The synthetic completion content is truthful about **this** request: it says a
+notice *was sent* only when one actually went out; otherwise it says the user
+was already notified earlier today. Sessions registered with `notify: false`
+(background work, e.g. a memory summarizer sharing the conversation's budget
+identity) never deliver a notice, never consume the notice timestamp, and get
+content stating that no user notice was sent by this path.
+
 ## As a genswarms object
 
 ```elixir
@@ -43,7 +62,10 @@ implementations it unifies — micro-markets carried the other).
     store_mod: MyApp.LlmProxyStore,   # optional — see Durable accounting
     dm_module: MyApp.Cid,             # optional — exports dm?/1 for per-kind budgets
     metrics: :metrics,                # optional — counter-bump target object
-    sender: :sender                   # notice delivery target
+    sender: :sender,                  # notice delivery target
+    notice_repeat_ms: 14_400_000      # optional — min interval between repeated
+                                      # block notices per conversation per cap type
+                                      # (default 4h; 0/nil = once per UTC day)
   }
 }
 ```
