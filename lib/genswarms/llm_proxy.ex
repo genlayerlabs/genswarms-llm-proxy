@@ -517,7 +517,12 @@ defmodule Genswarms.LlmProxy do
       kind: attrs |> Map.fetch!(:kind) |> to_string(),
       workspace_key: attrs |> Map.get(:workspace_key, "default") |> to_string(),
       budget_identity: budget_identity(attrs),
-      daily_limit_usd: session_daily_limit(attrs)
+      daily_limit_usd: session_daily_limit(attrs),
+      # notify: false = background session (e.g. a summarizer sharing the
+      # conversation's budget identity): when blocked it neither delivers a
+      # Telegram block notice NOR consumes/advances the notice timestamp, so it
+      # can't starve the user-facing session's notice. Default true.
+      notify: Map.get(attrs, :notify, true) != false
     }
 
     persist_budget_origin(Map.get(attrs, :store_mod), session)

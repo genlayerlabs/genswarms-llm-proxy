@@ -449,6 +449,75 @@ check.(
     String.contains?(Enum.at(slot_replies.(), 2), "service daily LLM budget")
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+# Section 4: notify: false sessions (background work) neither deliver nor
+# consume the notice timestamp
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 4: notify: false background sessions]")
+
+{:ok, bg_state} = Proxy.start_state_link()
+bg_opts = Map.put(base_opts, :state_pid, bg_state)
+
+# Same conversation/kind/workspace → SAME budget_identity for the user-facing
+# session and the background one (e.g. slot "summarizer:<cid>").
+user_attrs = %{conversation_id: "tg:bg:0", slot: :bg_agent, kind: :dm, workspace_key: "default"}
+
+bg_attrs = %{
+  conversation_id: "tg:bg:0",
+  slot: :"summarizer:tg:bg:0",
+  kind: :dm,
+  workspace_key: "default",
+  notify: false
+}
+
+bg_identity = Proxy.budget_identity(user_attrs)
+{:ok, user_token} = Proxy.register_session(bg_state, user_attrs)
+{:ok, bg_token} = Proxy.register_session(bg_state, bg_attrs)
+LLM.NoticeUxStore.seed(bg_identity, today)
+
+reset_captured.()
+set_clock.(t0)
+b1 = post.(bg_token, bg_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "notify:false blocked call delivers NO Telegram notice",
+  slot_replies.() == []
+)
+
+check.(
+  "notify:false synthetic content states the limit + that no user notice was sent by this path",
+  content_of.(b1) == "The daily LLM limit for this conversation was reached. No user notice was sent by this path."
+)
+
+# The background block must NOT have consumed/advanced the notice timestamp:
+# the user-facing session blocked a minute later still notifies.
+set_clock.(DateTime.add(t0, 60, :second))
+u1 = post.(user_token, bg_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "user-facing session still notifies after a background block (timestamp not consumed)",
+  length(slot_replies.()) == 1 and
+    content_of.(u1) == "The daily LLM limit for this conversation was reached. " <> sent_tail
+)
+
+# notify: false threads through register_static_session too
+static_token = "static-bg-token-0123456789abcdef"
+
+{:ok, ^static_token} =
+  Proxy.register_static_session(
+    bg_state,
+    Map.merge(bg_attrs, %{slot: :"static_summarizer:tg:bg:0", token: static_token})
+  )
+
+set_clock.(DateTime.add(t0, 120, :second))
+s1 = post.(static_token, bg_opts, %{"model" => "m", "messages" => []})
+
+check.(
+  "static session with notify:false also skips delivery and says so",
+  length(slot_replies.()) == 1 and
+    content_of.(s1) == "The daily LLM limit for this conversation was reached. No user notice was sent by this path."
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 failed = Agent.get(failures, & &1)
