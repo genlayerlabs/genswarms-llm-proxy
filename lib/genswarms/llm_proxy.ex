@@ -392,33 +392,94 @@ defmodule Genswarms.LlmProxy do
 
   def start_state_link(opts \\ []) do
     Agent.start_link(
-      fn -> %{sessions: %{}, usage: %{}, notified: MapSet.new(), global: %{}} end,
+      fn -> %{sessions: %{}, usage: %{}, notified: %{}, global: %{}} end,
       opts
     )
   end
 
+  # Minimum interval between repeated block notices for the same
+  # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
+  # `notice_repeat_ms` config/opt; 0 or nil = legacy once-per-day.
+  @default_notice_repeat_ms 4 * 60 * 60 * 1000
+
+  @doc "Default minimum interval (ms) between repeated block notices — 4 hours."
+  def default_notice_repeat_ms, do: @default_notice_repeat_ms
+
   @doc """
-  Returns true the FIRST time a (budget_identity, day) pair is seen, false after —
-  so the budget Telegram notice is delivered at most once per conversation per UTC
-  day **per proxy process lifetime**. A proxy restart clears the set and MAY re-notify
-  (non-durable by design). Day-keyed: a new UTC day re-notifies. The set is pruned to
-  the requested `day` on each call so it cannot grow unbounded.
+  Should a block notice be delivered for `(budget_identity, reason, day)` NOW?
+
+  Keeps a last-notified timestamp per {budget_identity, reason, day} (reason =
+  the cap type, e.g. `:budget` / `:request_quota` / `:global`, so one cap type
+  never silences another). Returns true — and atomically advances the
+  timestamp — when no notice was sent yet today OR the last one is older than
+  the minimum repeat interval; false otherwise.
+
+  Options:
+
+    * `:now` — the current instant (`DateTime`; `NaiveDateTime`/`Date`
+      accepted). Defaults to `DateTime.utc_now/0`. Pass the proxy clock so
+      tests stay deterministic.
+    * `:repeat_ms` — minimum interval between notices for the same key.
+      Defaults to #{@default_notice_repeat_ms} ms (4h). `0` or `nil` =
+      legacy once-per-day (never repeat within the same UTC day).
+
+  State is **per proxy process lifetime** (a restart clears it and MAY
+  re-notify — non-durable by design) and pruned to the requested `day` on
+  each call so it cannot grow unbounded. Atomic under concurrency: exactly
+  one of N racing callers for the same key sees true.
   """
-  def notice_once?(pid \\ @state_name, budget_identity, %Date{} = day) do
-    key = {budget_identity, day}
+  def notice_due?(pid \\ @state_name, budget_identity, reason, day, opts \\ [])
+
+  def notice_due?(pid, budget_identity, reason, %Date{} = day, opts) when is_list(opts) do
+    now = notice_now(Keyword.get(opts, :now))
+    repeat_ms = Keyword.get(opts, :repeat_ms, @default_notice_repeat_ms)
+    key = {budget_identity, reason, day}
 
     Agent.get_and_update(pid, fn state ->
-      notified = Map.get(state, :notified, MapSet.new())
+      pruned =
+        state
+        |> Map.get(:notified)
+        |> normalize_notified()
+        |> Enum.filter(fn {{_bid, _reason, d}, _at} -> d == day end)
+        |> Map.new()
 
-      if MapSet.member?(notified, key) do
-        {false, state}
+      due? =
+        case Map.get(pruned, key) do
+          nil ->
+            true
+
+          %DateTime{} = last ->
+            is_integer(repeat_ms) and repeat_ms > 0 and
+              DateTime.diff(now, last, :millisecond) >= repeat_ms
+        end
+
+      # Map.put (not `%{state | ...}`) so a keyless Agent state (e.g. an older boot)
+      # cannot KeyError.
+      if due? do
+        {true, Map.put(state, :notified, Map.put(pruned, key, now))}
       else
-        pruned = notified |> Enum.filter(fn {_bid, d} -> d == day end) |> MapSet.new()
-        # Map.put (not `%{state | ...}`) so a keyless Agent state (e.g. an older boot)
-        # cannot KeyError — the read above already falls back via Map.get/3.
-        {true, Map.put(state, :notified, MapSet.put(pruned, key))}
+        {false, Map.put(state, :notified, pruned)}
       end
     end)
+  end
+
+  # The pre-0.2.19 shape was a MapSet of {bid, day}; an already-running state
+  # Agent from an older boot must not crash the new code — treat as empty
+  # (worst case: one extra notice, same as a restart).
+  defp normalize_notified(%{} = map) when not is_struct(map), do: map
+  defp normalize_notified(_), do: %{}
+
+  defp notice_now(nil), do: DateTime.utc_now()
+  defp notice_now(%DateTime{} = dt), do: dt
+  defp notice_now(%NaiveDateTime{} = dt), do: DateTime.from_naive!(dt, "Etc/UTC")
+  defp notice_now(%Date{} = day), do: DateTime.new!(day, ~T[00:00:00], "Etc/UTC")
+
+  @doc """
+  Legacy shim (pre-0.2.19 API): delegates to `notice_due?/5` with reason
+  `:budget` and the default repeat interval. Prefer `notice_due?/5`.
+  """
+  def notice_once?(pid \\ @state_name, budget_identity, %Date{} = day) do
+    notice_due?(pid, budget_identity, :budget, day, [])
   end
 
   def register_session(pid \\ @state_name, attrs) when is_map(attrs) do
