@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.19 — 2026-07-18
 
 - **Truthful block content**: the synthetic 200 completion returned on a
   blocked request now describes what THIS request did. It only claims "a
