@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Truthful block content**: the synthetic 200 completion returned on a
+  blocked request now describes what THIS request did. It only claims "a
+  deterministic Telegram notice was sent" when one actually went out; when the
+  notice was rate-limit-suppressed it says the user was already notified
+  earlier today. Applies to buffered JSON and SSE bodies for all three cap
+  types. (Previously the second and later blocks of the day falsely claimed a
+  notice was sent, so agents stayed silent while users heard nothing.) The
+  global-ceiling streaming block now carries the service-wide framing instead
+  of the per-conversation budget text.
+- **Rate-limited repeat notices**: block notices are keyed by
+  `{budget_identity, cap type, UTC day}` with a last-notified timestamp and
+  repeat after `notice_repeat_ms` (new config/plug opt, default 4 hours;
+  explicit `0`/`nil` = legacy once per UTC day). Replaces the once-per-day
+  boolean set; still day-pruned, per process lifetime, atomic under
+  concurrency. `notice_once?/3` remains as a deprecated shim over the new
+  `notice_due?/5`.
+- **Independent notices per cap type**: a per-conversation dollar block no
+  longer silences a later request-quota or global-ceiling notice for the same
+  conversation (and vice versa) — the cap type is part of the dedup key.
+- **`notify: false` sessions**: `register_session`/`register_static_session`
+  accept `notify: false` for background sessions (e.g. a summarizer slot
+  sharing the conversation's budget identity). When blocked they neither
+  deliver a Telegram notice nor consume/advance the notice timestamp, and
+  their synthetic content states that no user notice was sent by this path.
+  Default `true` preserves existing delivery semantics.
+
 ## 0.2.18 - 2026-07-15
 
 - Price `/v1/compact` seals through the same cost chokepoint as chat calls.

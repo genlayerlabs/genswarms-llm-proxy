@@ -2,15 +2,18 @@
 #
 #   mix run tests/llm_proxy_notice_dedup_test.exs
 #
-# Tests that budget-exhausted Telegram notices are de-duplicated to at most one
-# per (budget_identity, UTC day) per proxy process lifetime.  Five cases:
+# Tests that budget-exhausted Telegram notices are rate-limited: at most one per
+# (budget_identity, reason, UTC day) per repeat interval (default 4h) per proxy
+# process lifetime — so back-to-back blocked calls dedup to a single notice.
+# (Interval/per-reason behavior itself: checks/llm_proxy_block_notice_ux_test.exs.)
+# Five cases:
 #
-#   1. Dedup    — ≥5 blocked calls → exactly 1 slot_reply notice; block metric fires 5×,
-#                 notified metric fires 1×; synthetic 200 returned for every call.
-#   2. Direct   — notice_once?/3 returns true then false for the same (bid, day).
+#   1. Dedup    — ≥5 blocked calls (same instant) → exactly 1 slot_reply notice; block
+#                 metric fires 5×, notified metric fires 1×; synthetic 200 every call.
+#   2. Direct   — legacy notice_once?/3 shim returns true then false for the same (bid, day).
 #   3. Concur   — 30 concurrent blocked calls → exactly 1 notice (atomic Agent CAS).
 #   4. Restart  — fresh pid re-notifies (non-durable by design).
-#   5. Prune    — day-D entry is dropped from the set when day_D+1 is first seen.
+#   5. Prune    — day-D entry is dropped from the state when day_D+1 is first seen.
 
 Application.ensure_all_started(:plug)
 
@@ -217,17 +220,17 @@ Proxy.notice_once?(pp_pid, "bid-prune", day_d)
 # Call with a different bid on day_d+1 — prune filters OUT day_d entries
 Proxy.notice_once?(pp_pid, "bid-prune-2", day_d_plus_1)
 
-notified_set = Agent.get(pp_pid, fn state -> Map.get(state, :notified, MapSet.new()) end)
+notified_map = Agent.get(pp_pid, fn state -> Map.get(state, :notified, %{}) end)
 
 check.(
-  "prune: after day_D+1 call, the day_D entry is removed from the notified set",
-  not MapSet.member?(notified_set, {"bid-prune", day_d}) and
-    MapSet.member?(notified_set, {"bid-prune-2", day_d_plus_1})
+  "prune: after day_D+1 call, the day_D entry is removed from the notified state",
+  not Enum.any?(Map.keys(notified_map), fn {_bid, _reason, d} -> d == day_d end) and
+    Map.has_key?(notified_map, {"bid-prune-2", :budget, day_d_plus_1})
 )
 
 check.(
-  "prune: notified set has exactly one entry (day_D+1 key only)",
-  MapSet.size(notified_set) == 1
+  "prune: notified state has exactly one entry (day_D+1 key only)",
+  map_size(notified_map) == 1
 )
 
 Agent.stop(pp_pid)
