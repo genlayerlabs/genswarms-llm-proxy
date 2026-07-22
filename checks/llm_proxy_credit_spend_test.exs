@@ -29,7 +29,15 @@ end
 
 {:ok, pid} = Proxy.start_state_link()
 
-opts = %{state_pid: pid, store_mod: SpendCheckStore, default_daily_limit: Decimal.new("0.50")}
+opts = %{
+  state_pid: pid,
+  store_mod: SpendCheckStore,
+  default_daily_limit: Decimal.new("0.50"),
+  # (B2) credits are feature-gated on payments_source config being present;
+  # this check exercises the credit-funded flow throughout, so it opts in
+  # explicitly rather than relying on any particular default.
+  credits_enabled: true
+}
 
 session = fn bi, limit -> %{budget_identity: bi, daily_limit_usd: limit} end
 req_ctx = %{day: ~D[2026-07-22], session_id: "sess-credit-spend"}
@@ -261,6 +269,90 @@ check.(
     "(credits never bypass the global backstop — the global clause blocks first, " <>
     "unconditionally, before credit is ever consulted)",
   ProxyPlug.credit_exhausted?(opts, session.("bi-f", d.("0.50"))) == false
+)
+
+# ── G. Feature gate: credits_enabled false = byte-identical-when-off ────────────────
+# No retro-charge, no retro-consult: a feature-off install must never read the credit
+# store (not even to find it empty) and must never accrue a mirror debit.
+defmodule RaisingCreditStore2 do
+  def reset, do: :persistent_term.put({__MODULE__, :calls}, 0)
+  def calls, do: :persistent_term.get({__MODULE__, :calls})
+
+  def llm_credit_balance(_bi) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    raise "credit store must not be consulted while credits_enabled is false"
+  end
+
+  def record_llm_credit_entry(_entry) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    raise "credit store must not be written while credits_enabled is false"
+  end
+end
+
+RaisingCreditStore2.reset()
+opts_off = %{opts | store_mod: RaisingCreditStore2, credits_enabled: false}
+
+check.(
+  "G1: credits_enabled false -> credit_exhausted? is true WITHOUT consulting the store " <>
+    "(even one hand-credited moments ago via a different, working store)",
+  ProxyPlug.credit_exhausted?(opts_off, session.("bi-g-off", d.("0.50"))) == true and
+    RaisingCreditStore2.calls() == 0
+)
+
+# opts lacking the key entirely defaults to off (mirrors production config with no
+# payments_source configured — the byte-identical-to-0.2.19 invariant).
+opts_missing_key = opts_off |> Map.delete(:credits_enabled)
+
+check.(
+  "G1b: opts missing :credits_enabled entirely also defaults to OFF (no store consult)",
+  ProxyPlug.credit_exhausted?(opts_missing_key, session.("bi-g-off2", d.("0.50"))) == true and
+    RaisingCreditStore2.calls() == 0
+)
+
+# A straddling call (well over the daily limit) must record NO debit entry and leave
+# the mirror untouched when credits are off — use a store that only implements
+# record_llm_call/4 (so record_budget_call proceeds) but would raise on any credit
+# read/write.
+defmodule GateSpendStore do
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+  def llm_credit_balance(_bi), do: raise("must not be consulted")
+  def record_llm_credit_entry(_entry), do: raise("must not be written")
+end
+
+opts_off_spend = %{opts_off | store_mod: GateSpendStore}
+
+ProxyPlug.record_budget_call(
+  opts_off_spend,
+  session.("bi-g-spend", d.("0.50")),
+  req_ctx,
+  record.("req-g-spend", d.("0.30")),
+  d.("0.40")
+)
+
+check.(
+  "G2: credits_enabled false -> a straddling call records NO debit, mirror stays empty",
+  eq.(Proxy.credit_balance(pid, nil, "bi-g-spend"), d.("0"))
+)
+
+# Even a hand-credited mirror balance doesn't unblock the gate while credits are off.
+credit!.("bi-g-blocked", "g:seed", "5.00")
+
+check.(
+  "G3: credits_enabled false -> exhausted budget stays blocked even with a positive " <>
+    "hand-credited mirror balance (the gate never reads it while off)",
+  ProxyPlug.credit_exhausted?(
+    %{opts_off | store_mod: nil},
+    session.("bi-g-blocked", d.("0.50"))
+  ) == true
+)
+
+# With credits_enabled true (existing behavior): the same shape of call IS
+# credit-funded, proving the gate flips both ways off the same config key.
+credit!.("bi-g-on", "g:on-seed", "5.00")
+
+check.(
+  "G4: credits_enabled true -> the existing credit-funded behavior is unchanged",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-g-on", d.("0.50"))) == false
 )
 
 failed = Agent.get(failures, & &1)

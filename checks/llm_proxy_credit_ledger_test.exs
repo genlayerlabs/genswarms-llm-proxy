@@ -155,6 +155,62 @@ end
 check.("credit_balance/3 falls open to the mirror when the store raises (no crash)",
   Decimal.equal?(Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi), Decimal.new("4.00")))
 
+# 8. (B1, I1) durable credits are both-callbacks-or-neither: a store exporting
+# only ONE of the two callbacks must be treated as fully absent for the
+# credit path — README promises "missing EITHER callback falls back to the
+# mirror for both". A store exporting only llm_credit_balance/1 must NOT be
+# read from durably (a paying user's mirror top-up must stay visible to the
+# gate, not be shadowed by a durable-read-only store reporting 0).
+defmodule BalanceOnlyStore do
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("0")}
+end
+
+{:ok, balance_only_pid} = Proxy.start_state_link()
+balance_only_entry = entry.("balance-only:1", "6.00")
+
+balance_only_result =
+  Proxy.apply_credit_entry(balance_only_pid, BalanceOnlyStore, balance_only_entry)
+
+check.(
+  "half-pair (balance-only store): apply_credit_entry still succeeds (mirror mode)",
+  match?({:ok, _}, balance_only_result)
+)
+
+check.(
+  "half-pair (balance-only store): credit_balance serves the MIRROR value, " <>
+    "not the durable store's 0 — the top-up must be visible to the gate",
+  Decimal.equal?(
+    Proxy.credit_balance(balance_only_pid, BalanceOnlyStore, bi),
+    Decimal.new("6.00")
+  )
+)
+
+# A store exporting only record_llm_credit_entry/1 must likewise be treated
+# as absent — mirror-mode read AND write.
+defmodule RecordOnlyStore do
+  def record_llm_credit_entry(_entry), do: :ok
+end
+
+{:ok, record_only_pid} = Proxy.start_state_link()
+record_only_entry = entry.("record-only:1", "8.00")
+
+record_only_result =
+  Proxy.apply_credit_entry(record_only_pid, RecordOnlyStore, record_only_entry)
+
+check.(
+  "half-pair (record-only store): apply_credit_entry succeeds (mirror mode, " <>
+    "durable write NOT attempted despite the store exporting the callback)",
+  match?({:ok, _}, record_only_result)
+)
+
+check.(
+  "half-pair (record-only store): credit_balance serves the mirror value",
+  Decimal.equal?(
+    Proxy.credit_balance(record_only_pid, RecordOnlyStore, bi),
+    Decimal.new("8.00")
+  )
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

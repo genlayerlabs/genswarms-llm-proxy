@@ -231,7 +231,13 @@ defmodule Genswarms.LlmProxy do
       # non-empty return value is appended as an extra line on a `:budget` block
       # notice (e.g. a top-up instruction). Absent/raising/non-binary -> no hint,
       # never crashes the block path (see budget_notice/4).
-      topup_hint_fun: Map.get(config, :topup_hint_fun)
+      topup_hint_fun: Map.get(config, :topup_hint_fun),
+      # (B2) Feature gate for the prepaid credit path (credit_exhausted?/2,
+      # maybe_debit_credit/4): on iff payments_source is configured — same
+      # derivation the object-side payments_source gate below uses, so a host
+      # that never configures payments can never accrue mirror debits nor
+      # have the block gate consult a credit balance at all.
+      credits_enabled: credits_enabled?(config)
     }
 
     if Decimal.compare(plug_opts.default_daily_limit, Decimal.new("0")) != :gt do
@@ -324,8 +330,26 @@ defmodule Genswarms.LlmProxy do
        # payments_source is the only trusted sender of {"action":"payment_confirmed"}.
        payments_source: Map.get(config, :payments_source),
        credit_namespace: Map.get(config, :credit_namespace, "default"),
-       credit_per_usd: decimal(Map.get(config, :credit_per_usd, "1.0"))
+       credit_per_usd: decimal(Map.get(config, :credit_per_usd, "1.0")),
+       # (B2) Same derivation as plug_opts.credits_enabled above — kept
+       # alongside payments_source on the object-side state too, one
+       # resolution point for "are credits on" regardless of which side asks.
+       credits_enabled: credits_enabled?(config)
      }}
+  end
+
+  # (B2) credits_enabled? = payments_source configured and non-empty. Derived
+  # once, at boot, from the same config read that feeds payments_source on
+  # both the plug_opts (credit_exhausted?/maybe_debit_credit) and the
+  # object-side state (handle_payment_confirmed) — a host that never sets
+  # payments_source gets the feature off on both sides, with no retro-charge
+  # if it's turned on later (see maybe_debit_credit/4).
+  defp credits_enabled?(config) do
+    case Map.get(config, :payments_source) do
+      nil -> false
+      "" -> false
+      _ -> true
+    end
   end
 
   def interface do
@@ -1841,9 +1865,24 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
+  # Durable credits are both-callbacks-or-neither: a store exporting only ONE
+  # of llm_credit_balance/1 / record_llm_credit_entry/1 is treated as fully
+  # absent for the credit path (README: "missing EITHER callback falls back
+  # to the mirror for both"). Exporting only the read callback would
+  # otherwise shadow a mirror top-up behind a durable-store read that never
+  # actually recorded anything (paying user told ok, gate reads durable 0,
+  # stays blocked); exporting only the write callback would silently accept
+  # writes it can never read back durably. One resolution point for both call
+  # sites below.
+  @doc false
+  def credit_store_ready?(store_mod) do
+    is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+      function_exported?(store_mod, :llm_credit_balance, 1) and
+      function_exported?(store_mod, :record_llm_credit_entry, 1)
+  end
+
   defp durable_credit_balance(store_mod, budget_identity) do
-    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
-         function_exported?(store_mod, :llm_credit_balance, 1) do
+    if credit_store_ready?(store_mod) do
       case store_mod.llm_credit_balance(budget_identity) do
         {:ok, %Decimal{} = bal} -> bal
         _ -> nil
@@ -1905,8 +1944,7 @@ defmodule Genswarms.LlmProxy do
   end
 
   defp durable_record_credit_entry(store_mod, entry) do
-    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
-         function_exported?(store_mod, :record_llm_credit_entry, 1) do
+    if credit_store_ready?(store_mod) do
       store_mod.record_llm_credit_entry(entry)
     else
       :no_store
@@ -3429,11 +3467,22 @@ defmodule Genswarms.LlmProxy.Plug do
   # exhausted?(budget) AND credit_exhausted?. Reading the balance only on the
   # already-exhausted path keeps the hot path store-call-free and makes the
   # no-credits configuration byte-identical to 0.2.19 (balance 0 → true).
+  #
+  # (B2) Feature-gated on `credits_enabled` (derived from `payments_source`
+  # config being present, see init/1): when off, this returns true WITHOUT
+  # reading any balance — zero credit consults, byte-identical 0.2.19
+  # blocking. A feature-off install must never be unblocked by a stray/
+  # hand-credited mirror balance, and enabling payments later must never
+  # retro-charge overage accrued while the feature was off.
   @doc false
   # Public for the credit-spend check: composes with exhausted?/1 in the two cond gates.
   def credit_exhausted?(opts, session) do
-    balance = Proxy.credit_balance(opts.state_pid, opts.store_mod, session.budget_identity)
-    Decimal.compare(balance, Decimal.new("0")) != :gt
+    if Map.get(opts, :credits_enabled, false) do
+      balance = Proxy.credit_balance(opts.state_pid, opts.store_mod, session.budget_identity)
+      Decimal.compare(balance, Decimal.new("0")) != :gt
+    else
+      true
+    end
   end
 
   defp request_quota_exhausted?(opts, budget) do
@@ -3883,9 +3932,22 @@ defmodule Genswarms.LlmProxy.Plug do
   # Straddle math: only the portion of this call's cost ABOVE the daily limit is
   # credit-funded. overflow(spent) = max(0, spent - limit);
   # debit = overflow(spent_before + cost) - overflow(spent_before).
+  #
+  # (B2) Feature-gated on `credits_enabled`: a feature-off install must never
+  # accrue a negative mirror balance (which would retro-charge pre-feature
+  # overage the moment payments are enabled later) — no-op entirely when off,
+  # before touching the credit store at all.
   defp maybe_debit_credit(_opts, _session, _record, nil), do: :ok
 
   defp maybe_debit_credit(opts, session, record, %Decimal{} = spent_before) do
+    if Map.get(opts, :credits_enabled, false) do
+      do_maybe_debit_credit(opts, session, record, spent_before)
+    else
+      :ok
+    end
+  end
+
+  defp do_maybe_debit_credit(opts, session, record, %Decimal{} = spent_before) do
     with %Decimal{} = cost <- Map.get(record, :cost_usd),
          request_id when is_binary(request_id) <- Map.get(record, :request_id) do
       limit = session.daily_limit_usd || opts.default_daily_limit
