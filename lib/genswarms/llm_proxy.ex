@@ -226,7 +226,12 @@ defmodule Genswarms.LlmProxy do
       # Minimum interval between repeated block notices to the SAME conversation
       # for the SAME cap type on the same UTC day (default 4h). 0 or nil = legacy
       # once-per-day.
-      notice_repeat_ms: Map.get(config, :notice_repeat_ms, @default_notice_repeat_ms)
+      notice_repeat_ms: Map.get(config, :notice_repeat_ms, @default_notice_repeat_ms),
+      # Optional seam (nil | (budget_identity -> nil | String.t())): when set, its
+      # non-empty return value is appended as an extra line on a `:budget` block
+      # notice (e.g. a top-up instruction). Absent/raising/non-binary -> no hint,
+      # never crashes the block path (see budget_notice/4).
+      topup_hint_fun: Map.get(config, :topup_hint_fun)
     }
 
     if Decimal.compare(plug_opts.default_daily_limit, Decimal.new("0")) != :gt do
@@ -911,6 +916,9 @@ defmodule Genswarms.LlmProxy do
         limit_usd: money(global_limit),
         pct: pct_decimal(global_used, global_limit)
       },
+      credit: %{
+        balance_usd: money2(credit_balance(state_pid, Map.get(quota, :store_mod), budget_identity))
+      },
       # mm vocabulary: the same numbers nested under "quota" with 2dp money strings
       # and a human reset stamp — both host lineages' consumers keep working.
       quota: %{
@@ -988,7 +996,11 @@ defmodule Genswarms.LlmProxy do
       action: "quota_status",
       ok: false,
       conversation_id: Map.get(msg, "conversation_id"),
-      error: "missing_conversation_id"
+      error: "missing_conversation_id",
+      # No conversation_id means no budget_identity to look up a real balance
+      # against — keep the field present (schema-stable for consumers) with
+      # the safe default rather than omitting it.
+      credit: %{balance_usd: money2(Decimal.new("0"))}
     }
   end
 
@@ -3526,7 +3538,7 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp budget_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
     bump_quota_metric(opts, session, "budget_exhausted")
-    notice = budget_notice(request_ctx, budget)
+    notice = budget_notice(request_ctx, budget, opts, session)
 
     # Deterministic Telegram delivery + block metrics are mode-independent; only the
     # HTTP response body differs (SSE chunk vs buffered JSON).
@@ -3775,9 +3787,38 @@ defmodule Genswarms.LlmProxy.Plug do
     })
   end
 
-  defp budget_notice(request_ctx, _budget) do
+  # Exposed @doc false so the credit-surfaces check can drive the hint-append
+  # logic directly (like bump_metric). Base text is byte-identical to 0.2.19;
+  # the hint (from opts.topup_hint_fun, see init/1) is appended on its own
+  # line only when present, non-empty, and the fun doesn't raise.
+  @doc false
+  def budget_notice(request_ctx, _budget, opts, session) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
-    "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+    base = "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+
+    case topup_hint(opts, session) do
+      nil -> base
+      hint -> base <> "\n" <> hint
+    end
+  end
+
+  defp topup_hint(opts, session) do
+    case Map.get(opts, :topup_hint_fun) do
+      fun when is_function(fun, 1) ->
+        try do
+          case fun.(session.budget_identity) do
+            hint when is_binary(hint) and hint != "" -> hint
+            _ -> nil
+          end
+        rescue
+          _ -> nil
+        catch
+          _, _ -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp request_quota_notice(request_ctx, _limit) do
