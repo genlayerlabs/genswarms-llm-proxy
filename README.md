@@ -63,15 +63,21 @@ content stating that no user notice was sent by this path.
     dm_module: MyApp.Cid,             # optional — exports dm?/1 for per-kind budgets
     metrics: :metrics,                # optional — counter-bump target object
     sender: :sender,                  # notice delivery target
-    notice_repeat_ms: 14_400_000      # optional — min interval between repeated
+    notice_repeat_ms: 14_400_000,     # optional — min interval between repeated
                                       # block notices per conversation per cap type
                                       # (default 4h; 0/nil = once per UTC day)
+    payments_source: :payments,       # optional — see Prepaid credit ledger
+                                      # (nil default = credit feature off)
+    credit_namespace: "default",      # optional
+    credit_per_usd: "1.0",            # optional
+    topup_hint_fun: &MyApp.topup_hint/1  # optional, plug opt only
   }
 }
 ```
 
 Object protocol: `{"action":"usage"}`, `{"action":"health"}`,
-`{"action":"quota_status","conversation_id":"…"}`.
+`{"action":"quota_status","conversation_id":"…"}`,
+`{"action":"payment_confirmed",...}` (see Prepaid credit ledger below).
 
 Module refs (`store_mod`, `dm_module`) may be atoms (Elixir defs) or strings
 (JSON IR) — strings resolve via `to_existing_atom`, unknown → treated as absent.
@@ -85,6 +91,60 @@ budgets that survive restarts, pass `store_mod:` — any subset of the
 `Genswarms.LlmProxy.Store` callbacks; missing ones fall back to memory
 (fail-open: an accounting outage must not take the swarm's LLM path down).
 See `lib/genswarms/llm_proxy/store.ex` for the exact contract.
+
+## Prepaid credit ledger (optional)
+
+Once a budget identity's free daily budget is exhausted, further calls draw
+down a per-identity prepaid credit balance instead of blocking outright —
+config:
+
+- `payments_source` — the trusted object name allowed to send
+  `{"action":"payment_confirmed"}`. `nil` (default) keeps the whole feature
+  off; any other sender is logged and ignored.
+- `credit_namespace` (default `"default"`) — a confirmation for a different
+  namespace is silently ignored (multiple consumers can share one settlement
+  hub, each only owns its own namespace).
+- `credit_per_usd` (default `"1.0"`) — conversion rate from `amount_usd` to
+  credited balance.
+- `topup_hint_fun` — optional 1-arity fun (`budget_identity -> String.t() |
+  nil`), plug opt only (not top-level config). A non-empty, non-raising
+  result is appended as an extra line on a `:budget` block notice; absent,
+  raising, or non-binary → no hint, never crashes the block path.
+
+`payment_confirmed` is trusted-source **and** namespace gated; `amount_usd`
+must parse as `Decimal` and be `> 0`, and `method`/`ref` are both required —
+the idempotency key is `"<method>:<ref>"`, so a re-delivered confirmation
+credits the balance once. Replies `{"ok":true}` (first credit),
+`{"ok":true,"duplicate":true}` (replay), or `{"ok":true,"degraded":true,...}`
+(store write failed — see Fail policy below); a malformed message replies
+`{"ok":false,"error":"bad_payment_confirmed"}`.
+
+Durable accounting for credits is two more OPTIONAL `Store` callbacks —
+`llm_credit_balance/1` (current signed balance) and
+`record_llm_credit_entry/1` (append one ledger entry: top-up positive,
+debit negative). `record_llm_credit_entry/1` **must** enforce
+`idempotency_key` uniqueness and return `{:error, :duplicate}` on replay —
+that's the double-credit guard. Missing either callback falls back to the
+in-memory mirror, same as the other six `Store` callbacks.
+
+**Spend order:** the free daily budget spends first; only once it's
+exhausted (`spent >= limit`) does the credit balance start being drawn down,
+and only the overflow portion of a straddling call is debited
+(`debit = overflow(spent_before + cost) - overflow(spent_before)`, entries
+keyed `"debit:" <> request_id`). Because the debit is computed after the
+call completes, the final credit-funded call can drive the balance slightly
+negative (post-hoc costs); the global daily ceiling still bounds all spend
+regardless of credit balance.
+
+**Fail policy:** credit balance reads fail open to the in-memory mirror (an
+accounting outage must not block spend). A store-down top-up still applies
+to the in-memory mirror, logs `Logger.error`, bumps
+`llm_proxy_budget_degraded`, and replies `degraded: true` — reconcile from
+the payment source's own ledger afterwards.
+
+`quota_status` gains a `credit.balance_usd` field (2dp string, like the other
+credit-related dollar amounts in this feature — `money2`, not the 6dp `money`
+used elsewhere in `quota_status`).
 
 ## Dashboard integration
 

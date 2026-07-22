@@ -342,7 +342,7 @@ defmodule Genswarms.LlmProxy do
       },
       payment_confirmed: %{
         input:
-          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"usdc_base","ref":"0xT:0","namespace":"llm_quota"}),
+          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"card","ref":"txn_0","namespace":"llm_quota"}),
         output:
           "credits the beneficiary's prepaid balance once per (method, ref) — only from the configured payments_source, only for the configured credit_namespace"
       }
@@ -420,8 +420,8 @@ defmodule Genswarms.LlmProxy do
 
       state_pid = Map.get(state, :state_pid, @state_name)
       # Tolerate both host state shapes (see quota_status/2): a top-level
-      # :store_mod (test/mm lineage) or one nested under :quota (production
-      # init/1 assembly, wingston lineage).
+      # :store_mod (test/mm lineage) or one nested under :quota (the
+      # production init/1 assembly path).
       store_mod = Map.get(state, :store_mod) || get_in(state, [:quota, :store_mod])
 
       case apply_credit_entry(state_pid, store_mod, entry) do
@@ -1812,7 +1812,7 @@ defmodule Genswarms.LlmProxy do
     end)
   end
 
-  # ── Credit ledger primitives (Task 1 of the USDC-topups plan) ────────────────
+  # ── Credit ledger primitives ──────────────────────────────────────────────
   #
   # A payment-agnostic prepaid credit balance per budget_identity, on top of the
   # existing daily-limit budget: the store (when it exports the two callbacks)
