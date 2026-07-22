@@ -334,6 +334,12 @@ defmodule Genswarms.LlmProxy do
         input:
           ~s({"action":"quota_status","conversation_id":"tg:903489662:0","kind":"dm","workspace_key":"default"}),
         output: "read-only per-identity request quota, spend, and global cap status"
+      },
+      payment_confirmed: %{
+        input:
+          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"usdc_base","ref":"0xT:0","namespace":"llm_quota"}),
+        output:
+          "credits the beneficiary's prepaid balance once per (method, ref) — only from the configured payments_source, only for the configured credit_namespace"
       }
     }
   end
@@ -389,11 +395,14 @@ defmodule Genswarms.LlmProxy do
 
   defp credit_payment(msg, state) do
     with {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
+         true <- Decimal.compare(amount, Decimal.new(0)) == :gt,
          beneficiary when is_binary(beneficiary) and beneficiary != "" <-
-           Map.get(msg, "beneficiary") do
+           Map.get(msg, "beneficiary"),
+         method when is_binary(method) and method != "" <- Map.get(msg, "method"),
+         ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref") do
       per_usd = decimal(Map.get(state, :credit_per_usd, Decimal.new("1.0")))
       credited = Decimal.mult(amount, per_usd)
-      key = "#{Map.get(msg, "method", "?")}:#{Map.get(msg, "ref", "?")}"
+      key = "#{method}:#{ref}"
 
       entry = %{
         idempotency_key: key,
@@ -401,7 +410,7 @@ defmodule Genswarms.LlmProxy do
         amount_usd: credited,
         kind: "credit",
         at: DateTime.utc_now(),
-        meta: %{"method" => Map.get(msg, "method"), "ref" => Map.get(msg, "ref")}
+        meta: %{"method" => method, "ref" => ref}
       }
 
       state_pid = Map.get(state, :state_pid, @state_name)

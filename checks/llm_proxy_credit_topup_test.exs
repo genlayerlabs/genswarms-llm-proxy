@@ -117,6 +117,66 @@ check.("credit_per_usd conversion", Jason.decode!(json3)["credited_usd"] == "10.
 
 check.("malformed amount refused", Jason.decode!(json4)["ok"] == false)
 
+# 8. negative amount → refused (a "credit" action must never silently debit),
+# balance unchanged
+{:reply, json5, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:6", "amount_usd" => "-5.00"}),
+    state
+  )
+
+check.(
+  "negative amount rejected, balance unchanged",
+  Jason.decode!(json5)["ok"] == false and
+    Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
+# 9. zero amount → not a payment, refused
+{:reply, json6, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:7", "amount_usd" => "0"}),
+    state
+  )
+
+check.("zero amount rejected", Jason.decode!(json6)["ok"] == false)
+
+# 10. missing ref → refused (must not collapse onto a shared "method:" key)
+{:reply, json7, _} =
+  Proxy.handle_message("payments", msg.(%{"ref" => nil}), state)
+
+check.("missing ref rejected", Jason.decode!(json7)["ok"] == false)
+
+# 11. explicit-null method → refused
+{:reply, json8, _} =
+  Proxy.handle_message("payments", msg.(%{"ref" => "0xT:8", "method" => nil}), state)
+
+check.("explicit-null method rejected", Jason.decode!(json8)["ok"] == false)
+
+# 12. CRITICAL: two DISTINCT malformed no-ref confirmations must NOT collapse
+# onto a shared idempotency key and swallow the second as duplicate:true —
+# each is independently refused.
+{:reply, json9a, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => nil, "beneficiary" => "w:a|k:dm|c:1"}),
+    state
+  )
+
+{:reply, json9b, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => nil, "beneficiary" => "w:b|k:dm|c:2"}),
+    state
+  )
+
+check.(
+  "two distinct malformed no-ref confirmations both refused, neither swallowed as duplicate",
+  Jason.decode!(json9a)["ok"] == false and Jason.decode!(json9b)["ok"] == false and
+    Jason.decode!(json9a)["duplicate"] != true and Jason.decode!(json9b)["duplicate"] != true
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 
