@@ -5,19 +5,32 @@
 - Prepaid credit ledger: free daily budget spends first; once exhausted, calls
   draw down a per-budget-identity credit balance (durable via two new OPTIONAL
   Store callbacks `llm_credit_balance/1` + `record_llm_credit_entry/1`;
-  in-memory mirror otherwise). Only the overflow portion of a straddling call
-  is debited; the final credit-funded call may drive the balance slightly
-  negative (post-hoc costs). The global daily ceiling still bounds ALL spend.
+  in-memory mirror otherwise). The two are both-callbacks-or-neither: a store
+  exporting only one of them is treated as fully absent for the credit path
+  and falls back to the mirror for both read and write (a paying user must
+  never be told `ok` while the gate keeps reading a stale durable 0). Only
+  the overflow portion of a straddling call is debited; the final
+  credit-funded call may drive the balance slightly negative (post-hoc
+  costs). The global daily ceiling still bounds ALL spend.
+- The whole credit path is feature-gated on `credits_enabled` (derived from
+  `payments_source` being configured and non-empty; default off): with it
+  off, the block gate never consults a credit balance and a straddling call
+  never debits the mirror — a feature-off install cannot accrue a negative
+  mirror balance that a later payments rollout would retro-charge.
 - `payment_confirmed` top-ups: trusted-source + namespace gated
   (`payments_source`, `credit_namespace`, `credit_per_usd` config), rejects
-  non-positive `amount_usd` and confirmations missing `method`/`ref`, and is
-  idempotent on `method:ref` — a re-delivered confirmation credits once
-  (replies `ok`, `duplicate`, or `degraded` when the store write fails and the
-  credit lands in the in-memory mirror only). Payment-agnostic: any settlement
-  hub or operator tool can be the source.
+  non-positive AND non-finite `amount_usd` (`"NaN"`/`"Infinity"`/`"-Infinity"`
+  — `Decimal.parse/1` accepts all three; unrejected, `"NaN"` would raise past
+  the `> 0` guard and `"Infinity"` would mint an unbounded balance) and
+  confirmations missing `method`/`ref`, and is idempotent on `method:ref` — a
+  re-delivered confirmation credits once (replies `ok`, `duplicate`, or
+  `degraded` when the store write fails and the credit lands in the
+  in-memory mirror only). Payment-agnostic: any settlement hub or operator
+  tool can be the source.
 - `quota_status` gains `credit.balance_usd`; budget block notices append the
-  host-injected `topup_hint_fun` line when configured. With none of the new
-  config set, behavior is identical to 0.2.19.
+  host-injected `topup_hint_fun` line when configured. Request-path behavior
+  is identical to 0.2.19 (`quota_status` additionally carries an additive
+  credit block) when none of the new config is set.
 
 ## 0.2.19 — 2026-07-18
 

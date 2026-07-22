@@ -40,8 +40,18 @@ defmodule Genswarms.LlmProxy.Store do
   @doc """
   Append one credit-ledger entry: %{idempotency_key, budget_identity,
   amount_usd (signed Decimal: + top-up, − debit), kind ("credit"|"debit"),
-  at (DateTime), meta (map)}. MUST enforce idempotency_key uniqueness and
-  return {:error, :duplicate} on replay — that is the double-credit guard.
+  at (DateTime), meta (map)}. MUST enforce idempotency_key uniqueness
+  GLOBALLY (across ALL budget identities, not just within one) and return
+  {:error, :duplicate} on replay — that is the double-credit guard.
+
+  The in-memory mirror's own dedup (a `seen` set per budget_identity) is only
+  PER-IDENTITY, not global — it can't be, since it never sees other
+  identities' entries. A source that (buggily or maliciously) reuses the same
+  `idempotency_key` (e.g. the same `"<method>:<ref>"`) across two DIFFERENT
+  beneficiaries is therefore invisible to the mirror: both would be accepted
+  as "newly marked" there. The store's global-uniqueness constraint is the
+  only thing that catches that case — it's the reason this callback's
+  uniqueness scope is global, not per-identity.
   """
   @callback record_llm_credit_entry(map()) :: :ok | {:error, :duplicate} | {:error, term()}
 

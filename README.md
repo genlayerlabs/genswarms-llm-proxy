@@ -99,8 +99,15 @@ down a per-identity prepaid credit balance instead of blocking outright —
 config:
 
 - `payments_source` — the trusted object name allowed to send
-  `{"action":"payment_confirmed"}`. `nil` (default) keeps the whole feature
-  off; any other sender is logged and ignored.
+  `{"action":"payment_confirmed"}`. `nil`/`""` (default) keeps the whole
+  feature off; any other sender is logged and ignored. `credits_enabled` is
+  derived from this one setting (present and non-empty ⇒ on) and threaded to
+  both sides: the plug-side block gate (`credit_exhausted?/2`) and debit
+  chokepoint (`maybe_debit_credit/4`), and the object-side message handler.
+  With it off, the credit path is a true no-op — the block gate never reads
+  a balance (byte-identical to 0.2.19 blocking) and a straddling call never
+  debits the mirror, so a feature enabled later never retro-charges overage
+  accrued while it was off.
 - `credit_namespace` (default `"default"`) — a confirmation for a different
   namespace is silently ignored (multiple consumers can share one settlement
   hub, each only owns its own namespace).
@@ -111,12 +118,15 @@ config:
   result is appended as an extra line on a `:budget` block notice; absent,
   raising, or non-binary → no hint, never crashes the block path.
 
-`payment_confirmed` is trusted-source **and** namespace gated; `amount_usd`
-must parse as `Decimal` and be `> 0`, and `method`/`ref` are both required —
-the idempotency key is `"<method>:<ref>"`, so a re-delivered confirmation
-credits the balance once. Replies `{"ok":true}` (first credit),
-`{"ok":true,"duplicate":true}` (replay), or `{"ok":true,"degraded":true,...}`
-(store write failed — see Fail policy below); a malformed message replies
+`payment_confirmed` is trusted-source **and** namespace gated; the required
+fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` must
+parse as a *finite* `Decimal` (`"NaN"`/`"Infinity"`/`"-Infinity"` are all
+refused, not just non-numeric strings) and be `> 0`, and `method`/`ref` are
+both required non-empty strings — the idempotency key is `"<method>:<ref>"`,
+so a re-delivered confirmation credits the balance once. Replies
+`{"ok":true}` (first credit), `{"ok":true,"duplicate":true}` (replay), or
+`{"ok":true,"degraded":true,...}` (store write failed — see Fail policy
+below); a malformed message replies
 `{"ok":false,"error":"bad_payment_confirmed"}`.
 
 Durable accounting for credits is two more OPTIONAL `Store` callbacks —
@@ -124,8 +134,12 @@ Durable accounting for credits is two more OPTIONAL `Store` callbacks —
 `record_llm_credit_entry/1` (append one ledger entry: top-up positive,
 debit negative). `record_llm_credit_entry/1` **must** enforce
 `idempotency_key` uniqueness and return `{:error, :duplicate}` on replay —
-that's the double-credit guard. Missing either callback falls back to the
-in-memory mirror, same as the other six `Store` callbacks.
+that's the double-credit guard. The two are **both-callbacks-or-neither**:
+missing EITHER one falls back to the mirror for BOTH read and write (a store
+exporting only `llm_credit_balance/1`, for example, is treated as fully
+absent for the credit path — otherwise a mirror top-up would be shadowed by
+a durable read that never actually recorded anything, and the paying user
+would be told `ok` while the block gate kept reading a stale durable 0).
 
 **Spend order:** the free daily budget spends first; only once it's
 exhausted (`spent >= limit`) does the credit balance start being drawn down,
@@ -136,11 +150,31 @@ call completes, the final credit-funded call can drive the balance slightly
 negative (post-hoc costs); the global daily ceiling still bounds all spend
 regardless of credit balance.
 
+Two concurrency bounds apply here, the same TOCTOU family as the daily
+budget gate (both read a `spent_before`/balance snapshot, act, then write —
+never a single atomic check-and-spend across a request's full duration): **N
+simultaneous credit-funded calls sharing the same budget identity can
+overdraft the balance by up to N × (the largest straddle among them)** — each
+racer reads a balance that hasn't yet reflected the others' debits before it
+commits its own. The mirror twin of this is an **under-debit favoring the
+user by the same bound**: concurrent straddles that share a `spent_before`
+baseline each compute `overflow(spent_before)` against the same
+pre-any-of-them number, so the total debited across all of them can be less
+than the true combined overflow. Neither bound is closed by this feature —
+both are inherited from the same read-then-write shape as the existing daily
+budget check.
+
 **Fail policy:** credit balance reads fail open to the in-memory mirror (an
 accounting outage must not block spend). A store-down top-up still applies
 to the in-memory mirror, logs `Logger.error`, bumps
 `llm_proxy_budget_degraded`, and replies `degraded: true` — reconcile from
-the payment source's own ledger afterwards.
+the payment source's own ledger afterwards. This recovery is NOT sticky: a
+degraded (memory-only) credit stops gating the moment the durable read
+recovers (the store answers again) — the very next balance read prefers the
+durable value, which may be lower (or absent) than what the mirror was
+carrying. Reconcile promptly once you see a `degraded: true` reply or the
+`llm_proxy_budget_degraded` metric, rather than assuming the mirror value
+persists.
 
 `quota_status` gains a `credit.balance_usd` field (2dp string, like the other
 credit-related dollar amounts in this feature — `money2`, not the 6dp `money`
