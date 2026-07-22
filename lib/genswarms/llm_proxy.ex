@@ -407,7 +407,7 @@ defmodule Genswarms.LlmProxy do
 
   def start_state_link(opts \\ []) do
     Agent.start_link(
-      fn -> %{sessions: %{}, usage: %{}, notified: %{}, global: %{}} end,
+      fn -> %{sessions: %{}, usage: %{}, notified: %{}, global: %{}, credits: %{}} end,
       opts
     )
   end
@@ -1674,6 +1674,126 @@ defmodule Genswarms.LlmProxy do
           }
 
       {row, %{state | usage: Map.put(state.usage, key, row)}}
+    end)
+  end
+
+  # ── Credit ledger primitives (Task 1 of the USDC-topups plan) ────────────────
+  #
+  # A payment-agnostic prepaid credit balance per budget_identity, on top of the
+  # existing daily-limit budget: the store (when it exports the two callbacks)
+  # is durable and authoritative; the in-memory `credits` mirror is always kept
+  # in sync and is the fail-open fallback (same availability stance as the rest
+  # of this module's accounting — an accounting outage never blocks the LLM
+  # path). Later tasks (block gate, top-ups, dashboard) build on these.
+
+  @doc """
+  Prepaid credit balance for a budget identity. Durable read when the store
+  exports llm_credit_balance/1 and answers; falls OPEN to the in-memory
+  mirror otherwise (same availability stance as per-conversation budget).
+  Never raises. Returns Decimal (0 when unknown).
+  """
+  def credit_balance(pid \\ @state_name, store_mod, budget_identity) do
+    case durable_credit_balance(store_mod, budget_identity) do
+      %Decimal{} = bal -> bal
+      nil -> mirror_credit_balance(pid, budget_identity)
+    end
+  end
+
+  defp durable_credit_balance(store_mod, budget_identity) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_credit_balance, 1) do
+      case store_mod.llm_credit_balance(budget_identity) do
+        {:ok, %Decimal{} = bal} -> bal
+        _ -> nil
+      end
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp mirror_credit_balance(pid, budget_identity) do
+    Agent.get(pid, fn state ->
+      state
+      |> Map.get(:credits, %{})
+      |> Map.get(budget_identity, %{})
+      |> Map.get(:balance, Decimal.new("0"))
+    end)
+  end
+
+  @doc """
+  Apply one signed credit-ledger entry (top-up or debit) with idempotency.
+  Dedup is two-layer: the mirror seen-set AND the store's `{:error, :duplicate}`
+  contract, so a replayed entry never double-applies whether or not a durable
+  store is configured. Recorded durably when the store exports
+  record_llm_credit_entry/1 and is healthy; the mirror is ALWAYS updated on a
+  non-duplicate apply, including when the store write itself errors (fail open
+  for the user — the upstream payment source holds its own durable record;
+  reconcile host-side; the caller is expected to log/bump a degraded metric on
+  that branch).
+
+  Returns `{:ok, new_mirror_balance}` | `:duplicate` | `{:degraded, new_mirror_balance}`.
+  """
+  def apply_credit_entry(pid \\ @state_name, store_mod, %{idempotency_key: key, budget_identity: bi} = entry) do
+    if mirror_credit_seen?(pid, bi, key) do
+      :duplicate
+    else
+      case durable_record_credit_entry(store_mod, entry) do
+        {:error, :duplicate} ->
+          mirror_mark_credit_seen(pid, bi, key)
+          :duplicate
+
+        :ok ->
+          {:ok, mirror_apply_credit(pid, entry)}
+
+        :no_store ->
+          {:ok, mirror_apply_credit(pid, entry)}
+
+        {:error, _reason} ->
+          {:degraded, mirror_apply_credit(pid, entry)}
+      end
+    end
+  end
+
+  defp durable_record_credit_entry(store_mod, entry) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :record_llm_credit_entry, 1) do
+      store_mod.record_llm_credit_entry(entry)
+    else
+      :no_store
+    end
+  rescue
+    e -> {:error, {:raised, Exception.message(e)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp mirror_credit_seen?(pid, budget_identity, key) do
+    Agent.get(pid, fn state ->
+      state
+      |> Map.get(:credits, %{})
+      |> Map.get(budget_identity, %{})
+      |> Map.get(:seen, MapSet.new())
+      |> MapSet.member?(key)
+    end)
+  end
+
+  defp mirror_mark_credit_seen(pid, budget_identity, key) do
+    Agent.update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+      row = Map.get(credits, budget_identity) || %{balance: Decimal.new("0"), seen: MapSet.new()}
+      row = %{row | seen: MapSet.put(row.seen, key)}
+      Map.put(state, :credits, Map.put(credits, budget_identity, row))
+    end)
+  end
+
+  defp mirror_apply_credit(pid, %{idempotency_key: key, budget_identity: bi, amount_usd: amt}) do
+    Agent.get_and_update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+      row = Map.get(credits, bi) || %{balance: Decimal.new("0"), seen: MapSet.new()}
+      row = %{row | balance: Decimal.add(row.balance, amt), seen: MapSet.put(row.seen, key)}
+      {row.balance, Map.put(state, :credits, Map.put(credits, bi, row))}
     end)
   end
 
