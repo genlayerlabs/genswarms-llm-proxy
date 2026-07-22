@@ -63,7 +63,7 @@ check.("unknown identity balance is 0", Decimal.equal?(Proxy.credit_balance(pid,
 {:ok, b2} = Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:1", "3.00"))
 check.("durable credit lands in store", Decimal.equal?(CreditStore.entries_balance(bi), Decimal.new("3.00")))
 check.("durable credit mirrored", Decimal.equal?(b2, Decimal.new("3.00")))
-check.("durable dedup via store :duplicate",
+check.("repeat call dedups via the mirror seen-set (store's :duplicate branch not required)",
   Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:1", "3.00")) == :duplicate)
 check.("balance read prefers durable",
   Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("3.00")))
@@ -85,6 +85,75 @@ check.("debit entry reduces durable balance", Decimal.equal?(CreditStore.entries
 # Mirror carries the store-down credit (2.00) that never landed durably, so the
 # mirror stays 2.00 ahead of the durable ledger: 5.00 (mirror after step 3) - 1.25 = 3.75.
 check.("debit returns updated mirror balance", Decimal.equal?(b4, Decimal.new("3.75")))
+
+# 5. restart-replay: a FRESH mirror (nothing seen yet) replaying a key the
+# DURABLE store already knows about (e.g. after a process restart) must
+# still dedup — this is the scenario the mirror-seen shortcut in step 2
+# above never actually exercises (that pid had already seen "d:1" itself).
+# Also assert the store is called exactly once: the SECOND replay on the
+# same fresh pid must short-circuit via the mirror's own seen-set (now
+# marked from the first call) without ever calling the store again.
+defmodule KnownKeyStore do
+  def reset, do: :persistent_term.put({__MODULE__, :calls}, 0)
+  def calls, do: :persistent_term.get({__MODULE__, :calls})
+
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("0")}
+
+  def record_llm_credit_entry(%{idempotency_key: _key}) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    {:error, :duplicate}
+  end
+end
+
+KnownKeyStore.reset()
+{:ok, replay_pid} = Proxy.start_state_link()
+replay_entry = entry.("already-known-key", "9.00")
+
+replay_result1 = Proxy.apply_credit_entry(replay_pid, KnownKeyStore, replay_entry)
+check.("restart-replay: fresh mirror + store already knows the key -> :duplicate",
+  replay_result1 == :duplicate)
+check.("restart-replay: mirror balance stays 0 (nothing applied)",
+  Decimal.equal?(Proxy.credit_balance(replay_pid, KnownKeyStore, bi), Decimal.new("0")))
+check.("restart-replay: the store WAS consulted on the first call",
+  KnownKeyStore.calls() == 1)
+
+replay_result2 = Proxy.apply_credit_entry(replay_pid, KnownKeyStore, replay_entry)
+check.("restart-replay: second replay short-circuits via the now-marked mirror seen-set " <>
+         "(no additional store call)",
+  replay_result2 == :duplicate and KnownKeyStore.calls() == 1)
+
+# 6. concurrency: N racers with the SAME idempotency_key must credit the
+# mirror EXACTLY ONCE, even with no durable store at all (nil-store mode is
+# where an unguarded read-then-write race would double-credit — the seen
+# check-and-mark must be one atomic Agent message, not two).
+{:ok, conc_pid} = Proxy.start_state_link()
+conc_entry = entry.("concurrent:1", "7.00")
+racers = 25
+
+conc_results =
+  1..racers
+  |> Enum.map(fn _ -> Task.async(fn -> Proxy.apply_credit_entry(conc_pid, nil, conc_entry) end) end)
+  |> Enum.map(&Task.await(&1, 5_000))
+
+conc_oks = Enum.count(conc_results, &match?({:ok, _}, &1))
+conc_dups = Enum.count(conc_results, &(&1 == :duplicate))
+
+check.("concurrency: exactly one of #{racers} same-key racers applies", conc_oks == 1)
+check.("concurrency: every other racer dedups", conc_dups == racers - 1)
+check.("concurrency: mirror credited exactly once — no double-credit",
+  Decimal.equal?(Proxy.credit_balance(conc_pid, nil, bi), Decimal.new("7.00")))
+
+# 7. credit_balance/3 falls open to the mirror when the store's read RAISES
+# (not just when it returns {:error, _}) — never raises to the caller.
+defmodule RaisingBalanceStore do
+  def llm_credit_balance(_bi), do: raise("boom")
+end
+
+{:ok, raising_pid} = Proxy.start_state_link()
+{:ok, _} = Proxy.apply_credit_entry(raising_pid, nil, entry.("raise:1", "4.00"))
+
+check.("credit_balance/3 falls open to the mirror when the store raises (no crash)",
+  Decimal.equal?(Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi), Decimal.new("4.00")))
 
 failed = Agent.get(failures, & &1)
 IO.puts("")

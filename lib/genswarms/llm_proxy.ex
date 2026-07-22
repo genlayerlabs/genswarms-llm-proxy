@@ -1724,35 +1724,41 @@ defmodule Genswarms.LlmProxy do
 
   @doc """
   Apply one signed credit-ledger entry (top-up or debit) with idempotency.
-  Dedup is two-layer: the mirror seen-set AND the store's `{:error, :duplicate}`
-  contract, so a replayed entry never double-applies whether or not a durable
-  store is configured. Recorded durably when the store exports
-  record_llm_credit_entry/1 and is healthy; the mirror is ALWAYS updated on a
-  non-duplicate apply, including when the store write itself errors (fail open
-  for the user — the upstream payment source holds its own durable record;
-  reconcile host-side; the caller is expected to log/bump a degraded metric on
-  that branch).
+  Dedup is two-layer and race-safe: the mirror seen-check-and-mark is a
+  SINGLE atomic `Agent.get_and_update` (not a separate read then write), so
+  N concurrent callers with the same `idempotency_key` can never all observe
+  "not seen" — exactly one wins the mark and proceeds to the durable write;
+  every other racer (and every later replay) gets `:duplicate` without
+  touching the balance. The store's own `{:error, :duplicate}` contract is
+  the second layer, for the case where the mirror was reset (restart) but
+  the durable ledger already has the key. Recorded durably when the store
+  exports record_llm_credit_entry/1 and is healthy; the mirror balance is
+  applied exactly once for every non-duplicate outcome, including when the
+  store write itself errors (fail open for the user — the upstream payment
+  source holds its own durable record; reconcile host-side; the caller is
+  expected to log/bump a degraded metric on that branch).
 
   Returns `{:ok, new_mirror_balance}` | `:duplicate` | `{:degraded, new_mirror_balance}`.
   """
   def apply_credit_entry(pid \\ @state_name, store_mod, %{idempotency_key: key, budget_identity: bi} = entry) do
-    if mirror_credit_seen?(pid, bi, key) do
-      :duplicate
-    else
-      case durable_record_credit_entry(store_mod, entry) do
-        {:error, :duplicate} ->
-          mirror_mark_credit_seen(pid, bi, key)
-          :duplicate
+    case mirror_mark_credit_seen(pid, bi, key) do
+      :already_seen ->
+        :duplicate
 
-        :ok ->
-          {:ok, mirror_apply_credit(pid, entry)}
+      :newly_marked ->
+        case durable_record_credit_entry(store_mod, entry) do
+          {:error, :duplicate} ->
+            :duplicate
 
-        :no_store ->
-          {:ok, mirror_apply_credit(pid, entry)}
+          :ok ->
+            {:ok, mirror_apply_credit(pid, entry)}
 
-        {:error, _reason} ->
-          {:degraded, mirror_apply_credit(pid, entry)}
-      end
+          :no_store ->
+            {:ok, mirror_apply_credit(pid, entry)}
+
+          {:error, _reason} ->
+            {:degraded, mirror_apply_credit(pid, entry)}
+        end
     end
   end
 
@@ -1769,30 +1775,34 @@ defmodule Genswarms.LlmProxy do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp mirror_credit_seen?(pid, budget_identity, key) do
-    Agent.get(pid, fn state ->
-      state
-      |> Map.get(:credits, %{})
-      |> Map.get(budget_identity, %{})
-      |> Map.get(:seen, MapSet.new())
-      |> MapSet.member?(key)
-    end)
-  end
-
+  # Atomic seen-check-and-mark: a single Agent message so the check and the
+  # mark can never be split by a concurrent racer (the bug a nil-store /
+  # store-round-trip race could otherwise hit — two callers both seeing
+  # "not seen" and both crediting the mirror). Returns :already_seen (mirror
+  # untouched) or :newly_marked (key now in the seen-set; caller owns this
+  # entry and must apply the balance itself via mirror_apply_credit/2).
   defp mirror_mark_credit_seen(pid, budget_identity, key) do
-    Agent.update(pid, fn state ->
+    Agent.get_and_update(pid, fn state ->
       credits = Map.get(state, :credits, %{})
       row = Map.get(credits, budget_identity) || %{balance: Decimal.new("0"), seen: MapSet.new()}
-      row = %{row | seen: MapSet.put(row.seen, key)}
-      Map.put(state, :credits, Map.put(credits, budget_identity, row))
+
+      if MapSet.member?(row.seen, key) do
+        {:already_seen, state}
+      else
+        row = %{row | seen: MapSet.put(row.seen, key)}
+        {:newly_marked, Map.put(state, :credits, Map.put(credits, budget_identity, row))}
+      end
     end)
   end
 
-  defp mirror_apply_credit(pid, %{idempotency_key: key, budget_identity: bi, amount_usd: amt}) do
+  # Balance-only mirror apply. The seen-set mark already happened atomically
+  # in mirror_mark_credit_seen/3 before the durable write was attempted, so
+  # this only ever runs for the single caller that won that mark.
+  defp mirror_apply_credit(pid, %{budget_identity: bi, amount_usd: amt}) do
     Agent.get_and_update(pid, fn state ->
       credits = Map.get(state, :credits, %{})
       row = Map.get(credits, bi) || %{balance: Decimal.new("0"), seen: MapSet.new()}
-      row = %{row | balance: Decimal.add(row.balance, amt), seen: MapSet.put(row.seen, key)}
+      row = %{row | balance: Decimal.add(row.balance, amt)}
       {row.balance, Map.put(state, :credits, Map.put(credits, bi, row))}
     end)
   end
