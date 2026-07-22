@@ -2467,7 +2467,7 @@ defmodule Genswarms.LlmProxy.Plug do
             streaming?(body) and Map.get(opts, :allow_streaming, false)
           )
 
-        exhausted?(budget) ->
+        exhausted?(budget) and credit_exhausted?(opts, session) ->
           # Only render an SSE budget body when streaming was REQUESTED *and* the gate is
           # on; otherwise the buffered JSON body (byte-identical to before).
           budget_exhausted_response(
@@ -2617,7 +2617,7 @@ defmodule Genswarms.LlmProxy.Plug do
             }
           })
 
-        exhausted?(budget) ->
+        exhausted?(budget) and credit_exhausted?(opts, session) ->
           bump_metric(opts, "llm_proxy_compact_block")
 
           json(conn, 429, %{
@@ -2643,7 +2643,13 @@ defmodule Genswarms.LlmProxy.Plug do
           # must burn quota. model "compact" keeps it distinguishable in the
           # ledger; failures record as "compact_error" (visible, quota-free —
           # same treatment as chat upstream errors).
-          record_budget_call(opts, session, request_ctx, compact_record(status, resp, budget, opts))
+          record_budget_call(
+            opts,
+            session,
+            request_ctx,
+            compact_record(status, resp, budget, opts),
+            budget.spent_usd
+          )
 
           json(conn, status, resp)
       end
@@ -3133,22 +3139,28 @@ defmodule Genswarms.LlmProxy.Plug do
       {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, spent)
       {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
-      record_budget_call(opts, session, request_ctx, %{
-        request_id: request_id(),
-        model: model,
-        status: "empty_retry",
-        prompt_tokens: usage["prompt_tokens"],
-        completion_tokens: usage["completion_tokens"],
-        total_tokens: usage["total_tokens"],
-        cached_tokens: cached_tokens,
-        non_cached_tokens: non_cached_tokens,
-        cost_usd: cost,
-        provider_cost_usd: provider_cost_usd(upstream_router),
-        provider_cost_state: provider_cost_state(upstream_router),
-        charge_basis: charge_basis(opts, upstream_router),
-        pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
-        provider: Map.get(upstream_router, "provider")
-      })
+      record_budget_call(
+        opts,
+        session,
+        request_ctx,
+        %{
+          request_id: request_id(),
+          model: model,
+          status: "empty_retry",
+          prompt_tokens: usage["prompt_tokens"],
+          completion_tokens: usage["completion_tokens"],
+          total_tokens: usage["total_tokens"],
+          cached_tokens: cached_tokens,
+          non_cached_tokens: non_cached_tokens,
+          cost_usd: cost,
+          provider_cost_usd: provider_cost_usd(upstream_router),
+          provider_cost_state: provider_cost_state(upstream_router),
+          charge_basis: charge_basis(opts, upstream_router),
+          pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
+          provider: Map.get(upstream_router, "provider")
+        },
+        spent
+      )
 
       Decimal.add(spent, cost)
     end)
@@ -3392,6 +3404,17 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp exhausted?(%{spent_usd: spent, limit_usd: limit}) do
     Decimal.compare(spent || Decimal.new("0"), limit || Proxy.default_daily_limit()) != :lt
+  end
+
+  # Credits only matter once the free daily budget is spent: the gate is
+  # exhausted?(budget) AND credit_exhausted?. Reading the balance only on the
+  # already-exhausted path keeps the hot path store-call-free and makes the
+  # no-credits configuration byte-identical to 0.2.19 (balance 0 → true).
+  @doc false
+  # Public for the credit-spend check: composes with exhausted?/1 in the two cond gates.
+  def credit_exhausted?(opts, session) do
+    balance = Proxy.credit_balance(opts.state_pid, opts.store_mod, session.budget_identity)
+    Decimal.compare(balance, Decimal.new("0")) != :gt
   end
 
   defp request_quota_exhausted?(opts, budget) do
@@ -3763,7 +3786,10 @@ defmodule Genswarms.LlmProxy.Plug do
     "⏳ This chat reached today's daily LLM request limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
   end
 
-  defp record_budget_call(opts, session, request_ctx, record) do
+  @doc false
+  # Public for the credit-spend check: the straddle-debit chokepoint every
+  # spend-recording call site funnels through.
+  def record_budget_call(opts, session, request_ctx, record, spent_before \\ nil) do
     store_row =
       try do
         record_llm_call(
@@ -3802,7 +3828,38 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     Proxy.record_usage(opts.state_pid, session, request_ctx.day, request_ctx.session_id, record)
+    maybe_debit_credit(opts, session, record, spent_before)
     store_row
+  end
+
+  # Straddle math: only the portion of this call's cost ABOVE the daily limit is
+  # credit-funded. overflow(spent) = max(0, spent - limit);
+  # debit = overflow(spent_before + cost) - overflow(spent_before).
+  defp maybe_debit_credit(_opts, _session, _record, nil), do: :ok
+
+  defp maybe_debit_credit(opts, session, record, %Decimal{} = spent_before) do
+    with %Decimal{} = cost <- Map.get(record, :cost_usd),
+         request_id when is_binary(request_id) <- Map.get(record, :request_id) do
+      limit = session.daily_limit_usd || opts.default_daily_limit
+      zero = Decimal.new("0")
+      overflow = fn spent -> Decimal.max(zero, Decimal.sub(spent, limit)) end
+      debit = Decimal.sub(overflow.(Decimal.add(spent_before, cost)), overflow.(spent_before))
+
+      if Decimal.compare(debit, zero) == :gt do
+        Proxy.apply_credit_entry(opts.state_pid, opts.store_mod, %{
+          idempotency_key: "debit:" <> request_id,
+          budget_identity: session.budget_identity,
+          amount_usd: Decimal.negate(debit),
+          kind: "debit",
+          at: DateTime.utc_now(),
+          meta: %{"request_id" => request_id}
+        })
+      end
+
+      :ok
+    else
+      _ -> :ok
+    end
   end
 
   defp record_llm_call(store_mod, budget_identity, day, session_id, record, default_limit) do
@@ -3843,7 +3900,7 @@ defmodule Genswarms.LlmProxy.Plug do
       provider: Map.get(upstream_router, "provider")
     }
 
-    record_budget_call(opts, session, request_ctx, record)
+    record_budget_call(opts, session, request_ctx, record, budget.spent_usd)
 
     json(
       conn,
@@ -3922,7 +3979,7 @@ defmodule Genswarms.LlmProxy.Plug do
         {base_record, %{}, nil}
       end
 
-    record_budget_call(opts, session, request_ctx, record)
+    record_budget_call(opts, session, request_ctx, record, budget.spent_usd)
 
     json(conn, status, %{
       error: %{
@@ -4571,22 +4628,28 @@ defmodule Genswarms.LlmProxy.Plug do
   defp record_stream(s, model, usage, cost, router) do
     {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, router)
 
-    record_budget_call(s.opts, s.session, s.request_ctx, %{
-      request_id: request_id(),
-      model: model,
-      status: "ok",
-      prompt_tokens: usage["prompt_tokens"],
-      completion_tokens: usage["completion_tokens"],
-      total_tokens: usage["total_tokens"],
-      cached_tokens: cached_tokens,
-      non_cached_tokens: non_cached_tokens,
-      cost_usd: cost,
-      provider_cost_usd: provider_cost_usd(router),
-      provider_cost_state: provider_cost_state(router),
-      charge_basis: charge_basis(s.opts, router),
-      pricing_version: Map.get(s.opts, :pricing_version, "cost_plus_v1"),
-      provider: Map.get(router, "provider")
-    })
+    record_budget_call(
+      s.opts,
+      s.session,
+      s.request_ctx,
+      %{
+        request_id: request_id(),
+        model: model,
+        status: "ok",
+        prompt_tokens: usage["prompt_tokens"],
+        completion_tokens: usage["completion_tokens"],
+        total_tokens: usage["total_tokens"],
+        cached_tokens: cached_tokens,
+        non_cached_tokens: non_cached_tokens,
+        cost_usd: cost,
+        provider_cost_usd: provider_cost_usd(router),
+        provider_cost_state: provider_cost_state(router),
+        charge_basis: charge_basis(s.opts, router),
+        pricing_version: Map.get(s.opts, :pricing_version, "cost_plus_v1"),
+        provider: Map.get(router, "provider")
+      },
+      s.budget.spent_usd
+    )
   end
 
   # True iff the bounded acc tail contains the SSE terminator as a whole frame — a trimmed
