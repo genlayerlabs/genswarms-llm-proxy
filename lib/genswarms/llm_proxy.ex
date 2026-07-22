@@ -455,9 +455,16 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
+  # Decimal.parse/1 also accepts "NaN"/"Infinity"/"-Infinity" (represented with
+  # a non-integer :NaN/:inf coefficient) — a payment amount must be a finite
+  # number: NaN would RAISE at the Decimal.compare/2 >0 guard downstream (an
+  # upstream hub retrying a permanently-malformed payload forever), and
+  # Infinity would pass the >0 guard and mint an infinite balance. Reject both
+  # here so they fall to the same bad_payment_confirmed reply as any other
+  # malformed amount.
   defp parse_money(v) when is_binary(v) do
     case Decimal.parse(v) do
-      {%Decimal{} = d, ""} -> {:ok, d}
+      {%Decimal{coef: coef} = d, ""} when is_integer(coef) -> {:ok, d}
       _ -> :error
     end
   end

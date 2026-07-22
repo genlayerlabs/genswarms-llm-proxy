@@ -177,6 +177,81 @@ check.(
     Jason.decode!(json9a)["duplicate"] != true and Jason.decode!(json9b)["duplicate"] != true
 )
 
+# 13. CRITICAL (A1): non-finite amounts must be refused, not raise and not mint
+# an infinite balance. Decimal.parse/1 happily parses "NaN"/"Infinity"/
+# "-Infinity" — parse_money/1 must reject all three BEFORE the >0 guard
+# (which would otherwise raise on NaN via Decimal.compare/2).
+for {label, ref, bad_amount} <- [
+      {"NaN", "0xT:nan", "NaN"},
+      {"Infinity", "0xT:inf", "Infinity"},
+      {"-Infinity", "0xT:neginf", "-Infinity"}
+    ] do
+  {result, json} =
+    try do
+      {:reply, json, _} =
+        Proxy.handle_message(
+          "payments",
+          msg.(%{"ref" => ref, "amount_usd" => bad_amount}),
+          state
+        )
+
+      {:ok, json}
+    rescue
+      e -> {:raised, Exception.message(e)}
+    end
+
+  check.(
+    "non-finite amount #{label} does not raise",
+    result == :ok
+  )
+
+  check.(
+    "non-finite amount #{label} refused (ok: false), no crash",
+    result == :ok and Jason.decode!(json)["ok"] == false
+  )
+end
+
+check.(
+  "non-finite amounts never touched the balance",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
+# 14. (A2, deferred #4) degraded-path check THROUGH handle_message: a store
+# whose record_llm_credit_entry/1 errors (e.g. db_down) but whose
+# llm_credit_balance/1 works — the store exports BOTH callbacks (half-pair
+# would otherwise be treated as absent per B1's both-callbacks-or-neither
+# rule) — must still reply ok:true, degraded:true, with the balance credited
+# to the in-memory mirror.
+defmodule DegradedTopupStore do
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("0")}
+  def record_llm_credit_entry(_entry), do: {:error, :db_down}
+end
+
+state_degraded = %{state | store_mod: DegradedTopupStore, quota: %{store_mod: DegradedTopupStore}}
+bi_degraded = "w:degraded|k:dm|c:tg:1:0"
+
+{:reply, json_degraded, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:degraded", "beneficiary" => bi_degraded}),
+    state_degraded
+  )
+
+reply_degraded = Jason.decode!(json_degraded)
+
+check.(
+  "degraded top-up: ok:true, degraded:true through handle_message",
+  reply_degraded["ok"] == true and reply_degraded["degraded"] == true
+)
+
+check.(
+  "degraded top-up: mirror balance credited despite durable write failure",
+  Decimal.equal?(
+    Proxy.credit_balance(pid, nil, bi_degraded),
+    Decimal.new("5.00")
+  )
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 
