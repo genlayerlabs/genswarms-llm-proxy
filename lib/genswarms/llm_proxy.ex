@@ -313,7 +313,13 @@ defmodule Genswarms.LlmProxy do
          notice_repeat_ms: plug_opts.notice_repeat_ms,
          clock: Map.get(config, :clock, fn -> DateTime.utc_now() end),
          dm_module: module_ref(Map.get(config, :dm_module))
-       }
+       },
+       # Payment-agnostic credit top-up (see handle_payment_confirmed/3):
+       # payments_source nil/"" keeps the feature OFF; the object that IS the
+       # payments_source is the only trusted sender of {"action":"payment_confirmed"}.
+       payments_source: Map.get(config, :payments_source),
+       credit_namespace: Map.get(config, :credit_namespace, "default"),
+       credit_per_usd: decimal(Map.get(config, :credit_per_usd, "1.0"))
      }}
   end
 
@@ -332,7 +338,7 @@ defmodule Genswarms.LlmProxy do
     }
   end
 
-  def handle_message(_from, content, state) do
+  def handle_message(from, content, state) do
     case Jason.decode(content) do
       {:ok, %{"action" => "usage"}} ->
         {:reply, Jason.encode!(%{usage: usage_totals(state.state_pid)}), state}
@@ -344,9 +350,117 @@ defmodule Genswarms.LlmProxy do
       {:ok, %{"action" => "quota_status"} = msg} ->
         {:reply, Jason.encode!(quota_status(msg, state)), state}
 
+      {:ok, %{"action" => "payment_confirmed"} = msg} ->
+        handle_payment_confirmed(from, msg, state)
+
       _ ->
         {:noreply, state}
     end
+  end
+
+  # Payment-agnostic credit top-up. Trust = the configured payments_source
+  # object name; confirmations for a foreign namespace are IGNORED per the
+  # settlement-hub contract (multiple consumers share one hub, each only
+  # cares about its own namespace — a foreign one is neither an error nor
+  # ours to warn about). Idempotency key "<method>:<ref>" — a re-delivered
+  # confirmation credits once (see Proxy.apply_credit_entry/3, Task 1).
+  defp handle_payment_confirmed(from, msg, state) do
+    source = Map.get(state, :payments_source)
+    namespace = Map.get(state, :credit_namespace, "default")
+
+    cond do
+      is_nil(source) or source == "" ->
+        {:noreply, state}
+
+      to_string(from) != to_string(source) ->
+        Logger.warning(
+          "llm_proxy: payment_confirmed from untrusted source #{inspect(from)} — ignored"
+        )
+
+        {:noreply, state}
+
+      Map.get(msg, "namespace") != namespace ->
+        {:noreply, state}
+
+      true ->
+        credit_payment(msg, state)
+    end
+  end
+
+  defp credit_payment(msg, state) do
+    with {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
+         beneficiary when is_binary(beneficiary) and beneficiary != "" <-
+           Map.get(msg, "beneficiary") do
+      per_usd = decimal(Map.get(state, :credit_per_usd, Decimal.new("1.0")))
+      credited = Decimal.mult(amount, per_usd)
+      key = "#{Map.get(msg, "method", "?")}:#{Map.get(msg, "ref", "?")}"
+
+      entry = %{
+        idempotency_key: key,
+        budget_identity: beneficiary,
+        amount_usd: credited,
+        kind: "credit",
+        at: DateTime.utc_now(),
+        meta: %{"method" => Map.get(msg, "method"), "ref" => Map.get(msg, "ref")}
+      }
+
+      state_pid = Map.get(state, :state_pid, @state_name)
+      # Tolerate both host state shapes (see quota_status/2): a top-level
+      # :store_mod (test/mm lineage) or one nested under :quota (production
+      # init/1 assembly, wingston lineage).
+      store_mod = Map.get(state, :store_mod) || get_in(state, [:quota, :store_mod])
+
+      case apply_credit_entry(state_pid, store_mod, entry) do
+        :duplicate ->
+          {:reply, Jason.encode!(%{ok: true, duplicate: true}), state}
+
+        {:ok, balance} ->
+          {:reply,
+           Jason.encode!(%{ok: true, credited_usd: money2(credited), balance_usd: money2(balance)}),
+           state}
+
+        {:degraded, balance} ->
+          Logger.error(
+            "llm_proxy: credit entry store write FAILED — credit applied to memory only " <>
+              "(reconcile from the payment source's ledger); key=#{key}"
+          )
+
+          bump_credit_degraded_metric(store_mod)
+
+          {:reply,
+           Jason.encode!(%{
+             ok: true,
+             degraded: true,
+             credited_usd: money2(credited),
+             balance_usd: money2(balance)
+           }), state}
+      end
+    else
+      _ ->
+        {:reply, Jason.encode!(%{ok: false, error: "bad_payment_confirmed"}), state}
+    end
+  end
+
+  defp parse_money(v) when is_binary(v) do
+    case Decimal.parse(v) do
+      {%Decimal{} = d, ""} -> {:ok, d}
+      _ -> :error
+    end
+  end
+
+  defp parse_money(_), do: :error
+
+  defp bump_credit_degraded_metric(store_mod) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :bump_metric, 3) do
+      store_mod.bump_metric("llm_proxy_budget_degraded", %{context: "payment_confirmed"}, 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   # Config (atom or string, e.g. from JSON IR) → the pricing-mode atom.
