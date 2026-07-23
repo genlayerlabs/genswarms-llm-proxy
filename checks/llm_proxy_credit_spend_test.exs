@@ -355,6 +355,108 @@ check.(
   ProxyPlug.credit_exhausted?(opts, session.("bi-g-on", d.("0.50"))) == false
 )
 
+# ── H. Gate/debit limit unification (X2): the debit chokepoint must use the SAME
+# limit_usd the exhausted?/1 gate saw (budget.limit_usd, possibly store-row-pinned
+# and different from session.daily_limit_usd/opts.default_daily_limit), not
+# re-derive its own from session/opts. record_budget_call/5's 5th arg is now the
+# full budget map the gate consulted (%{spent_usd:, limit_usd:}), not a bare
+# spent_before Decimal — every lib call site was updated to match (still accepts a
+# bare Decimal/nil/integer for legacy/direct callers, see G2/C1-C5 above and I below,
+# falling back to session/opts only when the budget map carries no limit_usd).
+#
+# H1: store pins limit_usd HIGHER than the session's own limit (1.00 vs 0.50). A
+# call landing entirely inside the pinned $1 free band must NOT debit credits —
+# the old bug (re-deriving 0.50 from session) would wrongly treat 0.60-0.80 as
+# overflow and double-charge (free daily row AND a credit debit for the same spend).
+credit!.("bi-h1", "h1:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h1", d.("0.50")),
+  req_ctx,
+  record.("req-h1", d.("0.20")),
+  %{spent_usd: d.("0.60"), limit_usd: d.("1.00")}
+)
+
+check.(
+  "H1: pinned-higher limit (1.00) -> spent_before 0.60 + cost 0.20 stays inside " <>
+    "the pinned-free band -> NO debit (no double-charge)",
+  eq.(balance.("bi-h1"), d.("5.00"))
+)
+
+# H2: store pins limit_usd LOWER than the session's own limit (0.30 vs 0.50). The
+# gate already blocks/credit-funds from the pinned $0.30 boundary, so the debit
+# must start there too — the old bug (re-deriving 0.50 from session) would treat
+# 0.30-0.50 as still-free and never debit it (free spend the operator eats).
+credit!.("bi-h2", "h2:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h2", d.("0.50")),
+  req_ctx,
+  record.("req-h2", d.("0.20")),
+  %{spent_usd: d.("0.30"), limit_usd: d.("0.30")}
+)
+
+check.(
+  "H2: pinned-lower limit (0.30) -> spent_before 0.30 (at the pinned boundary) + " <>
+    "cost 0.20 -> debits the full 0.20 from the pinned boundary (not free spend)",
+  eq.(balance.("bi-h2"), d.("4.80"))
+)
+
+# ── I. Legacy/non-Decimal spent_before tolerated (X3): a store returning an
+# integer spent_usd (legal on 0.2.19) must not crash maybe_debit_credit — it is
+# coerced via the module's decimal/1, same as everywhere else in this file, and
+# still debits/no-debits correctly.
+credit!.("bi-i1", "i1:seed", "5.00")
+
+result_i1 =
+  try do
+    ProxyPlug.record_budget_call(
+      opts,
+      session.("bi-i1", d.("0.50")),
+      req_ctx,
+      record.("req-i1", d.("0.20")),
+      0
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("I1: integer spent_before (0) does not crash record_budget_call", result_i1 == :ok)
+
+check.(
+  "I1: integer spent_before (0) + cost 0.20 stays under the 0.50 limit -> NO debit",
+  eq.(balance.("bi-i1"), d.("5.00"))
+)
+
+credit!.("bi-i2", "i2:seed", "5.00")
+
+result_i2 =
+  try do
+    ProxyPlug.record_budget_call(
+      opts,
+      session.("bi-i2", d.("0.50")),
+      req_ctx,
+      record.("req-i2", d.("0.20")),
+      1
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("I2: integer spent_before (1) does not crash record_budget_call", result_i2 == :ok)
+
+check.(
+  "I2: integer spent_before (1, already over the 0.50 limit) + cost 0.20 -> fully " <>
+    "credit-funded debit",
+  eq.(balance.("bi-i2"), d.("4.80"))
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

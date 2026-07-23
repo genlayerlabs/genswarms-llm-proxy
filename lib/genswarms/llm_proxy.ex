@@ -2567,17 +2567,17 @@ defmodule Genswarms.LlmProxy.Plug do
 
             # Discarded blank attempts consumed real tokens: record them (status
             # "empty_retry") and advance the spend BEFORE pricing the final answer.
-            spent_after_discards =
+            # (X2) Thread the full budget map (not just spent_usd) through the fold
+            # so every discarded-attempt debit uses the SAME limit_usd the gate saw.
+            budget =
               record_discarded_attempts(
                 opts,
                 session,
                 request_ctx,
                 conn.body_params,
-                budget.spent_usd || Decimal.new("0"),
+                Map.put(budget, :spent_usd, budget.spent_usd || Decimal.new("0")),
                 discarded_attempts
               )
-
-            budget = Map.put(budget, :spent_usd, spent_after_discards)
 
             respond_upstream(
               conn,
@@ -2700,12 +2700,14 @@ defmodule Genswarms.LlmProxy.Plug do
           # must burn quota. model "compact" keeps it distinguishable in the
           # ledger; failures record as "compact_error" (visible, quota-free —
           # same treatment as chat upstream errors).
+          # (X2) Pass the full `budget` map (not just spent_usd) so the debit
+          # chokepoint sees the SAME limit_usd this cond's exhausted?/1 gate did.
           record_budget_call(
             opts,
             session,
             request_ctx,
             compact_record(status, resp, budget, opts),
-            budget.spent_usd
+            budget
           )
 
           json(conn, status, resp)
@@ -3170,7 +3172,9 @@ defmodule Genswarms.LlmProxy.Plug do
 
   # Ported with the empty-retry feature from micro-markets: every discarded
   # blank attempt is a REAL upstream call — bill it (status "empty_retry").
-  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, spent, []), do: spent
+  # (X2) `budget` is the full map (spent_usd + limit_usd), threaded through so
+  # every discarded-attempt debit sees the same limit_usd the gate saw.
+  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
   # Hostile/garbage upstream token counts ("many", lists, maps) normalize to 0
   # BEFORE any consumer — cost, x_router, and the durable record all see ints
   # (mm hardening; a poisoned count must never crash a host store).
@@ -3188,12 +3192,12 @@ defmodule Genswarms.LlmProxy.Plug do
   defp nonneg_int(v) when is_integer(v) and v >= 0, do: v
   defp nonneg_int(_), do: 0
 
-  defp record_discarded_attempts(opts, session, request_ctx, request, spent_before, discarded) do
-    Enum.reduce(discarded, spent_before, fn %{body: body}, spent ->
+  defp record_discarded_attempts(opts, session, request_ctx, request, budget, discarded) do
+    Enum.reduce(discarded, budget, fn %{body: body}, budget_acc ->
       usage = normalize_usage_counts(Map.get(body, "usage") || %{})
       upstream_router = upstream_router(Map.get(body, "x_router"))
       model = served_model(upstream_router, body, request)
-      {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, spent)
+      {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, budget_acc.spent_usd)
       {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
       record_budget_call(
@@ -3216,10 +3220,10 @@ defmodule Genswarms.LlmProxy.Plug do
           pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
           provider: Map.get(upstream_router, "provider")
         },
-        spent
+        budget_acc
       )
 
-      Decimal.add(spent, cost)
+      Map.put(budget_acc, :spent_usd, Decimal.add(budget_acc.spent_usd, cost))
     end)
   end
 
@@ -3937,20 +3941,49 @@ defmodule Genswarms.LlmProxy.Plug do
   # accrue a negative mirror balance (which would retro-charge pre-feature
   # overage the moment payments are enabled later) — no-op entirely when off,
   # before touching the credit store at all.
+  #
+  # (X2) The 5th arg (formerly a bare `spent_before` Decimal) is now whatever the
+  # call site has: nil (no debit), the legacy bare spent_before (a Decimal or —
+  # X3 — an integer, for direct/legacy callers that never carried a limit
+  # alongside it), or the full `budget` map the exhausted?/1 gate itself
+  # consulted (%{spent_usd:, limit_usd:}). normalize_debit_budget/1 collapses
+  # all three into one shape so do_maybe_debit_credit/4 always has a
+  # `limit_usd` to prefer — the gate and the debit MUST agree on the same
+  # limit (a store-row-pinned budget.limit_usd that differs from
+  # session.daily_limit_usd otherwise double- or under-charges the straddle
+  # band the gate actually used).
   defp maybe_debit_credit(_opts, _session, _record, nil), do: :ok
 
-  defp maybe_debit_credit(opts, session, record, %Decimal{} = spent_before) do
+  defp maybe_debit_credit(opts, session, record, budget) do
     if Map.get(opts, :credits_enabled, false) do
-      do_maybe_debit_credit(opts, session, record, spent_before)
+      do_maybe_debit_credit(opts, session, record, normalize_debit_budget(budget))
     else
       :ok
     end
   end
 
-  defp do_maybe_debit_credit(opts, session, record, %Decimal{} = spent_before) do
+  # Legacy bare spent_before (Decimal or — X3 — integer): no limit info travels
+  # with it, so do_maybe_debit_credit/4 falls back to session/opts exactly as
+  # before. Proxy.decimal/1 coerces the integer case (a store returning an
+  # integer spent_usd is legal per 0.2.19 and must not crash here).
+  defp normalize_debit_budget(%Decimal{} = spent_before),
+    do: %{spent_usd: spent_before, limit_usd: nil}
+
+  defp normalize_debit_budget(spent_before) when is_integer(spent_before),
+    do: %{spent_usd: Proxy.decimal(spent_before), limit_usd: nil}
+
+  # The real budget map (from budget_status/fallback_budget_status): carry its
+  # limit_usd through so the debit uses the SAME limit the gate saw. spent_usd
+  # is still coerced (X3) in case a legacy store's budget row carries an
+  # integer there too.
+  defp normalize_debit_budget(%{} = budget) do
+    %{spent_usd: Proxy.decimal(Map.get(budget, :spent_usd)), limit_usd: Map.get(budget, :limit_usd)}
+  end
+
+  defp do_maybe_debit_credit(opts, session, record, %{spent_usd: spent_before, limit_usd: gate_limit}) do
     with %Decimal{} = cost <- Map.get(record, :cost_usd),
          request_id when is_binary(request_id) <- Map.get(record, :request_id) do
-      limit = session.daily_limit_usd || opts.default_daily_limit
+      limit = gate_limit || session.daily_limit_usd || opts.default_daily_limit
       zero = Decimal.new("0")
       overflow = fn spent -> Decimal.max(zero, Decimal.sub(spent, limit)) end
       debit = Decimal.sub(overflow.(Decimal.add(spent_before, cost)), overflow.(spent_before))
@@ -4010,7 +4043,9 @@ defmodule Genswarms.LlmProxy.Plug do
       provider: Map.get(upstream_router, "provider")
     }
 
-    record_budget_call(opts, session, request_ctx, record, budget.spent_usd)
+    # (X2) Pass the full `budget` map so the debit sees the same limit_usd the
+    # cond's exhausted?/1 gate did (not a re-derived session/opts limit).
+    record_budget_call(opts, session, request_ctx, record, budget)
 
     json(
       conn,
@@ -4089,7 +4124,8 @@ defmodule Genswarms.LlmProxy.Plug do
         {base_record, %{}, nil}
       end
 
-    record_budget_call(opts, session, request_ctx, record, budget.spent_usd)
+    # (X2) Same limit_usd the gate saw, not a re-derived session/opts one.
+    record_budget_call(opts, session, request_ctx, record, budget)
 
     json(conn, status, %{
       error: %{
@@ -4684,12 +4720,20 @@ defmodule Genswarms.LlmProxy.Plug do
         bump_metric(s.opts, "llm_proxy_stream_status_mismatch")
         Logger.error(sanitize_log("llm_proxy: streamed upstream returned status #{status}"))
 
-        record_budget_call(s.opts, s.session, s.request_ctx, %{
-          request_id: request_id(),
-          model: model,
-          status: "upstream_#{status}",
-          provider: Map.get(router, "provider")
-        })
+        # (X2) Consistent with every other call site: pass the full budget map
+        # (this record carries no cost_usd, so maybe_debit_credit no-ops anyway).
+        record_budget_call(
+          s.opts,
+          s.session,
+          s.request_ctx,
+          %{
+            request_id: request_id(),
+            model: model,
+            status: "upstream_#{status}",
+            provider: Map.get(router, "provider")
+          },
+          s.budget
+        )
 
       mode == :done ->
         bump_metric(s.opts, "llm_proxy_stream_disconnected")
@@ -4758,7 +4802,7 @@ defmodule Genswarms.LlmProxy.Plug do
         pricing_version: Map.get(s.opts, :pricing_version, "cost_plus_v1"),
         provider: Map.get(router, "provider")
       },
-      s.budget.spent_usd
+      s.budget
     )
   end
 
