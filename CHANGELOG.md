@@ -2,6 +2,31 @@
 
 ## 0.3.0 — unreleased
 
+- Fixed (review I1): a credit DEBIT whose durable write fails during a store
+  outage is no longer lost silently — the request stays served (budget-side
+  accounting fails open by design), but the proxy now logs a warning, bumps
+  `llm_proxy_budget_degraded`, and applies the debit to the in-memory mirror
+  so the fail-open balance stays the conservative lower figure until the
+  store heals (balance reads are durable-first, so the healed ledger shadows
+  the mirror — no double-count; the durable-side outage under-charge is a
+  documented rider in the README fail policy).
+- Fixed (review I2): a nonconforming store budget row with `limit_usd: nil`
+  no longer makes the gate and the debit disagree — `normalize_debit_budget/1`
+  now falls back to the exact same module default the gate (`exhausted?/1`)
+  uses, instead of the session/opts chain (which could under- or
+  double-charge the straddle band).
+- Hardening: `payment_confirmed` is now gated on the same strict
+  `credits_enabled` derivation as the plug side (`payments_source: false` +
+  a sender literally named `"false"` can no longer mint a mirror balance);
+  the namespace compare is `to_string/1`-normalized on both sides (an atom
+  `credit_namespace` config no longer silently drops every payment);
+  `method: "debit"` is refused as `reserved_method` (non-retryable — it would
+  collide with the ledger's internal `"debit:<request_id>"` keyspace);
+  exponent-notation `amount_usd` (`"5e2"`) is rejected — plain decimal
+  strings only; and a non-parseable/non-finite/non-positive `credit_per_usd`
+  now refuses to boot with `ArgumentError` instead of silently zeroing every
+  payment.
+
 - Prepaid credit ledger: free daily budget spends first; once exhausted, calls
   draw down a per-budget-identity credit balance (durable via two new OPTIONAL
   Store callbacks `llm_credit_balance/1` + `record_llm_credit_entry/1`;

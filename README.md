@@ -114,9 +114,14 @@ config:
   accrued while it was off.
 - `credit_namespace` (default `"default"`) — a confirmation for a different
   namespace is silently ignored (multiple consumers can share one settlement
-  hub, each only owns its own namespace).
+  hub, each only owns its own namespace). Both sides of the compare are
+  `to_string/1`-normalized (same as the source compare), so an atom config
+  (`:default`, e.g. from keyword/IR config) matches the JSON-decoded string.
 - `credit_per_usd` (default `"1.0"`) — conversion rate from `amount_usd` to
-  credited balance.
+  credited balance. **Boot-validated**: a non-parseable, non-finite, or
+  non-positive value refuses to boot with `ArgumentError` (same stance as
+  the pricing-config validation) — a tolerant parse would silently zero
+  every payment while still acking it `ok:true`.
 - `topup_hint_fun` — optional 1-arity fun (`budget_identity -> String.t() |
   nil`), plug opt only (not top-level config). A non-empty, non-raising
   result is appended as an extra line on a `:budget` block notice; absent,
@@ -130,9 +135,16 @@ just non-numeric strings) and is `> 0`. A JSON *number* (e.g. `5.0`, unquoted)
 is refused too, deliberately: `parse_money/1` only matches `is_binary/1`, so
 `amount_usd` arriving as a number is `bad_payment_confirmed`, not a silent
 float-precision hazard — the hub sends `Decimal.to_string/1`, never a raw
-number, and this contract is enforced rather than assumed. `method`/`ref` are
+number, and this contract is enforced rather than assumed. **Plain decimal
+strings only**: scientific/exponent notation (`"5e2"`, `"1E+2"`) is rejected
+even though it parses as a finite `Decimal` — an exponent amount is far more
+likely malformed than a legitimate top-up. `method`/`ref` are
 both required non-empty strings — the idempotency key is `"<method>:<ref>"`,
-so a re-delivered confirmation credits the balance once. Replies
+so a re-delivered confirmation credits the balance once. `method` may not be
+the literal string `"debit"` (refused with
+`{"ok":false,"error":"reserved_method"}`, non-retryable): `"debit:" <>
+request_id` is the ledger's reserved internal keyspace for spend debits, and
+a colliding top-up key would swallow a real debit as a duplicate. Replies
 `{"ok":true}` (first credit), `{"ok":true,"duplicate":true}` (replay), or
 `{"ok":false,"error":"store_unavailable","retryable":true}` (durable store
 configured but the write failed — see Fail policy below); a malformed
@@ -197,6 +209,19 @@ balance, and the mark is freed for a future attempt only after that one
 write fails. Mirror-only installs (no durable store at all) are unaffected —
 there is nothing durable to fail closed against, so a top-up applies to the
 mirror exactly as before.
+
+**Debits during a store outage** are the one asymmetric case: the request was
+already served (budget-side accounting fails OPEN — an accounting outage
+never blocks the LLM path) and, unlike a top-up, a debit has no redelivery
+vehicle, so a failed durable write cannot be retried later. The proxy makes
+the loss visible and conservative rather than silent: it logs a warning,
+bumps `llm_proxy_budget_degraded`, and applies the debit to the in-memory
+mirror anyway, so the fail-open balance the gate reads during the outage is
+the lower (already-debited) figure. Balance reads are durable-first, so once
+the store heals its un-debited ledger shadows the mirror — the mirror debit
+is never double-counted. **Accepted rider:** the durable ledger permanently
+under-charges by the debits lost during the outage window (bounded by the
+global daily ceiling); the log/metric trail is the reconciliation signal.
 
 Deliverers should send confirmations serially per ref (or treat any
 `ok:false` as retry-needed): a concurrent duplicate delivered during a
