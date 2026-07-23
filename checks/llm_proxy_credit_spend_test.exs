@@ -404,6 +404,41 @@ check.(
   eq.(balance.("bi-h2"), d.("4.80"))
 )
 
+# H3 (I2): a NONCONFORMING store row carries limit_usd: nil. The gate
+# (exhausted?/1) falls back to the module default (Proxy.default_daily_limit()),
+# NOT to session/opts — so with session.daily_limit_usd pinned at 5.00 and
+# spent 0.60, the gate treats the budget as exhausted (0.60 >= 0.50) and the
+# call runs credit-funded. The debit must compute overflow against the SAME
+# 0.50 the gate used: spent_before 0.60 is already past it, so the full 0.10
+# cost is debited. The pre-fix chain (nil -> session 5.00) computed zero
+# overflow and charged NOTHING (a proven under-charge).
+credit!.("bi-h3", "h3:seed", "5.00")
+
+gate_limit = Proxy.default_daily_limit()
+overflow_h3 = fn spent -> Decimal.max(d.("0"), Decimal.sub(spent, gate_limit)) end
+
+expected_debit_h3 =
+  Decimal.sub(overflow_h3.(Decimal.add(d.("0.60"), d.("0.10"))), overflow_h3.(d.("0.60")))
+
+check.(
+  "H3 sanity: the gate's nil-limit fallback (0.50) makes the full 0.10 cost overflow",
+  eq.(expected_debit_h3, d.("0.10"))
+)
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h3", d.("5.00")),
+  req_ctx,
+  record.("req-h3", d.("0.10")),
+  %{spent_usd: d.("0.60"), limit_usd: nil}
+)
+
+check.(
+  "H3: nil-limit store row -> debit equals the overflow computed with the GATE's " <>
+    "fallback limit (session 5.00 chain would have charged nothing)",
+  eq.(balance.("bi-h3"), Decimal.sub(d.("5.00"), expected_debit_h3))
+)
+
 # ── I. Legacy/non-Decimal spent_before tolerated (X3): a store returning an
 # integer spent_usd (legal on 0.2.19) must not crash maybe_debit_credit — it is
 # coerced via the module's decimal/1, same as everywhere else in this file, and
@@ -456,6 +491,185 @@ check.(
     "credit-funded debit",
   eq.(balance.("bi-i2"), d.("4.80"))
 )
+
+# ── J. (I1) Durable-store outage during a credit-funded call: the debit must
+# never vanish silently. The request is ALREADY served (budget accounting
+# fails open), but the loss must be visible — warning log + the
+# llm_proxy_budget_degraded metric — and the debit is applied MIRROR-ONLY so
+# the fail-open balance stays the conservative (lower) figure while the store
+# is down. Balance reads are durable-first, so a healed store's un-debited
+# ledger shadows the mirror (no double-count), and the mirror-only re-apply
+# re-takes the idempotency seen-mark, so a replay of the same request_id can
+# never double-debit.
+defmodule DebitOutageStore do
+  def reset do
+    :persistent_term.put({__MODULE__, :down}, false)
+    :persistent_term.put({__MODULE__, :debit_attempts}, 0)
+  end
+
+  def down!, do: :persistent_term.put({__MODULE__, :down}, true)
+  def heal!, do: :persistent_term.put({__MODULE__, :down}, false)
+  def down?, do: :persistent_term.get({__MODULE__, :down}, false)
+  def debit_attempts, do: :persistent_term.get({__MODULE__, :debit_attempts}, 0)
+
+  # Usage-row store stays healthy throughout so the ONLY degraded signal in
+  # this section can come from the credit-debit path itself.
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+
+  # Durable ledger holds only the seeded top-up (the failed debit never lands).
+  def llm_credit_balance(_bi) do
+    if down?(), do: {:error, :db_down}, else: {:ok, Decimal.new("5.00")}
+  end
+
+  def record_llm_credit_entry(entry) do
+    if Map.get(entry, :kind) == "debit" do
+      :persistent_term.put({__MODULE__, :debit_attempts}, debit_attempts() + 1)
+    end
+
+    if down?(), do: {:error, :db_down}, else: :ok
+  end
+end
+
+# Counts warning/error log lines from the debit-outage path.
+defmodule DebitOutageLogSink do
+  def hits, do: :persistent_term.get({__MODULE__, :hits}, 0)
+
+  def log(event, _config) do
+    text =
+      case event.msg do
+        {:string, s} -> IO.chardata_to_string(s)
+        {:report, r} -> inspect(r)
+        {fmt, args} -> IO.chardata_to_string(:io_lib.format(fmt, args))
+      end
+
+    if String.contains?(text, "credit DEBIT store write FAILED") do
+      :persistent_term.put({__MODULE__, :hits}, hits() + 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+end
+
+DebitOutageStore.reset()
+:ok = :logger.add_handler(:debit_outage_log_sink, DebitOutageLogSink, %{})
+
+# Captures bump_metric deliveries (the plug-side degraded-counter pattern).
+{:ok, metric_bumps} = Agent.start_link(fn -> [] end)
+
+opts_outage = %{
+  opts
+  | store_mod: DebitOutageStore
+}
+|> Map.merge(%{
+  swarm_name: "swarm",
+  metrics: :metrics,
+  deliver_fn: fn _sw, _metrics, _from, payload ->
+    case Jason.decode(payload) do
+      {:ok, %{"action" => "bump", "key" => key}} -> Agent.update(metric_bumps, &[key | &1])
+      _ -> :ok
+    end
+  end
+})
+
+degraded_bumps = fn ->
+  Agent.get(metric_bumps, &Enum.count(&1, fn k -> k == "llm_proxy_budget_degraded" end))
+end
+
+# Seed the balance while the store is healthy (top-up lands durably + mirror).
+credit_entry_j = %{
+  idempotency_key: "j:seed",
+  budget_identity: "bi-j",
+  amount_usd: d.("5.00"),
+  kind: "credit",
+  at: ~U[2026-07-22 10:00:00Z],
+  meta: %{}
+}
+
+{:ok, _} = Proxy.apply_credit_entry(pid, DebitOutageStore, credit_entry_j)
+
+# Outage begins; a fully-credit-funded call (spent_before 0.60 > limit 0.50).
+DebitOutageStore.down!()
+
+record_j = record.("req-j", d.("0.30"))
+
+served =
+  try do
+    ProxyPlug.record_budget_call(
+      opts_outage,
+      session.("bi-j", d.("0.50")),
+      req_ctx,
+      record_j,
+      d.("0.60")
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("J1: store outage during a credit-funded call -> the call is still served (no raise)", served == :ok)
+
+check.(
+  "J2: the durable debit write WAS attempted and failed (fail-open never skips the try)",
+  DebitOutageStore.debit_attempts() == 1
+)
+
+check.(
+  "J3: the lost durable debit is LOGGED (warning names the failed debit write)",
+  DebitOutageLogSink.hits() == 1
+)
+
+check.(
+  "J4: the llm_proxy_budget_degraded metric is bumped exactly once for the lost debit",
+  degraded_bumps.() == 1
+)
+
+check.(
+  "J5: the debit IS applied to the in-memory mirror (conservative lower balance " <>
+    "while the store is down): 5.00 - 0.30 = 4.70",
+  eq.(Proxy.credit_balance(pid, nil, "bi-j"), d.("4.70"))
+)
+
+check.(
+  "J6: during the outage the gate reads the conservative mirror figure " <>
+    "(durable read down -> falls open to the mirror's 4.70)",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("4.70"))
+)
+
+# Replay of the SAME request_id while still down: the mirror-only re-apply
+# re-took the seen-mark, so nothing double-debits, and no second durable
+# attempt / warning / metric fires (:already_seen short-circuits first).
+ProxyPlug.record_budget_call(
+  opts_outage,
+  session.("bi-j", d.("0.50")),
+  req_ctx,
+  record_j,
+  d.("0.60")
+)
+
+check.(
+  "J7: replaying the same request_id during the outage neither double-debits the " <>
+    "mirror nor re-fires the durable write/log/metric",
+  eq.(Proxy.credit_balance(pid, nil, "bi-j"), d.("4.70")) and
+    DebitOutageStore.debit_attempts() == 1 and DebitOutageLogSink.hits() == 1 and
+    degraded_bumps.() == 1
+)
+
+# Store heals: balance reads are DURABLE-FIRST, so the un-debited durable
+# ledger (top-up only, 5.00) shadows the mirror's 4.70 — the mirror debit is
+# never double-counted anywhere; the durable under-charge is the documented
+# outage rider.
+DebitOutageStore.heal!()
+
+check.(
+  "J8: after the store heals, the durable-first read shadows the mirror (5.00 — " <>
+    "the outage under-charge stays durable-side only, no double-apply)",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("5.00"))
+)
+
+:logger.remove_handler(:debit_outage_log_sink)
 
 failed = Agent.get(failures, & &1)
 IO.puts("")

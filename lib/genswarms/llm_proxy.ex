@@ -4062,7 +4062,17 @@ defmodule Genswarms.LlmProxy.Plug do
   # is still coerced (X3) in case a legacy store's budget row carries an
   # integer there too.
   defp normalize_debit_budget(%{} = budget) do
-    %{spent_usd: Proxy.decimal(Map.get(budget, :spent_usd)), limit_usd: Map.get(budget, :limit_usd)}
+    %{
+      spent_usd: Proxy.decimal(Map.get(budget, :spent_usd)),
+      # (I2) A nonconforming store row can carry limit_usd: nil. The gate
+      # (exhausted?/1) falls back `limit || Proxy.default_daily_limit()` — the
+      # debit must use the EXACT same fallback, not the session/opts chain, or
+      # a nil-limit row makes gate and debit disagree on where the free band
+      # ends (under- or double-charging the straddle). The session/opts chain
+      # remains only for the legacy bare-Decimal/integer arms above, which
+      # never saw a budget map at all.
+      limit_usd: Map.get(budget, :limit_usd) || Proxy.default_daily_limit()
+    }
   end
 
   defp do_maybe_debit_credit(opts, session, record, %{spent_usd: spent_before, limit_usd: gate_limit}) do
@@ -4074,14 +4084,45 @@ defmodule Genswarms.LlmProxy.Plug do
       debit = Decimal.sub(overflow.(Decimal.add(spent_before, cost)), overflow.(spent_before))
 
       if Decimal.compare(debit, zero) == :gt do
-        Proxy.apply_credit_entry(opts.state_pid, opts.store_mod, %{
+        entry = %{
           idempotency_key: "debit:" <> request_id,
           budget_identity: session.budget_identity,
           amount_usd: Decimal.negate(debit),
           kind: "debit",
           at: DateTime.utc_now(),
           meta: %{"request_id" => request_id}
-        })
+        }
+
+        case Proxy.apply_credit_entry(opts.state_pid, opts.store_mod, entry) do
+          {:error, :store_unavailable} ->
+            # (I1) The request was ALREADY served — budget-side accounting fails
+            # OPEN, per the spec's failure asymmetry — and unlike the top-up path
+            # (credit_payment/2, whose retryable NACK makes the hub redeliver),
+            # a debit has no redelivery vehicle: a durable-write failure here
+            # would otherwise lose the debit silently and forever. Make the loss
+            # visible (same degraded log+metric pattern as record_budget_call/5's
+            # store-down branch), then re-apply the entry MIRROR-ONLY (store_mod
+            # nil -> apply_credit_entry's :no_store arm) so the fail-open mirror
+            # balance stays the conservative, lower figure while the store is
+            # down. Safe on both sides of recovery: balance reads are
+            # durable-first (credit_balance/3), so a healed store's un-debited
+            # balance simply shadows the mirror — nothing re-syncs the mirror
+            # from durable, and the mirror-only re-apply re-takes the
+            # idempotency seen-mark, so the same request_id can never be
+            # double-applied by any later replay. The durable ledger's missing
+            # debit (an outage-window under-charge) is the documented rider.
+            Logger.warning(
+              "llm_proxy: credit DEBIT store write FAILED — debit applied to in-memory " <>
+                "mirror only; durable ledger under-charges this call (no retry vehicle); " <>
+                "request_id=#{request_id} debit_usd=#{Decimal.to_string(debit)}"
+            )
+
+            bump_metric(opts, "llm_proxy_budget_degraded")
+            Proxy.apply_credit_entry(opts.state_pid, nil, entry)
+
+          _ ->
+            :ok
+        end
       end
 
       :ok
