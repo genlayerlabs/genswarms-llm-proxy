@@ -197,7 +197,12 @@ budget check.
 
 **Fail policy:** credit balance *reads* fail open to the in-memory mirror (an
 accounting outage must not block spend — the gate still sees whatever the
-mirror last carried). Credit *writes* fail CLOSED per spec: when a durable
+mirror last carried). **Known limitation (cold mirror):** the mirror starts
+empty on every restart, so a durable *read* outage immediately after a
+restart leaves the credit gate seeing `0` — a user with a real durable
+balance stays blocked until the store read heals. Only the credit
+*extension* degrades closed this way (the conservative direction for money);
+free daily-budget calls are unaffected, as that path fails open on its own. Credit *writes* fail CLOSED per spec: when a durable
 store is configured (`store_mod` exports both `llm_credit_balance/1` and
 `record_llm_credit_entry/1`) and `record_llm_credit_entry/1`
 errors/raises/exits — **or returns any shape outside the documented

@@ -24,6 +24,10 @@
   it ambiguous: `("a", "b:c")` and `("a:b", "c")` minted the same key and the
   second, legitimately distinct, payment was permanently swallowed as
   `duplicate:true`. `ref` keeps colons freely (tx hashes).
+- Docs (review R3-M4): known limitation — the credit mirror starts cold on
+  restart, so a durable READ outage immediately after a restart blocks a
+  paying user (gate sees 0) until the store read heals; free daily-budget
+  calls are unaffected.
 
 - Fixed (review I1): a credit DEBIT whose durable write fails during a store
   outage is no longer lost silently — the request stays served (budget-side
