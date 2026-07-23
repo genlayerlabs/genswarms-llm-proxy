@@ -242,6 +242,93 @@ check.(
   )
 )
 
+# 9. (R3-I1) A NONCONFORMING record_llm_credit_entry/1 return VALUE (the
+# single most likely host-adapter slip: forwarding Repo.insert/1's
+# `{:ok, struct}` — a write that actually SUCCEEDED) must NOT raise
+# CaseClauseError out of apply_credit_entry/3. Pre-fix it did, permanently
+# leaking the seen-mark (redelivery acked :duplicate while the mirror balance
+# was never applied — a success-shaped lost payment). Now it is treated as a
+# failed write: no raise, {:error, :store_unavailable}, mirror untouched,
+# seen-mark RELEASED. Self-converging: since the nonconforming write landed,
+# the store's own uniqueness answers {:error, :duplicate} on the healed
+# redelivery and the entry settles exactly once (durable-first reads serve
+# the real balance).
+defmodule NonconformingStore do
+  def reset do
+    :persistent_term.put({__MODULE__, :d}, %{
+      balances: %{},
+      keys: MapSet.new(),
+      nonconforming: true
+    })
+  end
+
+  defp d, do: :persistent_term.get({__MODULE__, :d})
+  defp put(m), do: :persistent_term.put({__MODULE__, :d}, m)
+  def heal!, do: put(%{d() | nonconforming: false})
+  def entries_balance(bi), do: Map.get(d().balances, bi, Decimal.new("0"))
+  def entry_count, do: MapSet.size(d().keys)
+
+  def llm_credit_balance(bi), do: {:ok, entries_balance(bi)}
+
+  def record_llm_credit_entry(%{idempotency_key: key, budget_identity: bi, amount_usd: amt}) do
+    if MapSet.member?(d().keys, key) do
+      {:error, :duplicate}
+    else
+      # The write LANDS (Ecto's {:ok, struct} means insert succeeded) …
+      put(%{
+        d()
+        | keys: MapSet.put(d().keys, key),
+          balances: Map.update(d().balances, bi, amt, &Decimal.add(&1, amt))
+      })
+
+      # … but the adapter forwards a nonconforming shape while unhealed.
+      if d().nonconforming, do: {:ok, %{id: 1}}, else: :ok
+    end
+  end
+end
+
+NonconformingStore.reset()
+{:ok, nc_pid} = Proxy.start_state_link()
+nc_entry = entry.("nc:1", "5.00")
+
+nc_result =
+  try do
+    Proxy.apply_credit_entry(nc_pid, NonconformingStore, nc_entry)
+  rescue
+    e -> {:raised, e.__struct__}
+  end
+
+check.(
+  "nonconforming return ({:ok, struct}): no raise, treated as store failure " <>
+    "({:error, :store_unavailable})",
+  nc_result == {:error, :store_unavailable}
+)
+
+check.(
+  "nonconforming return: mirror NOT applied (balance stays 0)",
+  Decimal.equal?(Proxy.credit_balance(nc_pid, nil, bi), Decimal.new("0"))
+)
+
+NonconformingStore.heal!()
+
+check.(
+  "nonconforming return: seen-mark was RELEASED — the healed redelivery reaches the " <>
+    "store again and its uniqueness contract answers :duplicate (the landed write wins)",
+  Proxy.apply_credit_entry(nc_pid, NonconformingStore, nc_entry) == :duplicate
+)
+
+check.(
+  "nonconforming return: the entry settled EXACTLY once durably (one key, 5.00)",
+  NonconformingStore.entry_count() == 1 and
+    Decimal.equal?(NonconformingStore.entries_balance(bi), Decimal.new("5.00"))
+)
+
+check.(
+  "nonconforming return: durable-first read serves the landed balance (5.00) — " <>
+    "the payment converges, never silently lost",
+  Decimal.equal?(Proxy.credit_balance(nc_pid, NonconformingStore, bi), Decimal.new("5.00"))
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

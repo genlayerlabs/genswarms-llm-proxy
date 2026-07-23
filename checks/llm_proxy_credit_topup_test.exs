@@ -429,6 +429,92 @@ check.(
   Decimal.equal?(Proxy.credit_balance(pid, nil, bi_degraded), Decimal.new("5.00"))
 )
 
+# 14b. (R3-I1) NONCONFORMING store return shape THROUGH handle_message: a store
+# whose record_llm_credit_entry/1 returns an Ecto-style {:ok, struct} instead
+# of :ok must behave exactly like a failed write — ok:false,
+# error:"store_unavailable", retryable:true, NO raise out of the handler,
+# mirror NOT credited, seen-mark RELEASED. Pre-fix this raised CaseClauseError
+# and leaked the mark: the hub's redelivery was acked duplicate:true while the
+# balance was never applied (a success-shaped lost payment). Once the adapter
+# is healed to the conforming :ok, redelivery of the SAME method:ref credits
+# exactly once.
+defmodule NonconformingTopupStore do
+  def reset, do: :persistent_term.put({__MODULE__, :nonconforming}, true)
+  def nonconforming?, do: :persistent_term.get({__MODULE__, :nonconforming}, true)
+  def heal, do: :persistent_term.put({__MODULE__, :nonconforming}, false)
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("0")}
+
+  def record_llm_credit_entry(_entry) do
+    if nonconforming?(), do: {:ok, %{id: 1}}, else: :ok
+  end
+end
+
+NonconformingTopupStore.reset()
+
+state_nc = %{
+  state
+  | store_mod: NonconformingTopupStore,
+    quota: %{store_mod: NonconformingTopupStore}
+}
+
+bi_nc = "w:nonconforming|k:dm|c:tg:1:0"
+
+nc_first =
+  try do
+    {:reply, json_nc, _} =
+      Proxy.handle_message(
+        "payments",
+        msg.(%{"ref" => "0xT:nonconforming", "beneficiary" => bi_nc}),
+        state_nc
+      )
+
+    {:ok, Jason.decode!(json_nc)}
+  rescue
+    e -> {:raised, e.__struct__}
+  end
+
+check.(
+  "nonconforming store return: handler does NOT raise",
+  match?({:ok, _}, nc_first)
+)
+
+{:ok, reply_nc} = nc_first
+
+check.(
+  "nonconforming store return: answered ok:false, error store_unavailable, " <>
+    "retryable:true (fail-closed, NOT a success-shaped ack)",
+  reply_nc["ok"] == false and reply_nc["error"] == "store_unavailable" and
+    reply_nc["retryable"] == true
+)
+
+check.(
+  "nonconforming store return: mirror NOT credited",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi_nc), Decimal.new("0"))
+)
+
+NonconformingTopupStore.heal()
+
+{:reply, json_nc_healed, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:nonconforming", "beneficiary" => bi_nc}),
+    state_nc
+  )
+
+reply_nc_healed = Jason.decode!(json_nc_healed)
+
+check.(
+  "nonconforming store return: seen-mark was released — redelivery of the SAME " <>
+    "method:ref against the healed (conforming) store credits exactly once",
+  reply_nc_healed["ok"] == true and reply_nc_healed["credited_usd"] == "5.00" and
+    reply_nc_healed["duplicate"] != true
+)
+
+check.(
+  "nonconforming store return: mirror credited exactly once after the healed redelivery",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi_nc), Decimal.new("5.00"))
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

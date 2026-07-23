@@ -671,6 +671,49 @@ check.(
 
 :logger.remove_handler(:debit_outage_log_sink)
 
+# ── K. (R3-I1) NONCONFORMING store return shape during a credit-funded debit:
+# a store whose record_llm_credit_entry/1 returns an Ecto-style {:ok, struct}
+# must NOT raise out of record_budget_call — pre-fix this CaseClauseError
+# turned a successfully served, already-billed upstream call into a 502 on
+# the chat route and escaped uncaught into Bandit on the compact route (both
+# funnel their debits through this exact chokepoint). Now it is treated like
+# a store outage: the call stays served (fail-open debit side) and the debit
+# lands mirror-only, the conservative lower figure.
+defmodule NonconformingDebitStore do
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("5.00")}
+  def record_llm_credit_entry(_entry), do: {:ok, %{id: 1}}
+end
+
+opts_nonconforming = %{opts | store_mod: NonconformingDebitStore}
+
+served_k =
+  try do
+    ProxyPlug.record_budget_call(
+      opts_nonconforming,
+      session.("bi-k", d.("0.50")),
+      req_ctx,
+      record.("req-k", d.("0.30")),
+      d.("0.60")
+    )
+
+    :ok
+  rescue
+    e -> {:raised, e.__struct__}
+  end
+
+check.(
+  "K1: nonconforming {:ok, struct} debit write -> the call is still served (no raise " <>
+    "= no 502 on chat, nothing escapes into Bandit on compact)",
+  served_k == :ok
+)
+
+check.(
+  "K2: the debit IS applied to the in-memory mirror (same conservative mirror-only " <>
+    "fallback as a store outage): 0 - 0.30 = -0.30",
+  eq.(Proxy.credit_balance(pid, nil, "bi-k"), d.("-0.30"))
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

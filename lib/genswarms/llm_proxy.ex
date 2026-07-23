@@ -2058,6 +2058,28 @@ defmodule Genswarms.LlmProxy do
           {:error, _reason} ->
             mirror_unmark_credit_seen(pid, bi, key)
             {:error, :store_unavailable}
+
+          # (R3-I1) A NONCONFORMING return VALUE (the raise/exit cases are
+          # already rescued in durable_record_credit_entry/2) — most likely a
+          # host adapter forwarding Repo.insert/1's `{:ok, struct}` straight
+          # through. Without this arm it raised CaseClauseError out of the
+          # money path: the seen-mark leaked forever (redelivery acked
+          # `duplicate:true` while the mirror balance was never applied — a
+          # success-shaped lost payment) and the debit path 502'd an
+          # already-billed call. Treat it exactly like a failed write: release
+          # the mark, fail closed, let the hub redeliver. Self-converging even
+          # when the nonconforming write actually LANDED: the store's own
+          # uniqueness contract answers `{:error, :duplicate}` on the retry
+          # and the entry settles exactly once.
+          other ->
+            Logger.warning(
+              "llm_proxy: record_llm_credit_entry/1 returned nonconforming " <>
+                inspect(other) <>
+                " — treated as store failure (fails closed, retryable, key released)"
+            )
+
+            mirror_unmark_credit_seen(pid, bi, key)
+            {:error, :store_unavailable}
         end
     end
   end

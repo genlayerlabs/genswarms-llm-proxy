@@ -2,6 +2,18 @@
 
 ## 0.3.0 — unreleased
 
+- Fixed (review R3-I1): a NONCONFORMING `record_llm_credit_entry/1` return
+  VALUE (e.g. an adapter forwarding `Repo.insert/1`'s `{:ok, struct}`) no
+  longer raises `CaseClauseError` out of `apply_credit_entry/3` — it is now
+  treated exactly like a failed write (warning naming the shape, seen-mark
+  released, `{:error, :store_unavailable}`). Pre-fix consequences: the top-up
+  path leaked the idempotency seen-mark forever (redelivery acked
+  `duplicate:true` while the balance was never applied — a success-shaped
+  lost payment) and the debit path 502'd an already-billed chat call / let
+  the raise escape uncaught on the compact route. Self-converging when the
+  nonconforming write actually landed: the hub's retry hits the store's own
+  uniqueness and settles as `{:error, :duplicate}` exactly once.
+
 - Fixed (review I1): a credit DEBIT whose durable write fails during a store
   outage is no longer lost silently — the request stays served (budget-side
   accounting fails open by design), but the proxy now logs a warning, bumps

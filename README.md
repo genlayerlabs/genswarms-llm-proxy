@@ -190,14 +190,20 @@ accounting outage must not block spend — the gate still sees whatever the
 mirror last carried). Credit *writes* fail CLOSED per spec: when a durable
 store is configured (`store_mod` exports both `llm_credit_balance/1` and
 `record_llm_credit_entry/1`) and `record_llm_credit_entry/1`
-errors/raises/exits, the entry is **not** applied to the mirror and its
+errors/raises/exits — **or returns any shape outside the documented
+contract** (`:ok` | `{:error, :duplicate}` | `{:error, reason}`; e.g. an
+adapter forwarding `Repo.insert/1`'s `{:ok, struct}`) — the entry is **not**
+applied to the mirror and its
 idempotency key is **not** consumed — `apply_credit_entry/3` releases the
 atomic seen-mark it took before the write attempt, logs `Logger.error`,
 bumps `llm_proxy_budget_degraded`, and returns `{:error,
 :store_unavailable}`; `payment_confirmed` replies
 `{"ok":false,"error":"store_unavailable","retryable":true}`. A later
 redelivery of the *same* `(method, ref)` — once the store heals — is a
-genuine retry, not a swallowed duplicate, and credits normally. This closes
+genuine retry, not a swallowed duplicate, and credits normally. This is
+self-converging even when a *nonconforming-return* write actually landed:
+the retry reaches the store again and its own `idempotency_key` uniqueness
+answers `{:error, :duplicate}`, settling the entry exactly once. This closes
 a lose-payment gap: failing open here would have permanently consumed the
 idempotency key in the mirror seen-set, so the payment hub's own
 redelivery-after-recovery would have been silently swallowed as
