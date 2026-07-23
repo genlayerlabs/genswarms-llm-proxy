@@ -198,6 +198,11 @@ write fails. Mirror-only installs (no durable store at all) are unaffected —
 there is nothing durable to fail closed against, so a top-up applies to the
 mirror exactly as before.
 
+Deliverers should send confirmations serially per ref (or treat any
+`ok:false` as retry-needed): a concurrent duplicate delivered during a
+failing store write can be acked `duplicate:true` while the write fails —
+the key is released afterward, so a serial retry always lands.
+
 `quota_status` gains a `credit.balance_usd` field (2dp string, like the other
 credit-related dollar amounts in this feature — `money2`, not the 6dp `money`
 used elsewhere in `quota_status`).

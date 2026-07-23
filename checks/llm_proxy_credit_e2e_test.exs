@@ -25,6 +25,7 @@
 
 alias Genswarms.LlmProxy, as: Proxy
 alias Genswarms.LlmProxy.Curl
+alias Genswarms.LlmProxy.Plug, as: ProxyPlug
 
 Application.ensure_all_started(:bandit)
 Application.ensure_all_started(:plug)
@@ -78,6 +79,27 @@ defmodule E2E.FakeUpstream do
       ],
       # 1e6 prompt / 5e5 completion tokens @ 0.25/0.75 per Mtok -> cost_usd 0.625 (a
       # round, deterministic number for the debit assertion below).
+      "usage" => %{
+        "prompt_tokens" => 1_000_000,
+        "completion_tokens" => 500_000,
+        "total_tokens" => 1_500_000
+      }
+    }
+
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.send_resp(200, Jason.encode!(resp))
+  end
+
+  post "/v1/compact" do
+    # Real upstream /v1/compact sibling (compact_endpoint/1 swaps
+    # /chat/completions for /compact on this SAME fake upstream). Same token
+    # counts as the chat fake above so the priced-seal debit below reuses the
+    # scenario 1 arithmetic (1e6 prompt / 5e5 completion @ 0.25/0.75 per Mtok
+    # -> cost_usd 0.625).
+    resp = %{
+      "messages" => [%{"role" => "system", "content" => "[sealed]"}],
+      "compacted" => true,
       "usage" => %{
         "prompt_tokens" => 1_000_000,
         "completion_tokens" => 500_000,
@@ -280,6 +302,49 @@ balance_after = Proxy.credit_balance(state.state_pid, E2E.Store, session.budget_
 check.(
   "scenario 1: the mirror credit balance decreased by the straddle debit (5.00 -> 4.375)",
   Decimal.equal?(balance_after, Decimal.new("4.375"))
+)
+
+# ── Scenario 1b — same exhausted-budget-plus-positive-balance identity, but
+# hitting /v1/compact instead of /v1/chat/completions. Pins the compact
+# route's OWN `exhausted?(budget) and credit_exhausted?(opts, session)` gate
+# (checks/llm_proxy_compact_test.exs never drives credits at all, and every
+# other credit check only drives /v1/chat/completions — reverting ONLY the
+# compact gate to bare `exhausted?(budget)` passed the whole suite).
+compact_endpoint_credits = ProxyPlug.compact_endpoint(state.endpoint)
+
+compact_body =
+  Jason.encode!(%{
+    "messages" => [%{"role" => "user", "content" => "hi"}],
+    "keep_recent" => 6,
+    "max_tokens" => 512
+  })
+
+{:ok, compact_status, compact_resp_body} =
+  Curl.post(
+    compact_endpoint_credits,
+    body: compact_body,
+    headers: [{"authorization", "Bearer #{token}"}, {"content-type", "application/json"}],
+    timeout: 5
+  )
+
+compact_decoded = Jason.decode!(compact_resp_body)
+
+check.(
+  "scenario 1b: exhausted daily budget + positive credit balance -> /v1/compact " <>
+    "proceeds too (NOT the budget-block response)",
+  compact_status == 200 and compact_decoded["compacted"] == true and
+    get_in(compact_decoded, ["error", "code"]) != "budget_exhausted"
+)
+
+balance_after_compact =
+  Proxy.credit_balance(state.state_pid, E2E.Store, session.budget_identity)
+
+# spent_before is already far past the $0.50 limit (scenario 1 alone pushed it
+# to 1.225), so the seal's ENTIRE $0.625 rate-card cost is credit-funded —
+# same straddle math as scenario 1's chat debit (4.375 -> 3.75).
+check.(
+  "scenario 1b: the seal's overflow cost debits the SAME mirror balance (4.375 -> 3.75)",
+  Decimal.equal?(balance_after_compact, Decimal.new("3.75"))
 )
 
 Proxy.terminate(:normal, state)
