@@ -216,17 +216,28 @@ check.(
   Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
 )
 
-# 14. (A2, deferred #4) degraded-path check THROUGH handle_message: a store
-# whose record_llm_credit_entry/1 errors (e.g. db_down) but whose
-# llm_credit_balance/1 works — the store exports BOTH callbacks (half-pair
-# would otherwise be treated as absent per B1's both-callbacks-or-neither
-# rule) — must still reply ok:true, degraded:true, with the balance credited
-# to the in-memory mirror.
+# 14. (X4) degraded-path check THROUGH handle_message: the approved spec's
+# "credit writes fail CLOSED" governs — a store whose record_llm_credit_entry/1
+# errors (e.g. db_down) but whose llm_credit_balance/1 works (the store exports
+# BOTH callbacks — half-pair would otherwise be treated as absent per B1's
+# both-callbacks-or-neither rule) must reply ok:false, error:"store_unavailable",
+# retryable:true, and must NOT apply the mirror — the prior fail-open (ok:true,
+# degraded:true, mirror credited) permanently consumed the idempotency key in
+# the mirror seen-set, so the hub's redelivery after store recovery was
+# swallowed as a duplicate forever (a lost payment). A later redelivery of the
+# SAME method:ref must succeed once the store heals.
 defmodule DegradedTopupStore do
+  def reset, do: :persistent_term.put({__MODULE__, :down}, true)
+  def down?, do: :persistent_term.get({__MODULE__, :down}, true)
+  def heal, do: :persistent_term.put({__MODULE__, :down}, false)
   def llm_credit_balance(_bi), do: {:ok, Decimal.new("0")}
-  def record_llm_credit_entry(_entry), do: {:error, :db_down}
+
+  def record_llm_credit_entry(_entry) do
+    if down?(), do: {:error, :db_down}, else: :ok
+  end
 end
 
+DegradedTopupStore.reset()
 state_degraded = %{state | store_mod: DegradedTopupStore, quota: %{store_mod: DegradedTopupStore}}
 bi_degraded = "w:degraded|k:dm|c:tg:1:0"
 
@@ -240,16 +251,37 @@ bi_degraded = "w:degraded|k:dm|c:tg:1:0"
 reply_degraded = Jason.decode!(json_degraded)
 
 check.(
-  "degraded top-up: ok:true, degraded:true through handle_message",
-  reply_degraded["ok"] == true and reply_degraded["degraded"] == true
+  "degraded top-up: fails CLOSED — ok:false, error store_unavailable, retryable:true",
+  reply_degraded["ok"] == false and reply_degraded["error"] == "store_unavailable" and
+    reply_degraded["retryable"] == true
 )
 
 check.(
-  "degraded top-up: mirror balance credited despite durable write failure",
-  Decimal.equal?(
-    Proxy.credit_balance(pid, nil, bi_degraded),
-    Decimal.new("5.00")
+  "degraded top-up: mirror NOT credited while the store is down (fail-closed, " <>
+    "not fail-open)",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi_degraded), Decimal.new("0"))
+)
+
+DegradedTopupStore.heal()
+
+{:reply, json_recovered, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:degraded", "beneficiary" => bi_degraded}),
+    state_degraded
   )
+
+reply_recovered = Jason.decode!(json_recovered)
+
+check.(
+  "degraded top-up: redelivery of the SAME method:ref succeeds once the store " <>
+    "heals — the failed write did not permanently consume the idempotency key",
+  reply_recovered["ok"] == true and reply_recovered["credited_usd"] == "5.00"
+)
+
+check.(
+  "degraded top-up: mirror now credited after the healed redelivery",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi_degraded), Decimal.new("5.00"))
 )
 
 failed = Agent.get(failures, & &1)

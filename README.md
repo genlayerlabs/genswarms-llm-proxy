@@ -125,9 +125,9 @@ refused, not just non-numeric strings) and be `> 0`, and `method`/`ref` are
 both required non-empty strings — the idempotency key is `"<method>:<ref>"`,
 so a re-delivered confirmation credits the balance once. Replies
 `{"ok":true}` (first credit), `{"ok":true,"duplicate":true}` (replay), or
-`{"ok":true,"degraded":true,...}` (store write failed — see Fail policy
-below); a malformed message replies
-`{"ok":false,"error":"bad_payment_confirmed"}`.
+`{"ok":false,"error":"store_unavailable","retryable":true}` (durable store
+configured but the write failed — see Fail policy below); a malformed
+message replies `{"ok":false,"error":"bad_payment_confirmed"}`.
 
 Durable accounting for credits is two more OPTIONAL `Store` callbacks —
 `llm_credit_balance/1` (current signed balance) and
@@ -164,17 +164,30 @@ than the true combined overflow. Neither bound is closed by this feature —
 both are inherited from the same read-then-write shape as the existing daily
 budget check.
 
-**Fail policy:** credit balance reads fail open to the in-memory mirror (an
-accounting outage must not block spend). A store-down top-up still applies
-to the in-memory mirror, logs `Logger.error`, bumps
-`llm_proxy_budget_degraded`, and replies `degraded: true` — reconcile from
-the payment source's own ledger afterwards. This recovery is NOT sticky: a
-degraded (memory-only) credit stops gating the moment the durable read
-recovers (the store answers again) — the very next balance read prefers the
-durable value, which may be lower (or absent) than what the mirror was
-carrying. Reconcile promptly once you see a `degraded: true` reply or the
-`llm_proxy_budget_degraded` metric, rather than assuming the mirror value
-persists.
+**Fail policy:** credit balance *reads* fail open to the in-memory mirror (an
+accounting outage must not block spend — the gate still sees whatever the
+mirror last carried). Credit *writes* fail CLOSED per spec: when a durable
+store is configured (`store_mod` exports both `llm_credit_balance/1` and
+`record_llm_credit_entry/1`) and `record_llm_credit_entry/1`
+errors/raises/exits, the entry is **not** applied to the mirror and its
+idempotency key is **not** consumed — `apply_credit_entry/3` releases the
+atomic seen-mark it took before the write attempt, logs `Logger.error`,
+bumps `llm_proxy_budget_degraded`, and returns `{:error,
+:store_unavailable}`; `payment_confirmed` replies
+`{"ok":false,"error":"store_unavailable","retryable":true}`. A later
+redelivery of the *same* `(method, ref)` — once the store heals — is a
+genuine retry, not a swallowed duplicate, and credits normally. This closes
+a lose-payment gap: failing open here would have permanently consumed the
+idempotency key in the mirror seen-set, so the payment hub's own
+redelivery-after-recovery would have been silently swallowed as
+`duplicate:true` forever, with no durable record ever created. Concurrent
+callers sharing the same key during the failure window still see the
+existing at-most-once guarantee: only the caller that wins the atomic mark
+attempts the write; every other racer gets `:duplicate` without touching the
+balance, and the mark is freed for a future attempt only after that one
+write fails. Mirror-only installs (no durable store at all) are unaffected —
+there is nothing durable to fail closed against, so a top-up applies to the
+mirror exactly as before.
 
 `quota_status` gains a `credit.balance_usd` field (2dp string, like the other
 credit-related dollar amounts in this feature — `money2`, not the 6dp `money`

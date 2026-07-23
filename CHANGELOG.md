@@ -23,10 +23,18 @@
   — `Decimal.parse/1` accepts all three; unrejected, `"NaN"` would raise past
   the `> 0` guard and `"Infinity"` would mint an unbounded balance) and
   confirmations missing `method`/`ref`, and is idempotent on `method:ref` — a
-  re-delivered confirmation credits once (replies `ok`, `duplicate`, or
-  `degraded` when the store write fails and the credit lands in the
-  in-memory mirror only). Payment-agnostic: any settlement hub or operator
+  re-delivered confirmation credits once (replies `ok` or `duplicate`; a
+  durable-store write failure fails CLOSED — `ok:false,
+  error:"store_unavailable", retryable:true`, credit NOT applied, idempotency
+  key NOT consumed, so a later redelivery of the same `method:ref` succeeds
+  once the store heals). Payment-agnostic: any settlement hub or operator
   tool can be the source.
+- Fixed: `maybe_debit_credit`'s overflow limit now matches whatever
+  `budget.limit_usd` the block gate itself consulted (a store-row-pinned
+  limit differing from `session.daily_limit_usd`/`default_daily_limit`
+  previously let the gate and the debit disagree — double-charging or
+  under-charging the straddle band); an integer `spent_usd` from a legacy
+  store no longer crashes the debit path (coerced via `decimal/1`).
 - `quota_status` gains `credit.balance_usd`; budget block notices append the
   host-injected `topup_hint_fun` line when configured. Request-path behavior
   is identical to 0.2.19 (`quota_status` additionally carries an additive

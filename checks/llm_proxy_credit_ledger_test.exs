@@ -68,22 +68,53 @@ check.("repeat call dedups via the mirror seen-set (store's :duplicate branch no
 check.("balance read prefers durable",
   Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("3.00")))
 
-# 3. store down: WRITE fails open to mirror (loudly), READ fails open to mirror
+# 3. (X4) store down: WRITE fails CLOSED — a durable-store-configured write
+# error must NOT apply the mirror, and must release its seen-mark so a later
+# redelivery of the SAME idempotency_key (once the store heals) is still a
+# genuine retry, not a permanently-swallowed duplicate. This is the spec's
+# "credit writes fail CLOSED" ruling, restored after a review flagged the
+# prior fail-open-forever behavior as a lose-payment / double-mint risk (the
+# hub's redelivery after store recovery would have been swallowed as
+# duplicate:true forever, and cross-restart interleavings could double-mint).
 CreditStore.down!(true)
-{:degraded, b3} = Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00"))
-check.("store-down credit still applies to mirror", Decimal.equal?(b3, Decimal.new("5.00")))
-check.("store-down balance read falls back to mirror",
-  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("5.00")))
+result3 = Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00"))
+check.("store-down credit write fails CLOSED", result3 == {:error, :store_unavailable})
+
+check.(
+  "store-down: mirror NOT applied (stays at 3.00, unchanged — no fail-open credit)",
+  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("3.00"))
+)
+
 CreditStore.down!(false)
-check.("store recovers: durable value (3.00) served again — mirror kept the rest",
-  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("3.00")))
+
+check.(
+  "store recovers: redelivery of the SAME key ('d:2') is retryable and now succeeds " <>
+    "(the failed write did NOT permanently consume the idempotency key)",
+  match?({:ok, _}, Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00")))
+)
+
+check.(
+  "post-recovery: durable balance reflects the retried credit (3.00 + 2.00)",
+  Decimal.equal?(CreditStore.entries_balance(bi), Decimal.new("5.00"))
+)
+
+check.(
+  "post-recovery: mirror matches durable (both credited exactly once)",
+  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("5.00"))
+)
+
+check.(
+  "further redelivery of the now-settled key is a TRUE duplicate (the successful " <>
+    "write keeps its seen-mark — only the error path releases it)",
+  Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00")) == :duplicate
+)
 
 # 4. debits are negative entries through the same primitive
 {:ok, b4} = Proxy.apply_credit_entry(pid2, CreditStore,
   %{entry.("d:3", "-1.25") | kind: "debit"})
-check.("debit entry reduces durable balance", Decimal.equal?(CreditStore.entries_balance(bi), Decimal.new("1.75")))
-# Mirror carries the store-down credit (2.00) that never landed durably, so the
-# mirror stays 2.00 ahead of the durable ledger: 5.00 (mirror after step 3) - 1.25 = 3.75.
+check.("debit entry reduces durable balance", Decimal.equal?(CreditStore.entries_balance(bi), Decimal.new("3.75")))
+# Durable and mirror stay in sync now that a store-down credit is never applied
+# to only one side: 5.00 (both, post-recovery) - 1.25 = 3.75.
 check.("debit returns updated mirror balance", Decimal.equal?(b4, Decimal.new("3.75")))
 
 # 5. restart-replay: a FRESH mirror (nothing seen yet) replaying a key the

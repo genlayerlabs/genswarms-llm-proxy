@@ -457,20 +457,23 @@ defmodule Genswarms.LlmProxy do
            Jason.encode!(%{ok: true, credited_usd: money2(credited), balance_usd: money2(balance)}),
            state}
 
-        {:degraded, balance} ->
+        # (X4) Fail CLOSED per spec: the durable write failed and
+        # apply_credit_entry/3 has already released its seen-mark, so this
+        # exact (method, ref) is retryable — NOT applied to the mirror, NOT
+        # permanently consumed. The hub is expected to redeliver.
+        {:error, :store_unavailable} ->
           Logger.error(
-            "llm_proxy: credit entry store write FAILED — credit applied to memory only " <>
-              "(reconcile from the payment source's ledger); key=#{key}"
+            "llm_proxy: credit entry store write FAILED — credit NOT applied (fails " <>
+              "closed per spec; retryable, key not consumed); key=#{key}"
           )
 
           bump_credit_degraded_metric(store_mod)
 
           {:reply,
            Jason.encode!(%{
-             ok: true,
-             degraded: true,
-             credited_usd: money2(credited),
-             balance_usd: money2(balance)
+             ok: false,
+             error: "store_unavailable",
+             retryable: true
            }), state}
       end
     else
@@ -1913,13 +1916,22 @@ defmodule Genswarms.LlmProxy do
   touching the balance. The store's own `{:error, :duplicate}` contract is
   the second layer, for the case where the mirror was reset (restart) but
   the durable ledger already has the key. Recorded durably when the store
-  exports record_llm_credit_entry/1 and is healthy; the mirror balance is
-  applied exactly once for every non-duplicate outcome, including when the
-  store write itself errors (fail open for the user — the upstream payment
-  source holds its own durable record; reconcile host-side; the caller is
-  expected to log/bump a degraded metric on that branch).
+  exports record_llm_credit_entry/1 and is healthy.
 
-  Returns `{:ok, new_mirror_balance}` | `:duplicate` | `{:degraded, new_mirror_balance}`.
+  (X4) Credit writes FAIL CLOSED per spec: when a durable store IS configured
+  (`credit_store_ready?/1`) but `record_llm_credit_entry/1` errors/raises/
+  exits, the mirror is NOT applied and the atomic seen-mark taken above is
+  RELEASED before returning — the failed write must not permanently consume
+  the idempotency key, so a later redelivery of the same key (once the store
+  heals) is a genuine retry, not a swallowed duplicate. Releasing the mark
+  only on the error path (never on success) keeps the concurrency property:
+  concurrent same-key calls still credit at most once (every other racer
+  during the write attempt sees the mark and gets `:duplicate`; only after an
+  error is the key freed for a future attempt to retry). Mirror-only mode (no
+  durable store at all — `:no_store`) is unchanged: fail-open, same as ever,
+  since there is nothing durable to reconcile from.
+
+  Returns `{:ok, new_mirror_balance}` | `:duplicate` | `{:error, :store_unavailable}`.
   """
   def apply_credit_entry(pid \\ @state_name, store_mod, %{idempotency_key: key, budget_identity: bi} = entry) do
     case mirror_mark_credit_seen(pid, bi, key) do
@@ -1938,7 +1950,8 @@ defmodule Genswarms.LlmProxy do
             {:ok, mirror_apply_credit(pid, entry)}
 
           {:error, _reason} ->
-            {:degraded, mirror_apply_credit(pid, entry)}
+            mirror_unmark_credit_seen(pid, bi, key)
+            {:error, :store_unavailable}
         end
     end
   end
@@ -1971,6 +1984,28 @@ defmodule Genswarms.LlmProxy do
       else
         row = %{row | seen: MapSet.put(row.seen, key)}
         {:newly_marked, Map.put(state, :credits, Map.put(credits, budget_identity, row))}
+      end
+    end)
+  end
+
+  # (X4) Release a seen-mark taken by mirror_mark_credit_seen/3 when the durable
+  # write it was guarding subsequently FAILED — the mark is a lock, not a
+  # ledger: it must not survive a write that never actually applied anywhere.
+  # Only the error path in apply_credit_entry/3 calls this; a successful write
+  # (durable :ok, :no_store, or a store-reported :duplicate) keeps its mark, so
+  # a settled key still dedups a true replay. A missing row (already pruned or
+  # never created) is a no-op.
+  defp mirror_unmark_credit_seen(pid, budget_identity, key) do
+    Agent.update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+
+      case Map.get(credits, budget_identity) do
+        nil ->
+          state
+
+        row ->
+          row = %{row | seen: MapSet.delete(row.seen, key)}
+          Map.put(state, :credits, Map.put(credits, budget_identity, row))
       end
     end)
   end
