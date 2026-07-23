@@ -39,6 +39,26 @@
   host-injected `topup_hint_fun` line when configured. Request-path behavior
   is identical to 0.2.19 (`quota_status` additionally carries an additive
   credit block) when none of the new config is set.
+- Fixed: `credits_enabled?/1` (the boot-time derivation of `credits_enabled`
+  from `payments_source`) now treats `payments_source: false` as OFF — it
+  previously fell to a wildcard `true` (neither `nil` nor `""`), the opposite
+  of what setting it to `false` means. ON only for a non-empty binary or an
+  atom that is neither `nil` nor `false`.
+- Fixed: `quota_status`'s `credit.balance_usd` now honors `credits_enabled`
+  too, not just the block gate — a feature-off install shows `"0.00"`
+  WITHOUT ever calling the store's `llm_credit_balance/1` (previously it
+  always read through, potentially displaying a durable balance the block
+  gate ignores entirely).
+- Fixed: `credit_payment/2` and `quota_status/2` now resolve `store_mod` via
+  one shared function (previously opposite precedence between a top-level
+  and a `:quota`-nested `store_mod` — a split-brain risk if a host state ever
+  carried two different values in the two places).
+- Docs: `interface/0`'s `payment_confirmed` example now uses the actual
+  `credit_namespace` default (`"default"`, was the arbitrary `"llm_quota"`)
+  and documents that `namespace` must match the host's configured value.
+  README documents `amount_usd` is STRINGS-ONLY by contract (a JSON number is
+  refused, not accepted with float-precision risk — the hub always sends
+  `Decimal.to_string/1`), pinned by a new check.
 
 ## 0.2.19 — 2026-07-18
 

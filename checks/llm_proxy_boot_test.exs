@@ -121,6 +121,75 @@ check.(
   Genswarms.LlmProxy.terminate(:shutdown, state2) == :ok
 )
 
+# ── (X5a) credits_enabled?/1 strictness: `payments_source: false` must be OFF ──
+# `Map.get(config, :payments_source)` returning `false` is neither `nil` nor `""`,
+# so the pre-fix `case ... do nil -> false; "" -> false; _ -> true end` fell to
+# the wildcard and turned credits ON for an explicit `false` — the opposite of
+# what an operator setting it to `false` means. Only a non-empty binary, or an
+# atom that is neither `nil` nor `false` (an object-name atom source), turns
+# credits on.
+credits_false_config = %{
+  port: boot_port + 1,
+  upstream_endpoint: "https://llm.example/v1/chat/completions",
+  upstream_api_key: "sk-boot-smoke-key",
+  prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
+  payments_source: false
+}
+
+{:ok, state_false} = Genswarms.LlmProxy.init(credits_false_config)
+
+check.(
+  "init/1 with payments_source: false -> credits_enabled false (was true pre-fix)",
+  state_false.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_false)
+
+{:ok, state_atom} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 2, payments_source: :payments})
+
+check.(
+  "init/1 with payments_source as a non-nil/non-false ATOM (object-name source) -> " <>
+    "credits_enabled true",
+  state_atom.credits_enabled == true
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_atom)
+
+{:ok, state_nil} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 3, payments_source: nil})
+
+check.(
+  "init/1 with payments_source: nil -> credits_enabled false (unchanged)",
+  state_nil.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_nil)
+
+{:ok, state_empty} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 4, payments_source: ""})
+
+check.(
+  "init/1 with payments_source: \"\" -> credits_enabled false (unchanged)",
+  state_empty.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_empty)
+
+{:ok, state_string} =
+  Genswarms.LlmProxy.init(%{
+    credits_false_config
+    | port: boot_port + 5,
+      payments_source: "payments"
+  })
+
+check.(
+  "init/1 with payments_source as a non-empty string -> credits_enabled true (unchanged)",
+  state_string.credits_enabled == true
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_string)
+
 # ─────────────────────────────────────────────────────────────────────────────
 failed = Agent.get(failures, & &1)
 IO.puts("")

@@ -39,8 +39,13 @@ funded_identity = Proxy.budget_identity(%{conversation_id: funded_cid, kind: "dm
     meta: %{}
   })
 
+# (X5b) credits_enabled now gates the credit block below — this fixture opts in
+# explicitly (the key was previously dead/unread here) so the "4.00"/"0.00"
+# assertions in this section keep asserting the credit-path-ON behavior they
+# always meant to.
 quota_status_state = %{
   state_pid: state_pid,
+  credits_enabled: true,
   quota: %{
     store_mod: nil,
     default_daily_limit: Decimal.new("0.50"),
@@ -102,6 +107,90 @@ fallback_body = Jason.decode!(fallback_json)
 check.(
   "quota_status fallback (missing conversation_id) also carries a credit block",
   fallback_body["ok"] == false and fallback_body["credit"]["balance_usd"] == "0.00"
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Section 1b (X5b): credits_enabled gates quota_status's credit read entirely.
+# A feature-off install must show "0.00" WITHOUT ever calling the store's
+# llm_credit_balance/1 — probe P5 showed a feature-off install displaying a
+# durable balance the block gate itself ignores (credit_exhausted?/2 already
+# forces `true` off gate; quota_status must agree, not just cosmetically).
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 1b: credits_enabled gates the quota_status credit read]")
+
+defmodule CountingCreditStore do
+  def reset, do: :persistent_term.put({__MODULE__, :calls}, 0)
+  def calls, do: :persistent_term.get({__MODULE__, :calls}, 0)
+
+  def llm_credit_balance(_bi) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    {:ok, Decimal.new("9.99")}
+  end
+
+  def record_llm_credit_entry(_entry), do: :ok
+end
+
+CountingCreditStore.reset()
+gated_cid = "tg:cs-gated:0"
+
+state_credits_off = %{
+  state_pid: state_pid,
+  credits_enabled: false,
+  quota: %{
+    store_mod: CountingCreditStore,
+    default_daily_limit: Decimal.new("0.50"),
+    daily_request_limit: 30,
+    global_daily_limit: Decimal.new("0.30"),
+    clock: fn -> ~U[2026-07-01 10:00:00Z] end
+  }
+}
+
+{:reply, gated_json, _} =
+  Proxy.handle_message(
+    :commands,
+    Jason.encode!(%{
+      action: "quota_status",
+      conversation_id: gated_cid,
+      kind: "dm",
+      workspace_key: "default"
+    }),
+    state_credits_off
+  )
+
+gated_body = Jason.decode!(gated_json)
+
+check.(
+  "credits_enabled false -> quota_status credit block shows \"0.00\" even though the " <>
+    "store holds a real (9.99) balance",
+  gated_body["ok"] == true and gated_body["credit"]["balance_usd"] == "0.00"
+)
+
+check.(
+  "credits_enabled false -> the store's llm_credit_balance/1 is NEVER called (no read at all)",
+  CountingCreditStore.calls() == 0
+)
+
+state_credits_on = %{state_credits_off | credits_enabled: true}
+
+{:reply, on_json, _} =
+  Proxy.handle_message(
+    :commands,
+    Jason.encode!(%{
+      action: "quota_status",
+      conversation_id: gated_cid,
+      kind: "dm",
+      workspace_key: "default"
+    }),
+    state_credits_on
+  )
+
+on_body = Jason.decode!(on_json)
+
+check.(
+  "credits_enabled true -> the SAME identity/store now reads the real durable " <>
+    "balance (9.99), proving the gate flips both ways",
+  on_body["ok"] == true and on_body["credit"]["balance_usd"] == "9.99" and
+    CountingCreditStore.calls() == 1
 )
 
 # ────────────────────────────────────────────────────────────────────────────

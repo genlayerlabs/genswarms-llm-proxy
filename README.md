@@ -99,13 +99,17 @@ down a per-identity prepaid credit balance instead of blocking outright —
 config:
 
 - `payments_source` — the trusted object name allowed to send
-  `{"action":"payment_confirmed"}`. `nil`/`""` (default) keeps the whole
-  feature off; any other sender is logged and ignored. `credits_enabled` is
-  derived from this one setting (present and non-empty ⇒ on) and threaded to
-  both sides: the plug-side block gate (`credit_exhausted?/2`) and debit
-  chokepoint (`maybe_debit_credit/4`), and the object-side message handler.
-  With it off, the credit path is a true no-op — the block gate never reads
-  a balance (byte-identical to 0.2.19 blocking) and a straddling call never
+  `{"action":"payment_confirmed"}`. `nil`/`""`/`false` (default: `nil`) keeps
+  the whole feature off; any other sender is logged and ignored.
+  `credits_enabled` is derived from this one setting — on for a non-empty
+  binary, or an atom that is neither `nil` nor `false` (an object-name atom
+  source); off otherwise, including the explicit `false` case — and threaded
+  everywhere the feature gate matters: the plug-side block gate
+  (`credit_exhausted?/2`) and debit chokepoint (`maybe_debit_credit/4`), the
+  object-side message handler, AND `quota_status`'s `credit.balance_usd`
+  (which reads `"0.00"` without ever consulting the store when off). With it
+  off, the credit path is a true no-op — the block gate never reads a
+  balance (byte-identical to 0.2.19 blocking) and a straddling call never
   debits the mirror, so a feature enabled later never retro-charges overage
   accrued while it was off.
 - `credit_namespace` (default `"default"`) — a confirmation for a different
@@ -119,9 +123,14 @@ config:
   raising, or non-binary → no hint, never crashes the block path.
 
 `payment_confirmed` is trusted-source **and** namespace gated; the required
-fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` must
-parse as a *finite* `Decimal` (`"NaN"`/`"Infinity"`/`"-Infinity"` are all
-refused, not just non-numeric strings) and be `> 0`, and `method`/`ref` are
+fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` is
+**STRINGS-ONLY by contract** — it must be a JSON *string* that parses as a
+*finite* `Decimal` (`"NaN"`/`"Infinity"`/`"-Infinity"` are all refused, not
+just non-numeric strings) and is `> 0`. A JSON *number* (e.g. `5.0`, unquoted)
+is refused too, deliberately: `parse_money/1` only matches `is_binary/1`, so
+`amount_usd` arriving as a number is `bad_payment_confirmed`, not a silent
+float-precision hazard — the hub sends `Decimal.to_string/1`, never a raw
+number, and this contract is enforced rather than assumed. `method`/`ref` are
 both required non-empty strings — the idempotency key is `"<method>:<ref>"`,
 so a re-delivered confirmation credits the balance once. Replies
 `{"ok":true}` (first credit), `{"ok":true,"duplicate":true}` (replay), or

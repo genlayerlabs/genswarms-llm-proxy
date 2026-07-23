@@ -338,17 +338,23 @@ defmodule Genswarms.LlmProxy do
      }}
   end
 
-  # (B2) credits_enabled? = payments_source configured and non-empty. Derived
-  # once, at boot, from the same config read that feeds payments_source on
-  # both the plug_opts (credit_exhausted?/maybe_debit_credit) and the
-  # object-side state (handle_payment_confirmed) — a host that never sets
-  # payments_source gets the feature off on both sides, with no retro-charge
-  # if it's turned on later (see maybe_debit_credit/4).
+  # (B2, X5a) credits_enabled? = payments_source configured and non-empty.
+  # Derived once, at boot, from the same config read that feeds
+  # payments_source on both the plug_opts (credit_exhausted?/
+  # maybe_debit_credit) and the object-side state (handle_payment_confirmed)
+  # — a host that never sets payments_source gets the feature off on both
+  # sides, with no retro-charge if it's turned on later (see
+  # maybe_debit_credit/4). ON only for a non-empty binary (the common case —
+  # an object name string) or an atom that is neither `nil` nor `false` (a
+  # source given as an atom, e.g. an object-name atom): `payments_source:
+  # false` must be OFF everywhere — the prior wildcard `_ -> true` treated an
+  # explicit `false` as "on" (it is neither `nil` nor `""`), the opposite of
+  # what setting it to `false` means.
   defp credits_enabled?(config) do
     case Map.get(config, :payments_source) do
-      nil -> false
-      "" -> false
-      _ -> true
+      v when is_binary(v) and v != "" -> true
+      v when is_atom(v) and v not in [nil, false] -> true
+      _ -> false
     end
   end
 
@@ -365,10 +371,22 @@ defmodule Genswarms.LlmProxy do
         output: "read-only per-identity request quota, spend, and global cap status"
       },
       payment_confirmed: %{
+        # (X5d) namespace here is "default" — the actual credit_namespace default
+        # (see init/1's `credit_namespace: Map.get(config, :credit_namespace,
+        # "default")`), not an arbitrary example value. This MUST match whatever
+        # `credit_namespace` the host actually configures — a confirmation whose
+        # "namespace" differs from the configured value is silently ignored
+        # (see handle_payment_confirmed/3), so a hub copying this example
+        # verbatim against a host that overrides credit_namespace would have
+        # every payment silently dropped.
         input:
-          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"card","ref":"txn_0","namespace":"llm_quota"}),
+          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"card","ref":"txn_0","namespace":"default"}),
         output:
-          "credits the beneficiary's prepaid balance once per (method, ref) — only from the configured payments_source, only for the configured credit_namespace"
+          "credits the beneficiary's prepaid balance once per (method, ref) — only from the configured payments_source, only for the configured credit_namespace",
+        note:
+          "\"namespace\" must equal the host's configured credit_namespace (default " <>
+            "\"default\") — a mismatched namespace is silently ignored, not an error. " <>
+            "\"amount_usd\" is a STRING by contract, never a JSON number (see README)."
       }
     }
   end
@@ -391,6 +409,28 @@ defmodule Genswarms.LlmProxy do
       _ ->
         {:noreply, state}
     end
+  end
+
+  # (X5c) Single store_mod resolution point shared by credit_payment/2 and
+  # quota_status/2 — both tolerate the same two host state shapes (a
+  # top-level :store_mod, test/mm lineage; one nested under :quota, the
+  # production init/1 assembly path), but previously resolved them in
+  # OPPOSITE directions: credit_payment/2 took the top-level key first
+  # (falling back to the nested one only when the top-level was nil/false),
+  # while quota_status/2 takes the nested key first via `Map.put_new`
+  # (falling back to top-level only when :quota carries no :store_mod key at
+  # all) — a split-brain risk if a host ever assembled state with two
+  # different store_mod values in the two places (credits would durably
+  # write through one store while quota_status's dashboard reads the other).
+  # This is quota_status/2's existing direction — nested wins whenever
+  # present, matching the "production init/1 assembly path nests it" comment
+  # above; picked here rather than top-level-first because init/1 is the
+  # shape every real boot actually produces.
+  defp resolve_store_mod(state) do
+    state
+    |> Map.get(:quota, %{})
+    |> Map.put_new(:store_mod, Map.get(state, :store_mod))
+    |> Map.get(:store_mod)
   end
 
   # Payment-agnostic credit top-up. Trust = the configured payments_source
@@ -443,10 +483,8 @@ defmodule Genswarms.LlmProxy do
       }
 
       state_pid = Map.get(state, :state_pid, @state_name)
-      # Tolerate both host state shapes (see quota_status/2): a top-level
-      # :store_mod (test/mm lineage) or one nested under :quota (the
-      # production init/1 assembly path).
-      store_mod = Map.get(state, :store_mod) || get_in(state, [:quota, :store_mod])
+      # (X5c) Same resolver quota_status/2 uses — see resolve_store_mod/1.
+      store_mod = resolve_store_mod(state)
 
       case apply_credit_entry(state_pid, store_mod, entry) do
         :duplicate ->
@@ -881,10 +919,12 @@ defmodule Genswarms.LlmProxy do
     # Tolerate both host state shapes: everything under :quota (wingston lineage)
     # or store_mod/default_daily_limit at the top level with a *_usd global key
     # (mm lineage). The message may pin an explicit "day" (ISO) — mm's commands do.
+    # (X5c) :store_mod specifically goes through resolve_store_mod/1 — the same
+    # resolution credit_payment/2 now uses.
     quota =
       state
       |> Map.get(:quota, %{})
-      |> Map.put_new(:store_mod, Map.get(state, :store_mod))
+      |> Map.put(:store_mod, resolve_store_mod(state))
       |> Map.put_new(
         :default_daily_limit,
         Map.get(state, :default_daily_limit, @default_daily_limit)
@@ -923,6 +963,18 @@ defmodule Genswarms.LlmProxy do
     request_limit = request_limit(Map.get(quota, :daily_request_limit, 0))
     requests_used = max(int(Map.get(usage, :requests, 0)), 0)
 
+    # (X5b) credits_enabled gates the credit read here too, not just the plug's
+    # block gate (credit_exhausted?/2): a feature-off install must show "0.00"
+    # WITHOUT ever consulting the store — probe P5 showed a feature-off install
+    # displaying a durable balance the block gate ignores entirely. credit_balance/3
+    # (and therefore store_mod.llm_credit_balance/1) is only called when on.
+    credit_balance_usd =
+      if Map.get(state, :credits_enabled, false) do
+        money2(credit_balance(state_pid, Map.get(quota, :store_mod), budget_identity))
+      else
+        money2(Decimal.new("0"))
+      end
+
     %{
       action: "quota_status",
       ok: true,
@@ -950,9 +1002,7 @@ defmodule Genswarms.LlmProxy do
         limit_usd: money(global_limit),
         pct: pct_decimal(global_used, global_limit)
       },
-      credit: %{
-        balance_usd: money2(credit_balance(state_pid, Map.get(quota, :store_mod), budget_identity))
-      },
+      credit: %{balance_usd: credit_balance_usd},
       # mm vocabulary: the same numbers nested under "quota" with 2dp money strings
       # and a human reset stamp — both host lineages' consumers keep working.
       quota: %{

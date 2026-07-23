@@ -216,6 +216,34 @@ check.(
   Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
 )
 
+# 13b. (X5d) amount_usd is STRINGS-ONLY by contract — a JSON *number* (not a
+# quoted string) must be refused, pinning the deliberate parse_money/1
+# is_binary/1 gate documented in the README (the hub always sends
+# Decimal.to_string/1; a numeric amount_usd is never legitimate wire traffic).
+{:reply, json_numeric, _} =
+  Proxy.handle_message(
+    "payments",
+    Jason.encode!(%{
+      "action" => "payment_confirmed",
+      "beneficiary" => bi,
+      "amount_usd" => 5.0,
+      "method" => "usdc_base",
+      "ref" => "0xT:numeric",
+      "namespace" => "llm_quota"
+    }),
+    state
+  )
+
+check.(
+  "numeric amount_usd (5.0, not a quoted string) is refused per contract",
+  Jason.decode!(json_numeric)["ok"] == false
+)
+
+check.(
+  "numeric amount_usd never touched the balance",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
 # 14. (X4) degraded-path check THROUGH handle_message: the approved spec's
 # "credit writes fail CLOSED" governs — a store whose record_llm_credit_entry/1
 # errors (e.g. db_down) but whose llm_credit_balance/1 works (the store exports
