@@ -13,6 +13,17 @@
   the raise escape uncaught on the compact route. Self-converging when the
   nonconforming write actually landed: the hub's retry hits the store's own
   uniqueness and settles as `{:error, :duplicate}` exactly once.
+- Fixed (review R3-M2): `topup_hint_fun` is now gated on the same strict
+  `credits_enabled` derivation as every other credit surface — with credits
+  off the object silently drops every `payment_confirmed`, so the hint would
+  have pointed a blocked user at a payment path that cannot credit them. Off
+  → no hint (fun not even called), byte-identical 0.2.19 notice.
+- Fixed (review R3-M1): `method` containing `":"` is refused
+  (`bad_payment_confirmed`) — the idempotency key is the plain
+  `"<method>:<ref>"` join with global uniqueness, so a colon in `method` made
+  it ambiguous: `("a", "b:c")` and `("a:b", "c")` minted the same key and the
+  second, legitimately distinct, payment was permanently swallowed as
+  `duplicate:true`. `ref` keeps colons freely (tx hashes).
 
 - Fixed (review I1): a credit DEBIT whose durable write fails during a store
   outage is no longer lost silently — the request stays served (budget-side

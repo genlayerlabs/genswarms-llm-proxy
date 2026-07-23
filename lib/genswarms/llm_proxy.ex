@@ -516,6 +516,15 @@ defmodule Genswarms.LlmProxy do
          beneficiary when is_binary(beneficiary) and beneficiary != "" <-
            Map.get(msg, "beneficiary"),
          method when is_binary(method) and method != "" <- Map.get(msg, "method"),
+         # (R3-M1) The idempotency key below is the plain join
+         # "#{method}:#{ref}" with GLOBAL uniqueness on the joined string, so
+         # a colon inside `method` makes the join ambiguous: ("a", "b:c") and
+         # ("a:b", "c") would mint the SAME key "a:b:c" and the second —
+         # legitimately distinct — payment would be permanently swallowed as
+         # duplicate:true. Rejecting ":" in `method` (ref may contain colons
+         # freely, e.g. tx hashes "0xT:0") makes the join unambiguous: the
+         # separator can never occur in the left component.
+         false <- String.contains?(method, ":"),
          ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref") do
       per_usd = decimal(Map.get(state, :credit_per_usd, Decimal.new("1.0")))
       credited = Decimal.mult(amount, per_usd)
@@ -4013,7 +4022,8 @@ defmodule Genswarms.LlmProxy.Plug do
   # Exposed @doc false so the credit-surfaces check can drive the hint-append
   # logic directly (like bump_metric). Base text is byte-identical to 0.2.19;
   # the hint (from opts.topup_hint_fun, see init/1) is appended on its own
-  # line only when present, non-empty, and the fun doesn't raise.
+  # line only when credits_enabled is true (R3-M2), the fun is present, its
+  # result non-empty, and the fun doesn't raise.
   @doc false
   def budget_notice(request_ctx, _budget, opts, session) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
@@ -4025,7 +4035,19 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
+  # (R3-M2) Gated on the SAME strict credits_enabled derivation as every
+  # other credit surface (block gate, debit chokepoint, handler,
+  # quota_status): with credits off, this object silently drops every
+  # payment_confirmed, so rendering the hint would point a blocked user at a
+  # payment path that cannot credit them. Off (or key absent) -> no hint,
+  # byte-identical to 0.2.19 regardless of a configured fun.
   defp topup_hint(opts, session) do
+    if Map.get(opts, :credits_enabled, false) do
+      do_topup_hint(opts, session)
+    end
+  end
+
+  defp do_topup_hint(opts, session) do
     case Map.get(opts, :topup_hint_fun) do
       fun when is_function(fun, 1) ->
         try do

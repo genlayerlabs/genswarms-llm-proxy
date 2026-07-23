@@ -203,43 +203,74 @@ session = %{budget_identity: "bid-xyz"}
 
 base_text = "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (2026-07-02)."
 
+# (R3-M2) The hint is gated on the same strict credits_enabled derivation as
+# every other credit surface — the ON cases below opt in explicitly, and a
+# dedicated OFF case pins that a configured fun renders NO hint while credits
+# are off (a blocked user must not be pointed at a payment path this object
+# would silently drop).
+on = fn extra -> Map.put(extra, :credits_enabled, true) end
+
 check.(
   "topup_hint_fun absent from opts -> byte-identical to the 0.2.19 base text",
-  ProxyPlug.budget_notice(request_ctx, nil, %{}, session) == base_text
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{}), session) == base_text
 )
 
 check.(
   "topup_hint_fun: nil -> byte-identical to the 0.2.19 base text",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: nil}, session) == base_text
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: nil}), session) == base_text
 )
 
 hint_fun = fn bi -> "Top up: send USDC to 0xABC (" <> bi <> ")" end
 
 check.(
-  "topup_hint_fun returning a string -> notice ends with the hint on its own line, base unchanged before it",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: hint_fun}, session) ==
+  "credits on + topup_hint_fun returning a string -> notice ends with the hint on its own line, base unchanged before it",
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: hint_fun}), session) ==
     base_text <> "\n" <> "Top up: send USDC to 0xABC (bid-xyz)"
 )
 
 check.(
+  "(R3-M2) credits OFF + topup_hint_fun configured -> NO hint, byte-identical base text " <>
+    "(the hint would point at a payment path that drops every payment_confirmed)",
+  ProxyPlug.budget_notice(
+    request_ctx,
+    nil,
+    %{credits_enabled: false, topup_hint_fun: hint_fun},
+    session
+  ) == base_text
+)
+
+{:ok, hint_calls} = Agent.start_link(fn -> 0 end)
+counting_hint_fun = fn bi ->
+  Agent.update(hint_calls, &(&1 + 1))
+  hint_fun.(bi)
+end
+
+check.(
+  "(R3-M2) opts missing :credits_enabled entirely (feature-off install) -> NO hint, " <>
+    "and the fun is never even called",
+  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: counting_hint_fun}, session) ==
+    base_text and Agent.get(hint_calls, & &1) == 0
+)
+
+check.(
   "topup_hint_fun returning nil -> byte-identical to the 0.2.19 base text",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: fn _bi -> nil end}, session) == base_text
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: fn _bi -> nil end}), session) == base_text
 )
 
 check.(
   "topup_hint_fun returning an empty string -> byte-identical to the 0.2.19 base text (not appended)",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: fn _bi -> "" end}, session) == base_text
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: fn _bi -> "" end}), session) == base_text
 )
 
 check.(
   "topup_hint_fun RAISES -> falls back to the base text, never crashes the block path",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: fn _bi -> raise "boom" end}, session) ==
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: fn _bi -> raise "boom" end}), session) ==
     base_text
 )
 
 check.(
   "topup_hint_fun returning a non-binary -> byte-identical to the 0.2.19 base text (defensive)",
-  ProxyPlug.budget_notice(request_ctx, nil, %{topup_hint_fun: fn _bi -> 123 end}, session) == base_text
+  ProxyPlug.budget_notice(request_ctx, nil, on.(%{topup_hint_fun: fn _bi -> 123 end}), session) == base_text
 )
 
 failed = Agent.get(failures, & &1)

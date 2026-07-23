@@ -331,6 +331,44 @@ check.(
   ) and Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("4.00"))
 )
 
+# 13d2. (R3-M1) method containing ":" is refused: the idempotency key is the
+# plain join "method:ref" with GLOBAL uniqueness, so ("a", "b:c") and
+# ("a:b", "c") would mint the SAME key "a:b:c" — the second, legitimately
+# distinct, payment would be permanently swallowed as duplicate:true.
+# Rejecting the separator in `method` (ref keeps colons freely — tx hashes)
+# makes the join unambiguous.
+{:reply, json_collide_a, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"method" => "a", "ref" => "b:c", "beneficiary" => "w:collide|k:dm|c:tg:7:0"}),
+    state
+  )
+
+{:reply, json_collide_b, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"method" => "a:b", "ref" => "c", "beneficiary" => "w:collide|k:dm|c:tg:7:0"}),
+    state
+  )
+
+reply_collide_a = Jason.decode!(json_collide_a)
+reply_collide_b = Jason.decode!(json_collide_b)
+
+check.(
+  "collision-shaped pair: (\"a\", \"b:c\") credits normally (ref may contain colons)",
+  reply_collide_a["ok"] == true and reply_collide_a["credited_usd"] == "5.00"
+)
+
+check.(
+  "collision-shaped pair: (\"a:b\", \"c\") is REFUSED (colon in method), never " <>
+    "swallowed as duplicate of the first — distinct outcomes, no key collision",
+  reply_collide_b["ok"] == false and reply_collide_b["duplicate"] != true and
+    Decimal.equal?(
+      Proxy.credit_balance(pid, nil, "w:collide|k:dm|c:tg:7:0"),
+      Decimal.new("5.00")
+    )
+)
+
 # 13e. (M5b) credit_namespace configured as an ATOM (e.g. keyword/IR config)
 # must match the JSON-decoded binary namespace — the compare is to_string/1
 # normalized on both sides, same as the source compare. A non-scalar JSON

@@ -125,7 +125,11 @@ config:
 - `topup_hint_fun` — optional 1-arity fun (`budget_identity -> String.t() |
   nil`), plug opt only (not top-level config). A non-empty, non-raising
   result is appended as an extra line on a `:budget` block notice; absent,
-  raising, or non-binary → no hint, never crashes the block path.
+  raising, or non-binary → no hint, never crashes the block path. Rendered
+  **only while `credits_enabled` is on** (same strict derivation as every
+  other credit surface): with credits off this object silently drops every
+  `payment_confirmed`, so the hint would point a blocked user at a payment
+  path that cannot credit them — the fun is not even called.
 
 `payment_confirmed` is trusted-source **and** namespace gated; the required
 fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` is
@@ -140,7 +144,13 @@ strings only**: scientific/exponent notation (`"5e2"`, `"1E+2"`) is rejected
 even though it parses as a finite `Decimal` — an exponent amount is far more
 likely malformed than a legitimate top-up. `method`/`ref` are
 both required non-empty strings — the idempotency key is `"<method>:<ref>"`,
-so a re-delivered confirmation credits the balance once. `method` may not be
+so a re-delivered confirmation credits the balance once. `method` **may not
+contain `":"`** (refused as `bad_payment_confirmed`): the key is the plain
+join with global uniqueness on the joined string, so a colon inside `method`
+would make it ambiguous — `("a", "b:c")` and `("a:b", "c")` would mint the
+same key `"a:b:c"` and the second, legitimately distinct, payment would be
+permanently swallowed as `duplicate:true`. `ref` may contain colons freely
+(tx hashes do). `method` may also not be
 the literal string `"debit"` (refused with
 `{"ok":false,"error":"reserved_method"}`, non-retryable): `"debit:" <>
 request_id` is the ledger's reserved internal keyspace for spend debits, and
