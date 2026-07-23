@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-07-23
 
 - Fixed (review R3-I1): a NONCONFORMING `record_llm_credit_entry/1` return
   VALUE (e.g. an adapter forwarding `Repo.insert/1`'s `{:ok, struct}`) no
