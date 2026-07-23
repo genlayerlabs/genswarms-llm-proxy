@@ -121,6 +121,133 @@ check.(
   Genswarms.LlmProxy.terminate(:shutdown, state2) == :ok
 )
 
+# ── (X5a) credits_enabled?/1 strictness: `payments_source: false` must be OFF ──
+# `Map.get(config, :payments_source)` returning `false` is neither `nil` nor `""`,
+# so the pre-fix `case ... do nil -> false; "" -> false; _ -> true end` fell to
+# the wildcard and turned credits ON for an explicit `false` — the opposite of
+# what an operator setting it to `false` means. Only a non-empty binary, or an
+# atom that is neither `nil` nor `false` (an object-name atom source), turns
+# credits on.
+credits_false_config = %{
+  port: boot_port + 1,
+  upstream_endpoint: "https://llm.example/v1/chat/completions",
+  upstream_api_key: "sk-boot-smoke-key",
+  prices: %{prompt_per_mtok: "0.28", completion_per_mtok: "0.42"},
+  payments_source: false
+}
+
+{:ok, state_false} = Genswarms.LlmProxy.init(credits_false_config)
+
+check.(
+  "init/1 with payments_source: false -> credits_enabled false (was true pre-fix)",
+  state_false.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_false)
+
+{:ok, state_atom} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 2, payments_source: :payments})
+
+check.(
+  "init/1 with payments_source as a non-nil/non-false ATOM (object-name source) -> " <>
+    "credits_enabled true",
+  state_atom.credits_enabled == true
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_atom)
+
+{:ok, state_nil} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 3, payments_source: nil})
+
+check.(
+  "init/1 with payments_source: nil -> credits_enabled false (unchanged)",
+  state_nil.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_nil)
+
+{:ok, state_empty} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 4, payments_source: ""})
+
+check.(
+  "init/1 with payments_source: \"\" -> credits_enabled false (unchanged)",
+  state_empty.credits_enabled == false
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_empty)
+
+{:ok, state_string} =
+  Genswarms.LlmProxy.init(%{
+    credits_false_config
+    | port: boot_port + 5,
+      payments_source: "payments"
+  })
+
+check.(
+  "init/1 with payments_source as a non-empty string -> credits_enabled true (unchanged)",
+  state_string.credits_enabled == true
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_string)
+
+# ── (M3) credit_per_usd boot validation: garbage must refuse to boot ─────────
+# The tolerant decimal/1 maps unparseable strings to Decimal 0, so a typo'd
+# credit_per_usd would otherwise ack every payment ok:true credited_usd:"0.00"
+# — accepted, discarded, and never retried (the hub correctly trusts an ack).
+# Same stance as validate_pricing_config!/3: config this wrong is a boot
+# error, not a silent runtime zero.
+for {label, bad} <- [
+      {"comma-decimal \"1,0\"", "1,0"},
+      {"unparseable \"abc\"", "abc"},
+      {"zero \"0\"", "0"},
+      {"negative \"-1.0\"", "-1.0"},
+      {"non-finite \"Infinity\"", "Infinity"}
+    ] do
+  raised =
+    try do
+      Genswarms.LlmProxy.init(%{
+        credits_false_config
+        | port: boot_port + 6,
+          payments_source: "payments"
+      }
+      |> Map.put(:credit_per_usd, bad))
+
+      :no_raise
+    rescue
+      _e in ArgumentError -> :raised
+    end
+
+  check.(
+    "init/1 with credit_per_usd #{label} refuses to boot (ArgumentError)",
+    raised == :raised
+  )
+end
+
+{:ok, state_per_usd} =
+  Genswarms.LlmProxy.init(
+    %{credits_false_config | port: boot_port + 7, payments_source: "payments"}
+    |> Map.put(:credit_per_usd, "2.0")
+  )
+
+check.(
+  "init/1 with a valid credit_per_usd \"2.0\" boots and stores the parsed Decimal",
+  Decimal.equal?(state_per_usd.credit_per_usd, Decimal.new("2.0"))
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_per_usd)
+
+# The untouched default "1.0" still boots (prime invariant: no credit config ->
+# no behavior change).
+{:ok, state_default_per_usd} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 8})
+
+check.(
+  "init/1 without credit_per_usd keeps booting on the default \"1.0\"",
+  Decimal.equal?(state_default_per_usd.credit_per_usd, Decimal.new("1.0"))
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_default_per_usd)
+
 # ─────────────────────────────────────────────────────────────────────────────
 failed = Agent.get(failures, & &1)
 IO.puts("")

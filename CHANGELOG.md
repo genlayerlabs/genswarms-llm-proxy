@@ -1,5 +1,117 @@
 # Changelog
 
+## 0.3.0 — 2026-07-23
+
+- Fixed (review R3-I1): a NONCONFORMING `record_llm_credit_entry/1` return
+  VALUE (e.g. an adapter forwarding `Repo.insert/1`'s `{:ok, struct}`) no
+  longer raises `CaseClauseError` out of `apply_credit_entry/3` — it is now
+  treated exactly like a failed write (warning naming the shape, seen-mark
+  released, `{:error, :store_unavailable}`). Pre-fix consequences: the top-up
+  path leaked the idempotency seen-mark forever (redelivery acked
+  `duplicate:true` while the balance was never applied — a success-shaped
+  lost payment) and the debit path 502'd an already-billed chat call / let
+  the raise escape uncaught on the compact route. Self-converging when the
+  nonconforming write actually landed: the hub's retry hits the store's own
+  uniqueness and settles as `{:error, :duplicate}` exactly once.
+- Fixed (review R3-M2): `topup_hint_fun` is now gated on the same strict
+  `credits_enabled` derivation as every other credit surface — with credits
+  off the object silently drops every `payment_confirmed`, so the hint would
+  have pointed a blocked user at a payment path that cannot credit them. Off
+  → no hint (fun not even called), byte-identical 0.2.19 notice.
+- Fixed (review R3-M1): `method` containing `":"` is refused
+  (`bad_payment_confirmed`) — the idempotency key is the plain
+  `"<method>:<ref>"` join with global uniqueness, so a colon in `method` made
+  it ambiguous: `("a", "b:c")` and `("a:b", "c")` minted the same key and the
+  second, legitimately distinct, payment was permanently swallowed as
+  `duplicate:true`. `ref` keeps colons freely (tx hashes).
+- Docs (review R3-M4): known limitation — the credit mirror starts cold on
+  restart, so a durable READ outage immediately after a restart blocks a
+  paying user (gate sees 0) until the store read heals; free daily-budget
+  calls are unaffected.
+
+- Fixed (review I1): a credit DEBIT whose durable write fails during a store
+  outage is no longer lost silently — the request stays served (budget-side
+  accounting fails open by design), but the proxy now logs a warning, bumps
+  `llm_proxy_budget_degraded`, and applies the debit to the in-memory mirror
+  so the fail-open balance stays the conservative lower figure until the
+  store heals (balance reads are durable-first, so the healed ledger shadows
+  the mirror — no double-count; the durable-side outage under-charge is a
+  documented rider in the README fail policy).
+- Fixed (review I2): a nonconforming store budget row with `limit_usd: nil`
+  no longer makes the gate and the debit disagree — `normalize_debit_budget/1`
+  now falls back to the exact same module default the gate (`exhausted?/1`)
+  uses, instead of the session/opts chain (which could under- or
+  double-charge the straddle band).
+- Hardening: `payment_confirmed` is now gated on the same strict
+  `credits_enabled` derivation as the plug side (`payments_source: false` +
+  a sender literally named `"false"` can no longer mint a mirror balance);
+  the namespace compare is `to_string/1`-normalized on both sides (an atom
+  `credit_namespace` config no longer silently drops every payment);
+  `method: "debit"` is refused as `reserved_method` (non-retryable — it would
+  collide with the ledger's internal `"debit:<request_id>"` keyspace);
+  exponent-notation `amount_usd` (`"5e2"`) is rejected — plain decimal
+  strings only; and a non-parseable/non-finite/non-positive `credit_per_usd`
+  now refuses to boot with `ArgumentError` instead of silently zeroing every
+  payment.
+
+- Prepaid credit ledger: free daily budget spends first; once exhausted, calls
+  draw down a per-budget-identity credit balance (durable via two new OPTIONAL
+  Store callbacks `llm_credit_balance/1` + `record_llm_credit_entry/1`;
+  in-memory mirror otherwise). The two are both-callbacks-or-neither: a store
+  exporting only one of them is treated as fully absent for the credit path
+  and falls back to the mirror for both read and write (a paying user must
+  never be told `ok` while the gate keeps reading a stale durable 0). Only
+  the overflow portion of a straddling call is debited; the final
+  credit-funded call may drive the balance slightly negative (post-hoc
+  costs). The global daily ceiling still bounds ALL spend.
+- The whole credit path is feature-gated on `credits_enabled` (derived from
+  `payments_source` being configured and non-empty; default off): with it
+  off, the block gate never consults a credit balance and a straddling call
+  never debits the mirror — a feature-off install cannot accrue a negative
+  mirror balance that a later payments rollout would retro-charge.
+- `payment_confirmed` top-ups: trusted-source + namespace gated
+  (`payments_source`, `credit_namespace`, `credit_per_usd` config), rejects
+  non-positive AND non-finite `amount_usd` (`"NaN"`/`"Infinity"`/`"-Infinity"`
+  — `Decimal.parse/1` accepts all three; unrejected, `"NaN"` would raise past
+  the `> 0` guard and `"Infinity"` would mint an unbounded balance) and
+  confirmations missing `method`/`ref`, and is idempotent on `method:ref` — a
+  re-delivered confirmation credits once (replies `ok` or `duplicate`; a
+  durable-store write failure fails CLOSED — `ok:false,
+  error:"store_unavailable", retryable:true`, credit NOT applied, idempotency
+  key NOT consumed, so a later redelivery of the same `method:ref` succeeds
+  once the store heals). Payment-agnostic: any settlement hub or operator
+  tool can be the source.
+- Fixed: `maybe_debit_credit`'s overflow limit now matches whatever
+  `budget.limit_usd` the block gate itself consulted (a store-row-pinned
+  limit differing from `session.daily_limit_usd`/`default_daily_limit`
+  previously let the gate and the debit disagree — double-charging or
+  under-charging the straddle band); an integer `spent_usd` from a legacy
+  store no longer crashes the debit path (coerced via `decimal/1`).
+- `quota_status` gains `credit.balance_usd`; budget block notices append the
+  host-injected `topup_hint_fun` line when configured. Request-path behavior
+  is identical to 0.2.19 (`quota_status` additionally carries an additive
+  credit block) when none of the new config is set.
+- Fixed: `credits_enabled?/1` (the boot-time derivation of `credits_enabled`
+  from `payments_source`) now treats `payments_source: false` as OFF — it
+  previously fell to a wildcard `true` (neither `nil` nor `""`), the opposite
+  of what setting it to `false` means. ON only for a non-empty binary or an
+  atom that is neither `nil` nor `false`.
+- Fixed: `quota_status`'s `credit.balance_usd` now honors `credits_enabled`
+  too, not just the block gate — a feature-off install shows `"0.00"`
+  WITHOUT ever calling the store's `llm_credit_balance/1` (previously it
+  always read through, potentially displaying a durable balance the block
+  gate ignores entirely).
+- Fixed: `credit_payment/2` and `quota_status/2` now resolve `store_mod` via
+  one shared function (previously opposite precedence between a top-level
+  and a `:quota`-nested `store_mod` — a split-brain risk if a host state ever
+  carried two different values in the two places).
+- Docs: `interface/0`'s `payment_confirmed` example now uses the actual
+  `credit_namespace` default (`"default"`, was the arbitrary `"llm_quota"`)
+  and documents that `namespace` must match the host's configured value.
+  README documents `amount_usd` is STRINGS-ONLY by contract (a JSON number is
+  refused, not accepted with float-precision risk — the hub always sends
+  `Decimal.to_string/1`), pinned by a new check.
+
 ## 0.2.19 — 2026-07-18
 
 - **Truthful block content**: the synthetic 200 completion returned on a

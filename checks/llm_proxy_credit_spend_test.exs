@@ -1,0 +1,726 @@
+# Spend order (Task 3): credits unlock the block, straddle debits at the chokepoint.
+# Drives the pure money-semantics helpers directly — no server, no Plug.Test conn — the
+# same idiom as llm_proxy_two_spends_test.exs / llm_proxy_global_ceiling_test.exs.
+# Standalone — NO Postgres, NO network.   mix run checks/llm_proxy_credit_spend_test.exs
+
+alias Genswarms.LlmProxy, as: Proxy
+alias Genswarms.LlmProxy.Plug, as: ProxyPlug
+
+{:ok, failures} = Agent.start_link(fn -> [] end)
+
+check = fn label, ok ->
+  if ok do
+    IO.puts("  ok   #{label}")
+  else
+    IO.puts("  FAIL #{label}")
+    Agent.update(failures, &[label | &1])
+  end
+end
+
+d = fn s -> Decimal.new(s) end
+eq = fn a, b -> Decimal.equal?(a, b) end
+
+# A store implementing record_llm_call/4 so record_budget_call never falls onto the
+# store-down (nil store_row) branch — keeps every case below free of unrelated
+# Logger/emit_display/conversation_id plumbing.
+defmodule SpendCheckStore do
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+end
+
+{:ok, pid} = Proxy.start_state_link()
+
+opts = %{
+  state_pid: pid,
+  store_mod: SpendCheckStore,
+  default_daily_limit: Decimal.new("0.50"),
+  # (B2) credits are feature-gated on payments_source config being present;
+  # this check exercises the credit-funded flow throughout, so it opts in
+  # explicitly rather than relying on any particular default.
+  credits_enabled: true
+}
+
+session = fn bi, limit -> %{budget_identity: bi, daily_limit_usd: limit} end
+req_ctx = %{day: ~D[2026-07-22], session_id: "sess-credit-spend"}
+
+credit! = fn bi, key, amount ->
+  {:ok, _bal} =
+    Proxy.apply_credit_entry(pid, SpendCheckStore, %{
+      idempotency_key: key,
+      budget_identity: bi,
+      amount_usd: d.(amount),
+      kind: "credit",
+      at: ~U[2026-07-22 10:00:00Z],
+      meta: %{}
+    })
+end
+
+balance = fn bi -> Proxy.credit_balance(pid, SpendCheckStore, bi) end
+
+record = fn request_id, cost ->
+  base = %{request_id: request_id, model: "m", status: "ok"}
+  if is_nil(cost), do: base, else: Map.put(base, :cost_usd, cost)
+end
+
+# ── A. credit_exhausted?/2 ───────────────────────────────────────────────────────────
+credit!.("bi-a-pos", "a:pos", "5.00")
+
+check.(
+  "A: credit_exhausted? false while balance > 0",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-a-pos", d.("0.50"))) == false
+)
+
+check.(
+  "A: credit_exhausted? true when no credits ever configured/credited (balance 0)",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-a-never-credited", d.("0.50"))) == true
+)
+
+credit!.("bi-a-zero", "a:zero-up", "3.00")
+credit!.("bi-a-zero", "a:zero-down", "-3.00")
+
+check.(
+  "A: credit_exhausted? true at balance == 0 after a credit is fully spent back down",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-a-zero", d.("0.50"))) == true
+)
+
+# ── B. Block gate composition (exhausted?(budget) and credit_exhausted?(opts, session)) ──
+# exhausted?/1 is a private Plug helper; its formula (spent >= limit) is replicated here
+# rather than exposed, so this check never touches unrelated private surface.
+over_limit? = fn spent, limit -> Decimal.compare(spent, limit) != :lt end
+
+limit_b = d.("0.50")
+spent_over = d.("0.60")
+spent_under = d.("0.10")
+
+credit!.("bi-b-pos", "b:pos", "2.00")
+
+check.(
+  "B: spent >= limit and balance > 0 -> NOT blocked",
+  (over_limit?.(spent_over, limit_b) and
+     ProxyPlug.credit_exhausted?(opts, session.("bi-b-pos", limit_b))) == false
+)
+
+check.(
+  "B: spent >= limit and balance <= 0 -> blocked (same as today)",
+  (over_limit?.(spent_over, limit_b) and
+     ProxyPlug.credit_exhausted?(opts, session.("bi-b-never-credited", limit_b))) == true
+)
+
+defmodule RaisingCreditStore do
+  def reset, do: :persistent_term.put({__MODULE__, :calls}, 0)
+  def calls, do: :persistent_term.get({__MODULE__, :calls})
+
+  def llm_credit_balance(_bi) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    raise "credit store must not be consulted on the un-exhausted path"
+  end
+end
+
+RaisingCreditStore.reset()
+opts_raising = %{opts | store_mod: RaisingCreditStore}
+
+# Elixir's `and` short-circuits: when the left operand is false the right operand is
+# never evaluated, so credit_exhausted?/2 — and therefore the store — is never called.
+gate_under =
+  over_limit?.(spent_under, limit_b) and
+    ProxyPlug.credit_exhausted?(opts_raising, session.("bi-b-any", limit_b))
+
+check.(
+  "B: spent < limit never consults credit (store's llm_credit_balance not called)",
+  gate_under == false and RaisingCreditStore.calls() == 0
+)
+
+# ── C. Straddle debit math via record_budget_call/5 ─────────────────────────────────
+# C1: straddles the limit — only the overflow portion is credit-funded.
+credit!.("bi-c1", "c1:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-c1", d.("0.50")),
+  req_ctx,
+  record.("req-c1", d.("0.30")),
+  d.("0.40")
+)
+
+check.(
+  "C1: limit 0.50, spent_before 0.40, cost 0.30 -> debit only the 0.20 overflow",
+  eq.(balance.("bi-c1"), d.("4.80"))
+)
+
+# C2: already over the limit before this call — the ENTIRE cost is credit-funded.
+credit!.("bi-c2", "c2:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-c2", d.("0.50")),
+  req_ctx,
+  record.("req-c2", d.("0.10")),
+  d.("0.60")
+)
+
+check.(
+  "C2: spent_before 0.60 (already over), cost 0.10 -> fully credit-funded debit",
+  eq.(balance.("bi-c2"), d.("4.90"))
+)
+
+# C3: entirely within the free daily budget — no overflow, no debit.
+credit!.("bi-c3", "c3:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-c3", d.("0.50")),
+  req_ctx,
+  record.("req-c3", d.("0.20")),
+  d.("0.10")
+)
+
+check.(
+  "C3: spent_before 0.10, cost 0.20 (fully within free budget) -> NO debit",
+  eq.(balance.("bi-c3"), d.("5.00"))
+)
+
+# C4: no pre-call spend available (arity-4 call site) — nil, no debit, no crash.
+credit!.("bi-c4", "c4:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-c4", d.("0.50")),
+  req_ctx,
+  record.("req-c4", d.("0.20"))
+)
+
+check.(
+  "C4: spent_before nil -> NO debit, no crash",
+  eq.(balance.("bi-c4"), d.("5.00"))
+)
+
+# C5: an unbilled row (no cost_usd, e.g. an error record) never debits, even with a
+# real spent_before.
+credit!.("bi-c5", "c5:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-c5", d.("0.50")),
+  req_ctx,
+  record.("req-c5", nil),
+  d.("0.60")
+)
+
+check.(
+  "C5: record without cost_usd (unbilled error row) -> NO debit",
+  eq.(balance.("bi-c5"), d.("5.00"))
+)
+
+# ── D. Overshoot: negative balance accepted; the NEXT block check reports exhausted ──
+credit!.("bi-d", "d:seed", "0.05")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-d", d.("0.50")),
+  req_ctx,
+  record.("req-d", d.("0.15")),
+  d.("0.60")
+)
+
+check.(
+  "D: balance 0.05, credit-funded call costing 0.15 -> balance goes to -0.10",
+  eq.(balance.("bi-d"), d.("-0.10"))
+)
+
+check.(
+  "D: the next block check reports exhausted after going negative",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-d", d.("0.50"))) == true
+)
+
+# ── E. Debit idempotency: same request_id recorded twice -> one debit only ──────────
+credit!.("bi-e", "e:seed", "5.00")
+
+record_e = record.("req-e", d.("0.30"))
+
+ProxyPlug.record_budget_call(opts, session.("bi-e", d.("0.50")), req_ctx, record_e, d.("0.40"))
+ProxyPlug.record_budget_call(opts, session.("bi-e", d.("0.50")), req_ctx, record_e, d.("0.40"))
+
+check.(
+  "E: replaying the same request_id debits once, not twice",
+  eq.(balance.("bi-e"), d.("4.80"))
+)
+
+# ── F. Global ceiling: blocks regardless of positive credit balance ─────────────────
+# global_exhausted?/2 is untouched by this task (no code change) — its formula
+# (limit > 0 and global_spent(day) >= limit) is replicated here against the same
+# public in-memory accumulator it reads, rather than exposing the private helper.
+day_f = ~D[2026-07-20]
+global_limit = d.("1.00")
+
+sess_f = %{budget_identity: "bi-f", slot: "agent_f"}
+Proxy.record_usage(pid, sess_f, day_f, "bi-f", %{model: "m", status: "ok", cost_usd: "1.00"})
+
+credit!.("bi-f", "f:seed", "100.00")
+
+global_spent = Proxy.global_spent_inmem(pid, day_f)
+global_exhausted = Decimal.compare(global_limit, 0) == :gt and Decimal.compare(global_spent, global_limit) != :lt
+
+check.(
+  "F: global ceiling reached while the identity carries a large positive credit balance",
+  global_exhausted == true and eq.(balance.("bi-f"), d.("100.00"))
+)
+
+check.(
+  "F: that same identity's OWN per-conversation credit gate would read balance > 0 " <>
+    "(credits never bypass the global backstop — the global clause blocks first, " <>
+    "unconditionally, before credit is ever consulted)",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-f", d.("0.50"))) == false
+)
+
+# ── G. Feature gate: credits_enabled false = byte-identical-when-off ────────────────
+# No retro-charge, no retro-consult: a feature-off install must never read the credit
+# store (not even to find it empty) and must never accrue a mirror debit.
+defmodule RaisingCreditStore2 do
+  def reset, do: :persistent_term.put({__MODULE__, :calls}, 0)
+  def calls, do: :persistent_term.get({__MODULE__, :calls})
+
+  def llm_credit_balance(_bi) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    raise "credit store must not be consulted while credits_enabled is false"
+  end
+
+  def record_llm_credit_entry(_entry) do
+    :persistent_term.put({__MODULE__, :calls}, calls() + 1)
+    raise "credit store must not be written while credits_enabled is false"
+  end
+end
+
+RaisingCreditStore2.reset()
+opts_off = %{opts | store_mod: RaisingCreditStore2, credits_enabled: false}
+
+check.(
+  "G1: credits_enabled false -> credit_exhausted? is true WITHOUT consulting the store " <>
+    "(even one hand-credited moments ago via a different, working store)",
+  ProxyPlug.credit_exhausted?(opts_off, session.("bi-g-off", d.("0.50"))) == true and
+    RaisingCreditStore2.calls() == 0
+)
+
+# opts lacking the key entirely defaults to off (mirrors production config with no
+# payments_source configured — the byte-identical-to-0.2.19 invariant).
+opts_missing_key = opts_off |> Map.delete(:credits_enabled)
+
+check.(
+  "G1b: opts missing :credits_enabled entirely also defaults to OFF (no store consult)",
+  ProxyPlug.credit_exhausted?(opts_missing_key, session.("bi-g-off2", d.("0.50"))) == true and
+    RaisingCreditStore2.calls() == 0
+)
+
+# A straddling call (well over the daily limit) must record NO debit entry and leave
+# the mirror untouched when credits are off — use a store that only implements
+# record_llm_call/4 (so record_budget_call proceeds) but would raise on any credit
+# read/write.
+defmodule GateSpendStore do
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+  def llm_credit_balance(_bi), do: raise("must not be consulted")
+  def record_llm_credit_entry(_entry), do: raise("must not be written")
+end
+
+opts_off_spend = %{opts_off | store_mod: GateSpendStore}
+
+ProxyPlug.record_budget_call(
+  opts_off_spend,
+  session.("bi-g-spend", d.("0.50")),
+  req_ctx,
+  record.("req-g-spend", d.("0.30")),
+  d.("0.40")
+)
+
+check.(
+  "G2: credits_enabled false -> a straddling call records NO debit, mirror stays empty",
+  eq.(Proxy.credit_balance(pid, nil, "bi-g-spend"), d.("0"))
+)
+
+# Even a hand-credited mirror balance doesn't unblock the gate while credits are off.
+credit!.("bi-g-blocked", "g:seed", "5.00")
+
+check.(
+  "G3: credits_enabled false -> exhausted budget stays blocked even with a positive " <>
+    "hand-credited mirror balance (the gate never reads it while off)",
+  ProxyPlug.credit_exhausted?(
+    %{opts_off | store_mod: nil},
+    session.("bi-g-blocked", d.("0.50"))
+  ) == true
+)
+
+# With credits_enabled true (existing behavior): the same shape of call IS
+# credit-funded, proving the gate flips both ways off the same config key.
+credit!.("bi-g-on", "g:on-seed", "5.00")
+
+check.(
+  "G4: credits_enabled true -> the existing credit-funded behavior is unchanged",
+  ProxyPlug.credit_exhausted?(opts, session.("bi-g-on", d.("0.50"))) == false
+)
+
+# ── H. Gate/debit limit unification (X2): the debit chokepoint must use the SAME
+# limit_usd the exhausted?/1 gate saw (budget.limit_usd, possibly store-row-pinned
+# and different from session.daily_limit_usd/opts.default_daily_limit), not
+# re-derive its own from session/opts. record_budget_call/5's 5th arg is now the
+# full budget map the gate consulted (%{spent_usd:, limit_usd:}), not a bare
+# spent_before Decimal — every lib call site was updated to match (still accepts a
+# bare Decimal/nil/integer for legacy/direct callers, see G2/C1-C5 above and I below,
+# falling back to session/opts only when the budget map carries no limit_usd).
+#
+# H1: store pins limit_usd HIGHER than the session's own limit (1.00 vs 0.50). A
+# call landing entirely inside the pinned $1 free band must NOT debit credits —
+# the old bug (re-deriving 0.50 from session) would wrongly treat 0.60-0.80 as
+# overflow and double-charge (free daily row AND a credit debit for the same spend).
+credit!.("bi-h1", "h1:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h1", d.("0.50")),
+  req_ctx,
+  record.("req-h1", d.("0.20")),
+  %{spent_usd: d.("0.60"), limit_usd: d.("1.00")}
+)
+
+check.(
+  "H1: pinned-higher limit (1.00) -> spent_before 0.60 + cost 0.20 stays inside " <>
+    "the pinned-free band -> NO debit (no double-charge)",
+  eq.(balance.("bi-h1"), d.("5.00"))
+)
+
+# H2: store pins limit_usd LOWER than the session's own limit (0.30 vs 0.50). The
+# gate already blocks/credit-funds from the pinned $0.30 boundary, so the debit
+# must start there too — the old bug (re-deriving 0.50 from session) would treat
+# 0.30-0.50 as still-free and never debit it (free spend the operator eats).
+credit!.("bi-h2", "h2:seed", "5.00")
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h2", d.("0.50")),
+  req_ctx,
+  record.("req-h2", d.("0.20")),
+  %{spent_usd: d.("0.30"), limit_usd: d.("0.30")}
+)
+
+check.(
+  "H2: pinned-lower limit (0.30) -> spent_before 0.30 (at the pinned boundary) + " <>
+    "cost 0.20 -> debits the full 0.20 from the pinned boundary (not free spend)",
+  eq.(balance.("bi-h2"), d.("4.80"))
+)
+
+# H3 (I2): a NONCONFORMING store row carries limit_usd: nil. The gate
+# (exhausted?/1) falls back to the module default (Proxy.default_daily_limit()),
+# NOT to session/opts — so with session.daily_limit_usd pinned at 5.00 and
+# spent 0.60, the gate treats the budget as exhausted (0.60 >= 0.50) and the
+# call runs credit-funded. The debit must compute overflow against the SAME
+# 0.50 the gate used: spent_before 0.60 is already past it, so the full 0.10
+# cost is debited. The pre-fix chain (nil -> session 5.00) computed zero
+# overflow and charged NOTHING (a proven under-charge).
+credit!.("bi-h3", "h3:seed", "5.00")
+
+gate_limit = Proxy.default_daily_limit()
+overflow_h3 = fn spent -> Decimal.max(d.("0"), Decimal.sub(spent, gate_limit)) end
+
+expected_debit_h3 =
+  Decimal.sub(overflow_h3.(Decimal.add(d.("0.60"), d.("0.10"))), overflow_h3.(d.("0.60")))
+
+check.(
+  "H3 sanity: the gate's nil-limit fallback (0.50) makes the full 0.10 cost overflow",
+  eq.(expected_debit_h3, d.("0.10"))
+)
+
+ProxyPlug.record_budget_call(
+  opts,
+  session.("bi-h3", d.("5.00")),
+  req_ctx,
+  record.("req-h3", d.("0.10")),
+  %{spent_usd: d.("0.60"), limit_usd: nil}
+)
+
+check.(
+  "H3: nil-limit store row -> debit equals the overflow computed with the GATE's " <>
+    "fallback limit (session 5.00 chain would have charged nothing)",
+  eq.(balance.("bi-h3"), Decimal.sub(d.("5.00"), expected_debit_h3))
+)
+
+# ── I. Legacy/non-Decimal spent_before tolerated (X3): a store returning an
+# integer spent_usd (legal on 0.2.19) must not crash maybe_debit_credit — it is
+# coerced via the module's decimal/1, same as everywhere else in this file, and
+# still debits/no-debits correctly.
+credit!.("bi-i1", "i1:seed", "5.00")
+
+result_i1 =
+  try do
+    ProxyPlug.record_budget_call(
+      opts,
+      session.("bi-i1", d.("0.50")),
+      req_ctx,
+      record.("req-i1", d.("0.20")),
+      0
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("I1: integer spent_before (0) does not crash record_budget_call", result_i1 == :ok)
+
+check.(
+  "I1: integer spent_before (0) + cost 0.20 stays under the 0.50 limit -> NO debit",
+  eq.(balance.("bi-i1"), d.("5.00"))
+)
+
+credit!.("bi-i2", "i2:seed", "5.00")
+
+result_i2 =
+  try do
+    ProxyPlug.record_budget_call(
+      opts,
+      session.("bi-i2", d.("0.50")),
+      req_ctx,
+      record.("req-i2", d.("0.20")),
+      1
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("I2: integer spent_before (1) does not crash record_budget_call", result_i2 == :ok)
+
+check.(
+  "I2: integer spent_before (1, already over the 0.50 limit) + cost 0.20 -> fully " <>
+    "credit-funded debit",
+  eq.(balance.("bi-i2"), d.("4.80"))
+)
+
+# ── J. (I1) Durable-store outage during a credit-funded call: the debit must
+# never vanish silently. The request is ALREADY served (budget accounting
+# fails open), but the loss must be visible — warning log + the
+# llm_proxy_budget_degraded metric — and the debit is applied MIRROR-ONLY so
+# the fail-open balance stays the conservative (lower) figure while the store
+# is down. Balance reads are durable-first, so a healed store's un-debited
+# ledger shadows the mirror (no double-count), and the mirror-only re-apply
+# re-takes the idempotency seen-mark, so a replay of the same request_id can
+# never double-debit.
+defmodule DebitOutageStore do
+  def reset do
+    :persistent_term.put({__MODULE__, :down}, false)
+    :persistent_term.put({__MODULE__, :debit_attempts}, 0)
+  end
+
+  def down!, do: :persistent_term.put({__MODULE__, :down}, true)
+  def heal!, do: :persistent_term.put({__MODULE__, :down}, false)
+  def down?, do: :persistent_term.get({__MODULE__, :down}, false)
+  def debit_attempts, do: :persistent_term.get({__MODULE__, :debit_attempts}, 0)
+
+  # Usage-row store stays healthy throughout so the ONLY degraded signal in
+  # this section can come from the credit-debit path itself.
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+
+  # Durable ledger holds only the seeded top-up (the failed debit never lands).
+  def llm_credit_balance(_bi) do
+    if down?(), do: {:error, :db_down}, else: {:ok, Decimal.new("5.00")}
+  end
+
+  def record_llm_credit_entry(entry) do
+    if Map.get(entry, :kind) == "debit" do
+      :persistent_term.put({__MODULE__, :debit_attempts}, debit_attempts() + 1)
+    end
+
+    if down?(), do: {:error, :db_down}, else: :ok
+  end
+end
+
+# Counts warning/error log lines from the debit-outage path.
+defmodule DebitOutageLogSink do
+  def hits, do: :persistent_term.get({__MODULE__, :hits}, 0)
+
+  def log(event, _config) do
+    text =
+      case event.msg do
+        {:string, s} -> IO.chardata_to_string(s)
+        {:report, r} -> inspect(r)
+        {fmt, args} -> IO.chardata_to_string(:io_lib.format(fmt, args))
+      end
+
+    if String.contains?(text, "credit DEBIT store write FAILED") do
+      :persistent_term.put({__MODULE__, :hits}, hits() + 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+end
+
+DebitOutageStore.reset()
+:ok = :logger.add_handler(:debit_outage_log_sink, DebitOutageLogSink, %{})
+
+# Captures bump_metric deliveries (the plug-side degraded-counter pattern).
+{:ok, metric_bumps} = Agent.start_link(fn -> [] end)
+
+opts_outage = %{
+  opts
+  | store_mod: DebitOutageStore
+}
+|> Map.merge(%{
+  swarm_name: "swarm",
+  metrics: :metrics,
+  deliver_fn: fn _sw, _metrics, _from, payload ->
+    case Jason.decode(payload) do
+      {:ok, %{"action" => "bump", "key" => key}} -> Agent.update(metric_bumps, &[key | &1])
+      _ -> :ok
+    end
+  end
+})
+
+degraded_bumps = fn ->
+  Agent.get(metric_bumps, &Enum.count(&1, fn k -> k == "llm_proxy_budget_degraded" end))
+end
+
+# Seed the balance while the store is healthy (top-up lands durably + mirror).
+credit_entry_j = %{
+  idempotency_key: "j:seed",
+  budget_identity: "bi-j",
+  amount_usd: d.("5.00"),
+  kind: "credit",
+  at: ~U[2026-07-22 10:00:00Z],
+  meta: %{}
+}
+
+{:ok, _} = Proxy.apply_credit_entry(pid, DebitOutageStore, credit_entry_j)
+
+# Outage begins; a fully-credit-funded call (spent_before 0.60 > limit 0.50).
+DebitOutageStore.down!()
+
+record_j = record.("req-j", d.("0.30"))
+
+served =
+  try do
+    ProxyPlug.record_budget_call(
+      opts_outage,
+      session.("bi-j", d.("0.50")),
+      req_ctx,
+      record_j,
+      d.("0.60")
+    )
+
+    :ok
+  rescue
+    e -> {:raised, Exception.message(e)}
+  end
+
+check.("J1: store outage during a credit-funded call -> the call is still served (no raise)", served == :ok)
+
+check.(
+  "J2: the durable debit write WAS attempted and failed (fail-open never skips the try)",
+  DebitOutageStore.debit_attempts() == 1
+)
+
+check.(
+  "J3: the lost durable debit is LOGGED (warning names the failed debit write)",
+  DebitOutageLogSink.hits() == 1
+)
+
+check.(
+  "J4: the llm_proxy_budget_degraded metric is bumped exactly once for the lost debit",
+  degraded_bumps.() == 1
+)
+
+check.(
+  "J5: the debit IS applied to the in-memory mirror (conservative lower balance " <>
+    "while the store is down): 5.00 - 0.30 = 4.70",
+  eq.(Proxy.credit_balance(pid, nil, "bi-j"), d.("4.70"))
+)
+
+check.(
+  "J6: during the outage the gate reads the conservative mirror figure " <>
+    "(durable read down -> falls open to the mirror's 4.70)",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("4.70"))
+)
+
+# Replay of the SAME request_id while still down: the mirror-only re-apply
+# re-took the seen-mark, so nothing double-debits, and no second durable
+# attempt / warning / metric fires (:already_seen short-circuits first).
+ProxyPlug.record_budget_call(
+  opts_outage,
+  session.("bi-j", d.("0.50")),
+  req_ctx,
+  record_j,
+  d.("0.60")
+)
+
+check.(
+  "J7: replaying the same request_id during the outage neither double-debits the " <>
+    "mirror nor re-fires the durable write/log/metric",
+  eq.(Proxy.credit_balance(pid, nil, "bi-j"), d.("4.70")) and
+    DebitOutageStore.debit_attempts() == 1 and DebitOutageLogSink.hits() == 1 and
+    degraded_bumps.() == 1
+)
+
+# Store heals: balance reads are DURABLE-FIRST, so the un-debited durable
+# ledger (top-up only, 5.00) shadows the mirror's 4.70 — the mirror debit is
+# never double-counted anywhere; the durable under-charge is the documented
+# outage rider.
+DebitOutageStore.heal!()
+
+check.(
+  "J8: after the store heals, the durable-first read shadows the mirror (5.00 — " <>
+    "the outage under-charge stays durable-side only, no double-apply)",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("5.00"))
+)
+
+:logger.remove_handler(:debit_outage_log_sink)
+
+# ── K. (R3-I1) NONCONFORMING store return shape during a credit-funded debit:
+# a store whose record_llm_credit_entry/1 returns an Ecto-style {:ok, struct}
+# must NOT raise out of record_budget_call — pre-fix this CaseClauseError
+# turned a successfully served, already-billed upstream call into a 502 on
+# the chat route and escaped uncaught into Bandit on the compact route (both
+# funnel their debits through this exact chokepoint). Now it is treated like
+# a store outage: the call stays served (fail-open debit side) and the debit
+# lands mirror-only, the conservative lower figure.
+defmodule NonconformingDebitStore do
+  def record_llm_call(_identity, _day, _session_id, _attrs), do: %{ok: true}
+  def llm_credit_balance(_bi), do: {:ok, Decimal.new("5.00")}
+  def record_llm_credit_entry(_entry), do: {:ok, %{id: 1}}
+end
+
+opts_nonconforming = %{opts | store_mod: NonconformingDebitStore}
+
+served_k =
+  try do
+    ProxyPlug.record_budget_call(
+      opts_nonconforming,
+      session.("bi-k", d.("0.50")),
+      req_ctx,
+      record.("req-k", d.("0.30")),
+      d.("0.60")
+    )
+
+    :ok
+  rescue
+    e -> {:raised, e.__struct__}
+  end
+
+check.(
+  "K1: nonconforming {:ok, struct} debit write -> the call is still served (no raise " <>
+    "= no 502 on chat, nothing escapes into Bandit on compact)",
+  served_k == :ok
+)
+
+check.(
+  "K2: the debit IS applied to the in-memory mirror (same conservative mirror-only " <>
+    "fallback as a store outage): 0 - 0.30 = -0.30",
+  eq.(Proxy.credit_balance(pid, nil, "bi-k"), d.("-0.30"))
+)
+
+failed = Agent.get(failures, & &1)
+IO.puts("")
+
+if failed == [] do
+  IO.puts("LLM_PROXY_CREDIT_SPEND: ALL PASS")
+else
+  IO.puts("LLM_PROXY_CREDIT_SPEND: FAILED")
+  IO.puts("  Failed: #{Enum.join(Enum.reverse(failed), ", ")}")
+  System.halt(1)
+end

@@ -226,7 +226,18 @@ defmodule Genswarms.LlmProxy do
       # Minimum interval between repeated block notices to the SAME conversation
       # for the SAME cap type on the same UTC day (default 4h). 0 or nil = legacy
       # once-per-day.
-      notice_repeat_ms: Map.get(config, :notice_repeat_ms, @default_notice_repeat_ms)
+      notice_repeat_ms: Map.get(config, :notice_repeat_ms, @default_notice_repeat_ms),
+      # Optional seam (nil | (budget_identity -> nil | String.t())): when set, its
+      # non-empty return value is appended as an extra line on a `:budget` block
+      # notice (e.g. a top-up instruction). Absent/raising/non-binary -> no hint,
+      # never crashes the block path (see budget_notice/4).
+      topup_hint_fun: Map.get(config, :topup_hint_fun),
+      # (B2) Feature gate for the prepaid credit path (credit_exhausted?/2,
+      # maybe_debit_credit/4): on iff payments_source is configured — same
+      # derivation the object-side payments_source gate below uses, so a host
+      # that never configures payments can never accrue mirror debits nor
+      # have the block gate consult a credit balance at all.
+      credits_enabled: credits_enabled?(config)
     }
 
     if Decimal.compare(plug_opts.default_daily_limit, Decimal.new("0")) != :gt do
@@ -313,8 +324,58 @@ defmodule Genswarms.LlmProxy do
          notice_repeat_ms: plug_opts.notice_repeat_ms,
          clock: Map.get(config, :clock, fn -> DateTime.utc_now() end),
          dm_module: module_ref(Map.get(config, :dm_module))
-       }
+       },
+       # Payment-agnostic credit top-up (see handle_payment_confirmed/3):
+       # payments_source nil/"" keeps the feature OFF; the object that IS the
+       # payments_source is the only trusted sender of {"action":"payment_confirmed"}.
+       payments_source: Map.get(config, :payments_source),
+       credit_namespace: Map.get(config, :credit_namespace, "default"),
+       credit_per_usd: validate_credit_per_usd!(Map.get(config, :credit_per_usd, "1.0")),
+       # (B2) Same derivation as plug_opts.credits_enabled above — kept
+       # alongside payments_source on the object-side state too, one
+       # resolution point for "are credits on" regardless of which side asks.
+       credits_enabled: credits_enabled?(config)
      }}
+  end
+
+  # (B2, X5a) credits_enabled? = payments_source configured and non-empty.
+  # Derived once, at boot, from the same config read that feeds
+  # payments_source on both the plug_opts (credit_exhausted?/
+  # maybe_debit_credit) and the object-side state (handle_payment_confirmed)
+  # — a host that never sets payments_source gets the feature off on both
+  # sides, with no retro-charge if it's turned on later (see
+  # maybe_debit_credit/4). ON only for a non-empty binary (the common case —
+  # an object name string) or an atom that is neither `nil` nor `false` (a
+  # source given as an atom, e.g. an object-name atom): `payments_source:
+  # false` must be OFF everywhere — the prior wildcard `_ -> true` treated an
+  # explicit `false` as "on" (it is neither `nil` nor `""`), the opposite of
+  # what setting it to `false` means.
+  defp credits_enabled?(config) do
+    case Map.get(config, :payments_source) do
+      v when is_binary(v) and v != "" -> true
+      v when is_atom(v) and v not in [nil, false] -> true
+      _ -> false
+    end
+  end
+
+  # (M3) Boot-reject a garbage credit_per_usd the same way a bad pricing
+  # config is boot-rejected (validate_pricing_config!/3): the tolerant
+  # decimal/1 maps unparseable strings to Decimal 0, so a typo'd
+  # `credit_per_usd: "1,0"` would otherwise ack EVERY payment
+  # `ok:true, credited_usd:"0.00"` — accepted and discarded, and the hub
+  # (correctly) never retries an acked confirmation. The default "1.0"
+  # always passes; only an explicitly configured non-parseable, non-finite,
+  # or non-positive value refuses boot.
+  defp validate_credit_per_usd!(value) do
+    with %Decimal{} = d <- strict_decimal(value),
+         true <- finite_decimal?(d) and Decimal.compare(d, Decimal.new(0)) == :gt do
+      d
+    else
+      _ ->
+        raise ArgumentError,
+              "credit_per_usd must be a positive finite decimal (a string like \"1.0\"), " <>
+                "got: #{inspect(value)} — a tolerant parse would silently zero every payment"
+    end
   end
 
   def interface do
@@ -328,11 +389,29 @@ defmodule Genswarms.LlmProxy do
         input:
           ~s({"action":"quota_status","conversation_id":"tg:903489662:0","kind":"dm","workspace_key":"default"}),
         output: "read-only per-identity request quota, spend, and global cap status"
+      },
+      payment_confirmed: %{
+        # (X5d) namespace here is "default" — the actual credit_namespace default
+        # (see init/1's `credit_namespace: Map.get(config, :credit_namespace,
+        # "default")`), not an arbitrary example value. This MUST match whatever
+        # `credit_namespace` the host actually configures — a confirmation whose
+        # "namespace" differs from the configured value is silently ignored
+        # (see handle_payment_confirmed/3), so a hub copying this example
+        # verbatim against a host that overrides credit_namespace would have
+        # every payment silently dropped.
+        input:
+          ~s({"action":"payment_confirmed","beneficiary":"w:default|k:dm|c:tg:9:0","amount_usd":"5.00","method":"card","ref":"txn_0","namespace":"default"}),
+        output:
+          "credits the beneficiary's prepaid balance once per (method, ref) — only from the configured payments_source, only for the configured credit_namespace",
+        note:
+          "\"namespace\" must equal the host's configured credit_namespace (default " <>
+            "\"default\") — a mismatched namespace is silently ignored, not an error. " <>
+            "\"amount_usd\" is a STRING by contract, never a JSON number (see README)."
       }
     }
   end
 
-  def handle_message(_from, content, state) do
+  def handle_message(from, content, state) do
     case Jason.decode(content) do
       {:ok, %{"action" => "usage"}} ->
         {:reply, Jason.encode!(%{usage: usage_totals(state.state_pid)}), state}
@@ -344,9 +423,195 @@ defmodule Genswarms.LlmProxy do
       {:ok, %{"action" => "quota_status"} = msg} ->
         {:reply, Jason.encode!(quota_status(msg, state)), state}
 
+      {:ok, %{"action" => "payment_confirmed"} = msg} ->
+        handle_payment_confirmed(from, msg, state)
+
       _ ->
         {:noreply, state}
     end
+  end
+
+  # (X5c) Single store_mod resolution point shared by credit_payment/2 and
+  # quota_status/2 — both tolerate the same two host state shapes (a
+  # top-level :store_mod, test/mm lineage; one nested under :quota, the
+  # production init/1 assembly path), but previously resolved them in
+  # OPPOSITE directions: credit_payment/2 took the top-level key first
+  # (falling back to the nested one only when the top-level was nil/false),
+  # while quota_status/2 takes the nested key first via `Map.put_new`
+  # (falling back to top-level only when :quota carries no :store_mod key at
+  # all) — a split-brain risk if a host ever assembled state with two
+  # different store_mod values in the two places (credits would durably
+  # write through one store while quota_status's dashboard reads the other).
+  # This is quota_status/2's existing direction — nested wins whenever
+  # present, matching the "production init/1 assembly path nests it" comment
+  # above; picked here rather than top-level-first because init/1 is the
+  # shape every real boot actually produces.
+  defp resolve_store_mod(state) do
+    state
+    |> Map.get(:quota, %{})
+    |> Map.put_new(:store_mod, Map.get(state, :store_mod))
+    |> Map.get(:store_mod)
+  end
+
+  # Payment-agnostic credit top-up. Trust = the configured payments_source
+  # object name; confirmations for a foreign namespace are IGNORED per the
+  # settlement-hub contract (multiple consumers share one hub, each only
+  # cares about its own namespace — a foreign one is neither an error nor
+  # ours to warn about). Idempotency key "<method>:<ref>" — a re-delivered
+  # confirmation credits once (see Proxy.apply_credit_entry/3, Task 1).
+  defp handle_payment_confirmed(from, msg, state) do
+    source = Map.get(state, :payments_source)
+    namespace = Map.get(state, :credit_namespace, "default")
+
+    cond do
+      # (M2) Gate on the SAME strict credits_enabled derivation the plug side
+      # uses (init/1 stores it next to payments_source; false/nil = feature
+      # off = reject). Gating on raw payments_source alone let
+      # `payments_source: false` — OFF everywhere else per X5a — pass the
+      # to_string/1 trust compare for a sender literally named "false" and
+      # mint a mirror balance invisible to the (correctly off) gate.
+      not Map.get(state, :credits_enabled, false) ->
+        {:noreply, state}
+
+      is_nil(source) or source == "" ->
+        {:noreply, state}
+
+      to_string(from) != to_string(source) ->
+        Logger.warning(
+          "llm_proxy: payment_confirmed from untrusted source #{inspect(from)} — ignored"
+        )
+
+        {:noreply, state}
+
+      normalize_namespace(Map.get(msg, "namespace")) != normalize_namespace(namespace) ->
+        {:noreply, state}
+
+      true ->
+        credit_payment(msg, state)
+    end
+  end
+
+  # (M5b) Same to_string/1 normalization the source compare above applies: a
+  # host configuring `credit_namespace` as an atom (`:default`, e.g. from
+  # keyword/IR config) must not silently drop every payment against the
+  # JSON-decoded binary "default". Only stringable scalars are normalized —
+  # a hostile non-scalar JSON "namespace" (map/list) stays as-is and simply
+  # mismatches (ignored), never raising out of the handler.
+  defp normalize_namespace(v) when is_binary(v) or is_atom(v) or is_number(v), do: to_string(v)
+  defp normalize_namespace(v), do: v
+
+  # (M1) "debit:<request_id>" is the ledger's RESERVED internal keyspace
+  # (see do_maybe_debit_credit/4): a top-up whose method is literally "debit"
+  # would mint idempotency keys a real debit's "debit:" <> request_id can
+  # collide with — the colliding debit would then be swallowed as :duplicate
+  # and the balance never drawn down. Refuse it outright, non-retryable (the
+  # payload can never become valid; the hub must not redeliver).
+  defp credit_payment(%{"method" => "debit"}, state) do
+    {:reply, Jason.encode!(%{ok: false, error: "reserved_method"}), state}
+  end
+
+  defp credit_payment(msg, state) do
+    with {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
+         true <- Decimal.compare(amount, Decimal.new(0)) == :gt,
+         beneficiary when is_binary(beneficiary) and beneficiary != "" <-
+           Map.get(msg, "beneficiary"),
+         method when is_binary(method) and method != "" <- Map.get(msg, "method"),
+         # (R3-M1) The idempotency key below is the plain join
+         # "#{method}:#{ref}" with GLOBAL uniqueness on the joined string, so
+         # a colon inside `method` makes the join ambiguous: ("a", "b:c") and
+         # ("a:b", "c") would mint the SAME key "a:b:c" and the second —
+         # legitimately distinct — payment would be permanently swallowed as
+         # duplicate:true. Rejecting ":" in `method` (ref may contain colons
+         # freely, e.g. tx hashes "0xT:0") makes the join unambiguous: the
+         # separator can never occur in the left component.
+         false <- String.contains?(method, ":"),
+         ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref") do
+      per_usd = decimal(Map.get(state, :credit_per_usd, Decimal.new("1.0")))
+      credited = Decimal.mult(amount, per_usd)
+      key = "#{method}:#{ref}"
+
+      entry = %{
+        idempotency_key: key,
+        budget_identity: beneficiary,
+        amount_usd: credited,
+        kind: "credit",
+        at: DateTime.utc_now(),
+        meta: %{"method" => method, "ref" => ref}
+      }
+
+      state_pid = Map.get(state, :state_pid, @state_name)
+      # (X5c) Same resolver quota_status/2 uses — see resolve_store_mod/1.
+      store_mod = resolve_store_mod(state)
+
+      case apply_credit_entry(state_pid, store_mod, entry) do
+        :duplicate ->
+          {:reply, Jason.encode!(%{ok: true, duplicate: true}), state}
+
+        {:ok, balance} ->
+          {:reply,
+           Jason.encode!(%{ok: true, credited_usd: money2(credited), balance_usd: money2(balance)}),
+           state}
+
+        # (X4) Fail CLOSED per spec: the durable write failed and
+        # apply_credit_entry/3 has already released its seen-mark, so this
+        # exact (method, ref) is retryable — NOT applied to the mirror, NOT
+        # permanently consumed. The hub is expected to redeliver.
+        {:error, :store_unavailable} ->
+          Logger.error(
+            "llm_proxy: credit entry store write FAILED — credit NOT applied (fails " <>
+              "closed per spec; retryable, key not consumed); key=#{key}"
+          )
+
+          bump_credit_degraded_metric(store_mod)
+
+          {:reply,
+           Jason.encode!(%{
+             ok: false,
+             error: "store_unavailable",
+             retryable: true
+           }), state}
+      end
+    else
+      _ ->
+        {:reply, Jason.encode!(%{ok: false, error: "bad_payment_confirmed"}), state}
+    end
+  end
+
+  # Decimal.parse/1 also accepts "NaN"/"Infinity"/"-Infinity" (represented with
+  # a non-integer :NaN/:inf coefficient) — a payment amount must be a finite
+  # number: NaN would RAISE at the Decimal.compare/2 >0 guard downstream (an
+  # upstream hub retrying a permanently-malformed payload forever), and
+  # Infinity would pass the >0 guard and mint an infinite balance. Reject both
+  # here so they fall to the same bad_payment_confirmed reply as any other
+  # malformed amount.
+  # (M4) Exponent forms are NOT part of the contract either: Decimal.parse/1
+  # happily accepts "5e2" (= 500.00) with a finite integer coefficient, but
+  # the wire contract is plain decimal strings only (the hub sends
+  # Decimal.to_string/1 of a normalized amount) — a stray exponent is far
+  # more likely a malformed/hostile payload than a legitimate five-hundred-
+  # dollar top-up, so it falls to the same bad_payment_confirmed reply.
+  defp parse_money(v) when is_binary(v) do
+    with false <- String.contains?(v, ["e", "E"]),
+         {%Decimal{coef: coef} = d, ""} when is_integer(coef) <- Decimal.parse(v) do
+      {:ok, d}
+    else
+      _ -> :error
+    end
+  end
+
+  defp parse_money(_), do: :error
+
+  defp bump_credit_degraded_metric(store_mod) do
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :bump_metric, 3) do
+      store_mod.bump_metric("llm_proxy_budget_degraded", %{context: "payment_confirmed"}, 1)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   # Config (atom or string, e.g. from JSON IR) → the pricing-mode atom.
@@ -407,7 +672,7 @@ defmodule Genswarms.LlmProxy do
 
   def start_state_link(opts \\ []) do
     Agent.start_link(
-      fn -> %{sessions: %{}, usage: %{}, notified: %{}, global: %{}} end,
+      fn -> %{sessions: %{}, usage: %{}, notified: %{}, global: %{}, credits: %{}} end,
       opts
     )
   end
@@ -719,10 +984,12 @@ defmodule Genswarms.LlmProxy do
     # Tolerate both host state shapes: everything under :quota (wingston lineage)
     # or store_mod/default_daily_limit at the top level with a *_usd global key
     # (mm lineage). The message may pin an explicit "day" (ISO) — mm's commands do.
+    # (X5c) :store_mod specifically goes through resolve_store_mod/1 — the same
+    # resolution credit_payment/2 now uses.
     quota =
       state
       |> Map.get(:quota, %{})
-      |> Map.put_new(:store_mod, Map.get(state, :store_mod))
+      |> Map.put(:store_mod, resolve_store_mod(state))
       |> Map.put_new(
         :default_daily_limit,
         Map.get(state, :default_daily_limit, @default_daily_limit)
@@ -761,6 +1028,18 @@ defmodule Genswarms.LlmProxy do
     request_limit = request_limit(Map.get(quota, :daily_request_limit, 0))
     requests_used = max(int(Map.get(usage, :requests, 0)), 0)
 
+    # (X5b) credits_enabled gates the credit read here too, not just the plug's
+    # block gate (credit_exhausted?/2): a feature-off install must show "0.00"
+    # WITHOUT ever consulting the store — probe P5 showed a feature-off install
+    # displaying a durable balance the block gate ignores entirely. credit_balance/3
+    # (and therefore store_mod.llm_credit_balance/1) is only called when on.
+    credit_balance_usd =
+      if Map.get(state, :credits_enabled, false) do
+        money2(credit_balance(state_pid, Map.get(quota, :store_mod), budget_identity))
+      else
+        money2(Decimal.new("0"))
+      end
+
     %{
       action: "quota_status",
       ok: true,
@@ -788,6 +1067,7 @@ defmodule Genswarms.LlmProxy do
         limit_usd: money(global_limit),
         pct: pct_decimal(global_used, global_limit)
       },
+      credit: %{balance_usd: credit_balance_usd},
       # mm vocabulary: the same numbers nested under "quota" with 2dp money strings
       # and a human reset stamp — both host lineages' consumers keep working.
       quota: %{
@@ -865,7 +1145,11 @@ defmodule Genswarms.LlmProxy do
       action: "quota_status",
       ok: false,
       conversation_id: Map.get(msg, "conversation_id"),
-      error: "missing_conversation_id"
+      error: "missing_conversation_id",
+      # No conversation_id means no budget_identity to look up a real balance
+      # against — keep the field present (schema-stable for consumers) with
+      # the safe default rather than omitting it.
+      credit: %{balance_usd: money2(Decimal.new("0"))}
     }
   end
 
@@ -1677,6 +1961,204 @@ defmodule Genswarms.LlmProxy do
     end)
   end
 
+  # ── Credit ledger primitives ──────────────────────────────────────────────
+  #
+  # A payment-agnostic prepaid credit balance per budget_identity, on top of the
+  # existing daily-limit budget: the store (when it exports the two callbacks)
+  # is durable and authoritative; the in-memory `credits` mirror is always kept
+  # in sync and is the fail-open fallback (same availability stance as the rest
+  # of this module's accounting — an accounting outage never blocks the LLM
+  # path). Later tasks (block gate, top-ups, dashboard) build on these.
+
+  @doc """
+  Prepaid credit balance for a budget identity. Durable read when the store
+  exports llm_credit_balance/1 and answers; falls OPEN to the in-memory
+  mirror otherwise (same availability stance as per-conversation budget).
+  Never raises. Returns Decimal (0 when unknown).
+  """
+  def credit_balance(pid \\ @state_name, store_mod, budget_identity) do
+    case durable_credit_balance(store_mod, budget_identity) do
+      %Decimal{} = bal -> bal
+      nil -> mirror_credit_balance(pid, budget_identity)
+    end
+  end
+
+  # Durable credits are both-callbacks-or-neither: a store exporting only ONE
+  # of llm_credit_balance/1 / record_llm_credit_entry/1 is treated as fully
+  # absent for the credit path (README: "missing EITHER callback falls back
+  # to the mirror for both"). Exporting only the read callback would
+  # otherwise shadow a mirror top-up behind a durable-store read that never
+  # actually recorded anything (paying user told ok, gate reads durable 0,
+  # stays blocked); exporting only the write callback would silently accept
+  # writes it can never read back durably. One resolution point for both call
+  # sites below.
+  @doc false
+  def credit_store_ready?(store_mod) do
+    is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+      function_exported?(store_mod, :llm_credit_balance, 1) and
+      function_exported?(store_mod, :record_llm_credit_entry, 1)
+  end
+
+  defp durable_credit_balance(store_mod, budget_identity) do
+    if credit_store_ready?(store_mod) do
+      case store_mod.llm_credit_balance(budget_identity) do
+        {:ok, %Decimal{} = bal} -> bal
+        _ -> nil
+      end
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp mirror_credit_balance(pid, budget_identity) do
+    Agent.get(pid, fn state ->
+      state
+      |> Map.get(:credits, %{})
+      |> Map.get(budget_identity, %{})
+      |> Map.get(:balance, Decimal.new("0"))
+    end)
+  end
+
+  @doc """
+  Apply one signed credit-ledger entry (top-up or debit) with idempotency.
+  Dedup is two-layer and race-safe: the mirror seen-check-and-mark is a
+  SINGLE atomic `Agent.get_and_update` (not a separate read then write), so
+  N concurrent callers with the same `idempotency_key` can never all observe
+  "not seen" — exactly one wins the mark and proceeds to the durable write;
+  every other racer (and every later replay) gets `:duplicate` without
+  touching the balance. The store's own `{:error, :duplicate}` contract is
+  the second layer, for the case where the mirror was reset (restart) but
+  the durable ledger already has the key. Recorded durably when the store
+  exports record_llm_credit_entry/1 and is healthy.
+
+  (X4) Credit writes FAIL CLOSED per spec: when a durable store IS configured
+  (`credit_store_ready?/1`) but `record_llm_credit_entry/1` errors/raises/
+  exits, the mirror is NOT applied and the atomic seen-mark taken above is
+  RELEASED before returning — the failed write must not permanently consume
+  the idempotency key, so a later redelivery of the same key (once the store
+  heals) is a genuine retry, not a swallowed duplicate. Releasing the mark
+  only on the error path (never on success) keeps the concurrency property:
+  concurrent same-key calls still credit at most once (every other racer
+  during the write attempt sees the mark and gets `:duplicate`; only after an
+  error is the key freed for a future attempt to retry). Mirror-only mode (no
+  durable store at all — `:no_store`) is unchanged: fail-open, same as ever,
+  since there is nothing durable to reconcile from.
+
+  Returns `{:ok, new_mirror_balance}` | `:duplicate` | `{:error, :store_unavailable}`.
+  """
+  def apply_credit_entry(pid \\ @state_name, store_mod, %{idempotency_key: key, budget_identity: bi} = entry) do
+    case mirror_mark_credit_seen(pid, bi, key) do
+      :already_seen ->
+        :duplicate
+
+      :newly_marked ->
+        case durable_record_credit_entry(store_mod, entry) do
+          {:error, :duplicate} ->
+            :duplicate
+
+          :ok ->
+            {:ok, mirror_apply_credit(pid, entry)}
+
+          :no_store ->
+            {:ok, mirror_apply_credit(pid, entry)}
+
+          {:error, _reason} ->
+            mirror_unmark_credit_seen(pid, bi, key)
+            {:error, :store_unavailable}
+
+          # (R3-I1) A NONCONFORMING return VALUE (the raise/exit cases are
+          # already rescued in durable_record_credit_entry/2) — most likely a
+          # host adapter forwarding Repo.insert/1's `{:ok, struct}` straight
+          # through. Without this arm it raised CaseClauseError out of the
+          # money path: the seen-mark leaked forever (redelivery acked
+          # `duplicate:true` while the mirror balance was never applied — a
+          # success-shaped lost payment) and the debit path 502'd an
+          # already-billed call. Treat it exactly like a failed write: release
+          # the mark, fail closed, let the hub redeliver. Self-converging even
+          # when the nonconforming write actually LANDED: the store's own
+          # uniqueness contract answers `{:error, :duplicate}` on the retry
+          # and the entry settles exactly once.
+          other ->
+            Logger.warning(
+              "llm_proxy: record_llm_credit_entry/1 returned nonconforming " <>
+                inspect(other) <>
+                " — treated as store failure (fails closed, retryable, key released)"
+            )
+
+            mirror_unmark_credit_seen(pid, bi, key)
+            {:error, :store_unavailable}
+        end
+    end
+  end
+
+  defp durable_record_credit_entry(store_mod, entry) do
+    if credit_store_ready?(store_mod) do
+      store_mod.record_llm_credit_entry(entry)
+    else
+      :no_store
+    end
+  rescue
+    e -> {:error, {:raised, Exception.message(e)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  # Atomic seen-check-and-mark: a single Agent message so the check and the
+  # mark can never be split by a concurrent racer (the bug a nil-store /
+  # store-round-trip race could otherwise hit — two callers both seeing
+  # "not seen" and both crediting the mirror). Returns :already_seen (mirror
+  # untouched) or :newly_marked (key now in the seen-set; caller owns this
+  # entry and must apply the balance itself via mirror_apply_credit/2).
+  defp mirror_mark_credit_seen(pid, budget_identity, key) do
+    Agent.get_and_update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+      row = Map.get(credits, budget_identity) || %{balance: Decimal.new("0"), seen: MapSet.new()}
+
+      if MapSet.member?(row.seen, key) do
+        {:already_seen, state}
+      else
+        row = %{row | seen: MapSet.put(row.seen, key)}
+        {:newly_marked, Map.put(state, :credits, Map.put(credits, budget_identity, row))}
+      end
+    end)
+  end
+
+  # (X4) Release a seen-mark taken by mirror_mark_credit_seen/3 when the durable
+  # write it was guarding subsequently FAILED — the mark is a lock, not a
+  # ledger: it must not survive a write that never actually applied anywhere.
+  # Only the error path in apply_credit_entry/3 calls this; a successful write
+  # (durable :ok, :no_store, or a store-reported :duplicate) keeps its mark, so
+  # a settled key still dedups a true replay. A missing row (already pruned or
+  # never created) is a no-op.
+  defp mirror_unmark_credit_seen(pid, budget_identity, key) do
+    Agent.update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+
+      case Map.get(credits, budget_identity) do
+        nil ->
+          state
+
+        row ->
+          row = %{row | seen: MapSet.delete(row.seen, key)}
+          Map.put(state, :credits, Map.put(credits, budget_identity, row))
+      end
+    end)
+  end
+
+  # Balance-only mirror apply. The seen-set mark already happened atomically
+  # in mirror_mark_credit_seen/3 before the durable write was attempted, so
+  # this only ever runs for the single caller that won that mark.
+  defp mirror_apply_credit(pid, %{budget_identity: bi, amount_usd: amt}) do
+    Agent.get_and_update(pid, fn state ->
+      credits = Map.get(state, :credits, %{})
+      row = Map.get(credits, bi) || %{balance: Decimal.new("0"), seen: MapSet.new()}
+      row = %{row | balance: Decimal.add(row.balance, amt)}
+      {row.balance, Map.put(state, :credits, Map.put(credits, bi, row))}
+    end)
+  end
+
   defp dashboard_usage_rows(store_mod, day, state_pid) do
     durable =
       try do
@@ -2214,7 +2696,7 @@ defmodule Genswarms.LlmProxy.Plug do
             streaming?(body) and Map.get(opts, :allow_streaming, false)
           )
 
-        exhausted?(budget) ->
+        exhausted?(budget) and credit_exhausted?(opts, session) ->
           # Only render an SSE budget body when streaming was REQUESTED *and* the gate is
           # on; otherwise the buffered JSON body (byte-identical to before).
           budget_exhausted_response(
@@ -2257,17 +2739,17 @@ defmodule Genswarms.LlmProxy.Plug do
 
             # Discarded blank attempts consumed real tokens: record them (status
             # "empty_retry") and advance the spend BEFORE pricing the final answer.
-            spent_after_discards =
+            # (X2) Thread the full budget map (not just spent_usd) through the fold
+            # so every discarded-attempt debit uses the SAME limit_usd the gate saw.
+            budget =
               record_discarded_attempts(
                 opts,
                 session,
                 request_ctx,
                 conn.body_params,
-                budget.spent_usd || Decimal.new("0"),
+                Map.put(budget, :spent_usd, budget.spent_usd || Decimal.new("0")),
                 discarded_attempts
               )
-
-            budget = Map.put(budget, :spent_usd, spent_after_discards)
 
             respond_upstream(
               conn,
@@ -2364,7 +2846,7 @@ defmodule Genswarms.LlmProxy.Plug do
             }
           })
 
-        exhausted?(budget) ->
+        exhausted?(budget) and credit_exhausted?(opts, session) ->
           bump_metric(opts, "llm_proxy_compact_block")
 
           json(conn, 429, %{
@@ -2390,7 +2872,15 @@ defmodule Genswarms.LlmProxy.Plug do
           # must burn quota. model "compact" keeps it distinguishable in the
           # ledger; failures record as "compact_error" (visible, quota-free —
           # same treatment as chat upstream errors).
-          record_budget_call(opts, session, request_ctx, compact_record(status, resp, budget, opts))
+          # (X2) Pass the full `budget` map (not just spent_usd) so the debit
+          # chokepoint sees the SAME limit_usd this cond's exhausted?/1 gate did.
+          record_budget_call(
+            opts,
+            session,
+            request_ctx,
+            compact_record(status, resp, budget, opts),
+            budget
+          )
 
           json(conn, status, resp)
       end
@@ -2854,7 +3344,9 @@ defmodule Genswarms.LlmProxy.Plug do
 
   # Ported with the empty-retry feature from micro-markets: every discarded
   # blank attempt is a REAL upstream call — bill it (status "empty_retry").
-  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, spent, []), do: spent
+  # (X2) `budget` is the full map (spent_usd + limit_usd), threaded through so
+  # every discarded-attempt debit sees the same limit_usd the gate saw.
+  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
   # Hostile/garbage upstream token counts ("many", lists, maps) normalize to 0
   # BEFORE any consumer — cost, x_router, and the durable record all see ints
   # (mm hardening; a poisoned count must never crash a host store).
@@ -2872,32 +3364,38 @@ defmodule Genswarms.LlmProxy.Plug do
   defp nonneg_int(v) when is_integer(v) and v >= 0, do: v
   defp nonneg_int(_), do: 0
 
-  defp record_discarded_attempts(opts, session, request_ctx, request, spent_before, discarded) do
-    Enum.reduce(discarded, spent_before, fn %{body: body}, spent ->
+  defp record_discarded_attempts(opts, session, request_ctx, request, budget, discarded) do
+    Enum.reduce(discarded, budget, fn %{body: body}, budget_acc ->
       usage = normalize_usage_counts(Map.get(body, "usage") || %{})
       upstream_router = upstream_router(Map.get(body, "x_router"))
       model = served_model(upstream_router, body, request)
-      {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, spent)
+      {cost, _invalid?} = executed_cost_usd(usage, opts, upstream_router, budget_acc.spent_usd)
       {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
-      record_budget_call(opts, session, request_ctx, %{
-        request_id: request_id(),
-        model: model,
-        status: "empty_retry",
-        prompt_tokens: usage["prompt_tokens"],
-        completion_tokens: usage["completion_tokens"],
-        total_tokens: usage["total_tokens"],
-        cached_tokens: cached_tokens,
-        non_cached_tokens: non_cached_tokens,
-        cost_usd: cost,
-        provider_cost_usd: provider_cost_usd(upstream_router),
-        provider_cost_state: provider_cost_state(upstream_router),
-        charge_basis: charge_basis(opts, upstream_router),
-        pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
-        provider: Map.get(upstream_router, "provider")
-      })
+      record_budget_call(
+        opts,
+        session,
+        request_ctx,
+        %{
+          request_id: request_id(),
+          model: model,
+          status: "empty_retry",
+          prompt_tokens: usage["prompt_tokens"],
+          completion_tokens: usage["completion_tokens"],
+          total_tokens: usage["total_tokens"],
+          cached_tokens: cached_tokens,
+          non_cached_tokens: non_cached_tokens,
+          cost_usd: cost,
+          provider_cost_usd: provider_cost_usd(upstream_router),
+          provider_cost_state: provider_cost_state(upstream_router),
+          charge_basis: charge_basis(opts, upstream_router),
+          pricing_version: Map.get(opts, :pricing_version, "cost_plus_v1"),
+          provider: Map.get(upstream_router, "provider")
+        },
+        budget_acc
+      )
 
-      Decimal.add(spent, cost)
+      Map.put(budget_acc, :spent_usd, Decimal.add(budget_acc.spent_usd, cost))
     end)
   end
 
@@ -3141,6 +3639,28 @@ defmodule Genswarms.LlmProxy.Plug do
     Decimal.compare(spent || Decimal.new("0"), limit || Proxy.default_daily_limit()) != :lt
   end
 
+  # Credits only matter once the free daily budget is spent: the gate is
+  # exhausted?(budget) AND credit_exhausted?. Reading the balance only on the
+  # already-exhausted path keeps the hot path store-call-free and makes the
+  # no-credits configuration byte-identical to 0.2.19 (balance 0 → true).
+  #
+  # (B2) Feature-gated on `credits_enabled` (derived from `payments_source`
+  # config being present, see init/1): when off, this returns true WITHOUT
+  # reading any balance — zero credit consults, byte-identical 0.2.19
+  # blocking. A feature-off install must never be unblocked by a stray/
+  # hand-credited mirror balance, and enabling payments later must never
+  # retro-charge overage accrued while the feature was off.
+  @doc false
+  # Public for the credit-spend check: composes with exhausted?/1 in the two cond gates.
+  def credit_exhausted?(opts, session) do
+    if Map.get(opts, :credits_enabled, false) do
+      balance = Proxy.credit_balance(opts.state_pid, opts.store_mod, session.budget_identity)
+      Decimal.compare(balance, Decimal.new("0")) != :gt
+    else
+      true
+    end
+  end
+
   defp request_quota_exhausted?(opts, budget) do
     limit = request_quota_limit(opts)
     limit > 0 and request_count(Map.get(budget, :requests, 0)) >= limit
@@ -3250,7 +3770,7 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp budget_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
     bump_quota_metric(opts, session, "budget_exhausted")
-    notice = budget_notice(request_ctx, budget)
+    notice = budget_notice(request_ctx, budget, opts, session)
 
     # Deterministic Telegram delivery + block metrics are mode-independent; only the
     # HTTP response body differs (SSE chunk vs buffered JSON).
@@ -3499,9 +4019,51 @@ defmodule Genswarms.LlmProxy.Plug do
     })
   end
 
-  defp budget_notice(request_ctx, _budget) do
+  # Exposed @doc false so the credit-surfaces check can drive the hint-append
+  # logic directly (like bump_metric). Base text is byte-identical to 0.2.19;
+  # the hint (from opts.topup_hint_fun, see init/1) is appended on its own
+  # line only when credits_enabled is true (R3-M2), the fun is present, its
+  # result non-empty, and the fun doesn't raise.
+  @doc false
+  def budget_notice(request_ctx, _budget, opts, session) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
-    "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+    base = "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+
+    case topup_hint(opts, session) do
+      nil -> base
+      hint -> base <> "\n" <> hint
+    end
+  end
+
+  # (R3-M2) Gated on the SAME strict credits_enabled derivation as every
+  # other credit surface (block gate, debit chokepoint, handler,
+  # quota_status): with credits off, this object silently drops every
+  # payment_confirmed, so rendering the hint would point a blocked user at a
+  # payment path that cannot credit them. Off (or key absent) -> no hint,
+  # byte-identical to 0.2.19 regardless of a configured fun.
+  defp topup_hint(opts, session) do
+    if Map.get(opts, :credits_enabled, false) do
+      do_topup_hint(opts, session)
+    end
+  end
+
+  defp do_topup_hint(opts, session) do
+    case Map.get(opts, :topup_hint_fun) do
+      fun when is_function(fun, 1) ->
+        try do
+          case fun.(session.budget_identity) do
+            hint when is_binary(hint) and hint != "" -> hint
+            _ -> nil
+          end
+        rescue
+          _ -> nil
+        catch
+          _, _ -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   defp request_quota_notice(request_ctx, _limit) do
@@ -3510,7 +4072,10 @@ defmodule Genswarms.LlmProxy.Plug do
     "⏳ This chat reached today's daily LLM request limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
   end
 
-  defp record_budget_call(opts, session, request_ctx, record) do
+  @doc false
+  # Public for the credit-spend check: the straddle-debit chokepoint every
+  # spend-recording call site funnels through.
+  def record_budget_call(opts, session, request_ctx, record, spent_before \\ nil) do
     store_row =
       try do
         record_llm_call(
@@ -3549,7 +4114,121 @@ defmodule Genswarms.LlmProxy.Plug do
     end
 
     Proxy.record_usage(opts.state_pid, session, request_ctx.day, request_ctx.session_id, record)
+    maybe_debit_credit(opts, session, record, spent_before)
     store_row
+  end
+
+  # Straddle math: only the portion of this call's cost ABOVE the daily limit is
+  # credit-funded. overflow(spent) = max(0, spent - limit);
+  # debit = overflow(spent_before + cost) - overflow(spent_before).
+  #
+  # (B2) Feature-gated on `credits_enabled`: a feature-off install must never
+  # accrue a negative mirror balance (which would retro-charge pre-feature
+  # overage the moment payments are enabled later) — no-op entirely when off,
+  # before touching the credit store at all.
+  #
+  # (X2) The 5th arg (formerly a bare `spent_before` Decimal) is now whatever the
+  # call site has: nil (no debit), the legacy bare spent_before (a Decimal or —
+  # X3 — an integer, for direct/legacy callers that never carried a limit
+  # alongside it), or the full `budget` map the exhausted?/1 gate itself
+  # consulted (%{spent_usd:, limit_usd:}). normalize_debit_budget/1 collapses
+  # all three into one shape so do_maybe_debit_credit/4 always has a
+  # `limit_usd` to prefer — the gate and the debit MUST agree on the same
+  # limit (a store-row-pinned budget.limit_usd that differs from
+  # session.daily_limit_usd otherwise double- or under-charges the straddle
+  # band the gate actually used).
+  defp maybe_debit_credit(_opts, _session, _record, nil), do: :ok
+
+  defp maybe_debit_credit(opts, session, record, budget) do
+    if Map.get(opts, :credits_enabled, false) do
+      do_maybe_debit_credit(opts, session, record, normalize_debit_budget(budget))
+    else
+      :ok
+    end
+  end
+
+  # Legacy bare spent_before (Decimal or — X3 — integer): no limit info travels
+  # with it, so do_maybe_debit_credit/4 falls back to session/opts exactly as
+  # before. Proxy.decimal/1 coerces the integer case (a store returning an
+  # integer spent_usd is legal per 0.2.19 and must not crash here).
+  defp normalize_debit_budget(%Decimal{} = spent_before),
+    do: %{spent_usd: spent_before, limit_usd: nil}
+
+  defp normalize_debit_budget(spent_before) when is_integer(spent_before),
+    do: %{spent_usd: Proxy.decimal(spent_before), limit_usd: nil}
+
+  # The real budget map (from budget_status/fallback_budget_status): carry its
+  # limit_usd through so the debit uses the SAME limit the gate saw. spent_usd
+  # is still coerced (X3) in case a legacy store's budget row carries an
+  # integer there too.
+  defp normalize_debit_budget(%{} = budget) do
+    %{
+      spent_usd: Proxy.decimal(Map.get(budget, :spent_usd)),
+      # (I2) A nonconforming store row can carry limit_usd: nil. The gate
+      # (exhausted?/1) falls back `limit || Proxy.default_daily_limit()` — the
+      # debit must use the EXACT same fallback, not the session/opts chain, or
+      # a nil-limit row makes gate and debit disagree on where the free band
+      # ends (under- or double-charging the straddle). The session/opts chain
+      # remains only for the legacy bare-Decimal/integer arms above, which
+      # never saw a budget map at all.
+      limit_usd: Map.get(budget, :limit_usd) || Proxy.default_daily_limit()
+    }
+  end
+
+  defp do_maybe_debit_credit(opts, session, record, %{spent_usd: spent_before, limit_usd: gate_limit}) do
+    with %Decimal{} = cost <- Map.get(record, :cost_usd),
+         request_id when is_binary(request_id) <- Map.get(record, :request_id) do
+      limit = gate_limit || session.daily_limit_usd || opts.default_daily_limit
+      zero = Decimal.new("0")
+      overflow = fn spent -> Decimal.max(zero, Decimal.sub(spent, limit)) end
+      debit = Decimal.sub(overflow.(Decimal.add(spent_before, cost)), overflow.(spent_before))
+
+      if Decimal.compare(debit, zero) == :gt do
+        entry = %{
+          idempotency_key: "debit:" <> request_id,
+          budget_identity: session.budget_identity,
+          amount_usd: Decimal.negate(debit),
+          kind: "debit",
+          at: DateTime.utc_now(),
+          meta: %{"request_id" => request_id}
+        }
+
+        case Proxy.apply_credit_entry(opts.state_pid, opts.store_mod, entry) do
+          {:error, :store_unavailable} ->
+            # (I1) The request was ALREADY served — budget-side accounting fails
+            # OPEN, per the spec's failure asymmetry — and unlike the top-up path
+            # (credit_payment/2, whose retryable NACK makes the hub redeliver),
+            # a debit has no redelivery vehicle: a durable-write failure here
+            # would otherwise lose the debit silently and forever. Make the loss
+            # visible (same degraded log+metric pattern as record_budget_call/5's
+            # store-down branch), then re-apply the entry MIRROR-ONLY (store_mod
+            # nil -> apply_credit_entry's :no_store arm) so the fail-open mirror
+            # balance stays the conservative, lower figure while the store is
+            # down. Safe on both sides of recovery: balance reads are
+            # durable-first (credit_balance/3), so a healed store's un-debited
+            # balance simply shadows the mirror — nothing re-syncs the mirror
+            # from durable, and the mirror-only re-apply re-takes the
+            # idempotency seen-mark, so the same request_id can never be
+            # double-applied by any later replay. The durable ledger's missing
+            # debit (an outage-window under-charge) is the documented rider.
+            Logger.warning(
+              "llm_proxy: credit DEBIT store write FAILED — debit applied to in-memory " <>
+                "mirror only; durable ledger under-charges this call (no retry vehicle); " <>
+                "request_id=#{request_id} debit_usd=#{Decimal.to_string(debit)}"
+            )
+
+            bump_metric(opts, "llm_proxy_budget_degraded")
+            Proxy.apply_credit_entry(opts.state_pid, nil, entry)
+
+          _ ->
+            :ok
+        end
+      end
+
+      :ok
+    else
+      _ -> :ok
+    end
   end
 
   defp record_llm_call(store_mod, budget_identity, day, session_id, record, default_limit) do
@@ -3590,7 +4269,9 @@ defmodule Genswarms.LlmProxy.Plug do
       provider: Map.get(upstream_router, "provider")
     }
 
-    record_budget_call(opts, session, request_ctx, record)
+    # (X2) Pass the full `budget` map so the debit sees the same limit_usd the
+    # cond's exhausted?/1 gate did (not a re-derived session/opts limit).
+    record_budget_call(opts, session, request_ctx, record, budget)
 
     json(
       conn,
@@ -3669,7 +4350,8 @@ defmodule Genswarms.LlmProxy.Plug do
         {base_record, %{}, nil}
       end
 
-    record_budget_call(opts, session, request_ctx, record)
+    # (X2) Same limit_usd the gate saw, not a re-derived session/opts one.
+    record_budget_call(opts, session, request_ctx, record, budget)
 
     json(conn, status, %{
       error: %{
@@ -4264,12 +4946,20 @@ defmodule Genswarms.LlmProxy.Plug do
         bump_metric(s.opts, "llm_proxy_stream_status_mismatch")
         Logger.error(sanitize_log("llm_proxy: streamed upstream returned status #{status}"))
 
-        record_budget_call(s.opts, s.session, s.request_ctx, %{
-          request_id: request_id(),
-          model: model,
-          status: "upstream_#{status}",
-          provider: Map.get(router, "provider")
-        })
+        # (X2) Consistent with every other call site: pass the full budget map
+        # (this record carries no cost_usd, so maybe_debit_credit no-ops anyway).
+        record_budget_call(
+          s.opts,
+          s.session,
+          s.request_ctx,
+          %{
+            request_id: request_id(),
+            model: model,
+            status: "upstream_#{status}",
+            provider: Map.get(router, "provider")
+          },
+          s.budget
+        )
 
       mode == :done ->
         bump_metric(s.opts, "llm_proxy_stream_disconnected")
@@ -4318,22 +5008,28 @@ defmodule Genswarms.LlmProxy.Plug do
   defp record_stream(s, model, usage, cost, router) do
     {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, router)
 
-    record_budget_call(s.opts, s.session, s.request_ctx, %{
-      request_id: request_id(),
-      model: model,
-      status: "ok",
-      prompt_tokens: usage["prompt_tokens"],
-      completion_tokens: usage["completion_tokens"],
-      total_tokens: usage["total_tokens"],
-      cached_tokens: cached_tokens,
-      non_cached_tokens: non_cached_tokens,
-      cost_usd: cost,
-      provider_cost_usd: provider_cost_usd(router),
-      provider_cost_state: provider_cost_state(router),
-      charge_basis: charge_basis(s.opts, router),
-      pricing_version: Map.get(s.opts, :pricing_version, "cost_plus_v1"),
-      provider: Map.get(router, "provider")
-    })
+    record_budget_call(
+      s.opts,
+      s.session,
+      s.request_ctx,
+      %{
+        request_id: request_id(),
+        model: model,
+        status: "ok",
+        prompt_tokens: usage["prompt_tokens"],
+        completion_tokens: usage["completion_tokens"],
+        total_tokens: usage["total_tokens"],
+        cached_tokens: cached_tokens,
+        non_cached_tokens: non_cached_tokens,
+        cost_usd: cost,
+        provider_cost_usd: provider_cost_usd(router),
+        provider_cost_state: provider_cost_state(router),
+        charge_basis: charge_basis(s.opts, router),
+        pricing_version: Map.get(s.opts, :pricing_version, "cost_plus_v1"),
+        provider: Map.get(router, "provider")
+      },
+      s.budget
+    )
   end
 
   # True iff the bounded acc tail contains the SSE terminator as a whole frame — a trimmed
