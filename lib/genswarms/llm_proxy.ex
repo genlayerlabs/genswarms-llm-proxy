@@ -330,7 +330,7 @@ defmodule Genswarms.LlmProxy do
        # payments_source is the only trusted sender of {"action":"payment_confirmed"}.
        payments_source: Map.get(config, :payments_source),
        credit_namespace: Map.get(config, :credit_namespace, "default"),
-       credit_per_usd: decimal(Map.get(config, :credit_per_usd, "1.0")),
+       credit_per_usd: validate_credit_per_usd!(Map.get(config, :credit_per_usd, "1.0")),
        # (B2) Same derivation as plug_opts.credits_enabled above — kept
        # alongside payments_source on the object-side state too, one
        # resolution point for "are credits on" regardless of which side asks.
@@ -355,6 +355,26 @@ defmodule Genswarms.LlmProxy do
       v when is_binary(v) and v != "" -> true
       v when is_atom(v) and v not in [nil, false] -> true
       _ -> false
+    end
+  end
+
+  # (M3) Boot-reject a garbage credit_per_usd the same way a bad pricing
+  # config is boot-rejected (validate_pricing_config!/3): the tolerant
+  # decimal/1 maps unparseable strings to Decimal 0, so a typo'd
+  # `credit_per_usd: "1,0"` would otherwise ack EVERY payment
+  # `ok:true, credited_usd:"0.00"` — accepted and discarded, and the hub
+  # (correctly) never retries an acked confirmation. The default "1.0"
+  # always passes; only an explicitly configured non-parseable, non-finite,
+  # or non-positive value refuses boot.
+  defp validate_credit_per_usd!(value) do
+    with %Decimal{} = d <- strict_decimal(value),
+         true <- finite_decimal?(d) and Decimal.compare(d, Decimal.new(0)) == :gt do
+      d
+    else
+      _ ->
+        raise ArgumentError,
+              "credit_per_usd must be a positive finite decimal (a string like \"1.0\"), " <>
+                "got: #{inspect(value)} — a tolerant parse would silently zero every payment"
     end
   end
 
@@ -444,6 +464,15 @@ defmodule Genswarms.LlmProxy do
     namespace = Map.get(state, :credit_namespace, "default")
 
     cond do
+      # (M2) Gate on the SAME strict credits_enabled derivation the plug side
+      # uses (init/1 stores it next to payments_source; false/nil = feature
+      # off = reject). Gating on raw payments_source alone let
+      # `payments_source: false` — OFF everywhere else per X5a — pass the
+      # to_string/1 trust compare for a sender literally named "false" and
+      # mint a mirror balance invisible to the (correctly off) gate.
+      not Map.get(state, :credits_enabled, false) ->
+        {:noreply, state}
+
       is_nil(source) or source == "" ->
         {:noreply, state}
 
@@ -454,12 +483,31 @@ defmodule Genswarms.LlmProxy do
 
         {:noreply, state}
 
-      Map.get(msg, "namespace") != namespace ->
+      normalize_namespace(Map.get(msg, "namespace")) != normalize_namespace(namespace) ->
         {:noreply, state}
 
       true ->
         credit_payment(msg, state)
     end
+  end
+
+  # (M5b) Same to_string/1 normalization the source compare above applies: a
+  # host configuring `credit_namespace` as an atom (`:default`, e.g. from
+  # keyword/IR config) must not silently drop every payment against the
+  # JSON-decoded binary "default". Only stringable scalars are normalized —
+  # a hostile non-scalar JSON "namespace" (map/list) stays as-is and simply
+  # mismatches (ignored), never raising out of the handler.
+  defp normalize_namespace(v) when is_binary(v) or is_atom(v) or is_number(v), do: to_string(v)
+  defp normalize_namespace(v), do: v
+
+  # (M1) "debit:<request_id>" is the ledger's RESERVED internal keyspace
+  # (see do_maybe_debit_credit/4): a top-up whose method is literally "debit"
+  # would mint idempotency keys a real debit's "debit:" <> request_id can
+  # collide with — the colliding debit would then be swallowed as :duplicate
+  # and the balance never drawn down. Refuse it outright, non-retryable (the
+  # payload can never become valid; the hub must not redeliver).
+  defp credit_payment(%{"method" => "debit"}, state) do
+    {:reply, Jason.encode!(%{ok: false, error: "reserved_method"}), state}
   end
 
   defp credit_payment(msg, state) do
@@ -527,9 +575,17 @@ defmodule Genswarms.LlmProxy do
   # Infinity would pass the >0 guard and mint an infinite balance. Reject both
   # here so they fall to the same bad_payment_confirmed reply as any other
   # malformed amount.
+  # (M4) Exponent forms are NOT part of the contract either: Decimal.parse/1
+  # happily accepts "5e2" (= 500.00) with a finite integer coefficient, but
+  # the wire contract is plain decimal strings only (the hub sends
+  # Decimal.to_string/1 of a normalized amount) — a stray exponent is far
+  # more likely a malformed/hostile payload than a legitimate five-hundred-
+  # dollar top-up, so it falls to the same bad_payment_confirmed reply.
   defp parse_money(v) when is_binary(v) do
-    case Decimal.parse(v) do
-      {%Decimal{coef: coef} = d, ""} when is_integer(coef) -> {:ok, d}
+    with false <- String.contains?(v, ["e", "E"]),
+         {%Decimal{coef: coef} = d, ""} when is_integer(coef) <- Decimal.parse(v) do
+      {:ok, d}
+    else
       _ -> :error
     end
   end

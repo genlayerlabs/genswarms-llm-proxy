@@ -48,7 +48,11 @@ state = %{
   store_mod: nil,
   payments_source: "payments",
   credit_namespace: "llm_quota",
-  credit_per_usd: Decimal.new("1.0")
+  credit_per_usd: Decimal.new("1.0"),
+  # (M2) init/1 always derives and stores this next to payments_source; the
+  # handler now gates on it (strict, false/nil = off), so the fixture carries
+  # the same shape a real boot produces.
+  credits_enabled: true
 }
 
 # 1. trusted source + right namespace credits
@@ -92,11 +96,31 @@ check.(
 )
 
 # 5. feature off (payments_source nil) → ignored even from any source
-state_off = %{state | payments_source: nil}
+state_off = %{state | payments_source: nil, credits_enabled: false}
 
 check.(
   "feature-off ignores payment_confirmed",
   match?({:noreply, _}, Proxy.handle_message("payments", msg.(%{"ref" => "0xT:3"}), state_off))
+)
+
+# 5b. (M2) payments_source: false derives credits_enabled false (X5a) — a
+# sender literally named "false" must NOT pass the to_string/1 trust compare
+# and mint an invisible mirror balance: the handler gates on the same strict
+# credits_enabled derivation as the plug side, BEFORE any source compare.
+state_false = %{state | payments_source: false, credits_enabled: false}
+bi_false = "w:false-gate|k:dm|c:tg:2:0"
+
+check.(
+  "payments_source: false + sender \"false\" -> rejected (credits_enabled gate), " <>
+    "no mirror balance minted",
+  match?(
+    {:noreply, _},
+    Proxy.handle_message(
+      "false",
+      msg.(%{"ref" => "0xT:falsegate", "beneficiary" => bi_false}),
+      state_false
+    )
+  ) and Decimal.equal?(Proxy.credit_balance(pid, nil, bi_false), Decimal.new("0"))
 )
 
 # 6. conversion: credit_per_usd 2.0 doubles
@@ -242,6 +266,99 @@ check.(
 check.(
   "numeric amount_usd never touched the balance",
   Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
+# 13c. (M4) Exponent strings are NOT part of the contract: Decimal.parse/1
+# accepts "5e2" (finite integer coefficient, = 500.00), so without an explicit
+# rejection a malformed/hostile exponent amount would mint 100x the intended
+# balance. Plain decimal strings only.
+for {label, ref, exp_amount} <- [
+      {"5e2", "0xT:exp1", "5e2"},
+      {"1E+2", "0xT:exp2", "1E+2"},
+      {"5.0e-1", "0xT:exp3", "5.0e-1"}
+    ] do
+  {:reply, json_exp, _} =
+    Proxy.handle_message(
+      "payments",
+      msg.(%{"ref" => ref, "amount_usd" => exp_amount}),
+      state
+    )
+
+  check.(
+    "exponent amount_usd #{label} refused (plain decimal strings only)",
+    Jason.decode!(json_exp)["ok"] == false
+  )
+end
+
+check.(
+  "exponent amounts never touched the balance",
+  Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
+# 13d. (M1) method "debit" is the ledger's reserved internal keyspace
+# ("debit:<request_id>" — see do_maybe_debit_credit/4): a top-up keyed
+# "debit:<ref>" could swallow a real debit whose request_id collides with ref
+# as :duplicate (balance never drawn down). Refused, non-retryable.
+{:reply, json_reserved, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "req-collide", "method" => "debit"}),
+    state
+  )
+
+reply_reserved = Jason.decode!(json_reserved)
+
+check.(
+  "method \"debit\" refused as reserved_method, non-retryable, balance untouched",
+  reply_reserved["ok"] == false and reply_reserved["error"] == "reserved_method" and
+    reply_reserved["retryable"] != true and
+    Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("5.00"))
+)
+
+check.(
+  "the rejected reserved-method top-up did NOT consume the \"debit:req-collide\" key — " <>
+    "a real debit with that request_id still applies",
+  match?(
+    {:ok, _},
+    Proxy.apply_credit_entry(pid, nil, %{
+      idempotency_key: "debit:req-collide",
+      budget_identity: bi,
+      amount_usd: Decimal.new("-1.00"),
+      kind: "debit",
+      at: ~U[2026-07-22 12:00:00Z],
+      meta: %{}
+    })
+  ) and Decimal.equal?(Proxy.credit_balance(pid, nil, bi), Decimal.new("4.00"))
+)
+
+# 13e. (M5b) credit_namespace configured as an ATOM (e.g. keyword/IR config)
+# must match the JSON-decoded binary namespace — the compare is to_string/1
+# normalized on both sides, same as the source compare. A non-scalar JSON
+# namespace still mismatches without raising.
+state_atom_ns = %{state | credit_namespace: :llm_quota}
+
+{:reply, json_atom_ns, _} =
+  Proxy.handle_message(
+    "payments",
+    msg.(%{"ref" => "0xT:atomns", "beneficiary" => "w:atomns|k:dm|c:tg:3:0"}),
+    state_atom_ns
+  )
+
+check.(
+  "atom credit_namespace :llm_quota matches wire \"llm_quota\" (to_string both sides)",
+  Jason.decode!(json_atom_ns)["ok"] == true
+)
+
+check.(
+  "non-scalar JSON namespace (map) mismatches silently, no raise",
+  match?(
+    {:noreply, _},
+    Proxy.handle_message(
+      "payments",
+      msg.(%{"ref" => "0xT:mapns", "namespace" => %{"x" => 1}}),
+      state
+    )
+  )
 )
 
 # 14. (X4) degraded-path check THROUGH handle_message: the approved spec's

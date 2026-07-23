@@ -190,6 +190,64 @@ check.(
 
 Genswarms.LlmProxy.terminate(:shutdown, state_string)
 
+# ── (M3) credit_per_usd boot validation: garbage must refuse to boot ─────────
+# The tolerant decimal/1 maps unparseable strings to Decimal 0, so a typo'd
+# credit_per_usd would otherwise ack every payment ok:true credited_usd:"0.00"
+# — accepted, discarded, and never retried (the hub correctly trusts an ack).
+# Same stance as validate_pricing_config!/3: config this wrong is a boot
+# error, not a silent runtime zero.
+for {label, bad} <- [
+      {"comma-decimal \"1,0\"", "1,0"},
+      {"unparseable \"abc\"", "abc"},
+      {"zero \"0\"", "0"},
+      {"negative \"-1.0\"", "-1.0"},
+      {"non-finite \"Infinity\"", "Infinity"}
+    ] do
+  raised =
+    try do
+      Genswarms.LlmProxy.init(%{
+        credits_false_config
+        | port: boot_port + 6,
+          payments_source: "payments"
+      }
+      |> Map.put(:credit_per_usd, bad))
+
+      :no_raise
+    rescue
+      _e in ArgumentError -> :raised
+    end
+
+  check.(
+    "init/1 with credit_per_usd #{label} refuses to boot (ArgumentError)",
+    raised == :raised
+  )
+end
+
+{:ok, state_per_usd} =
+  Genswarms.LlmProxy.init(
+    %{credits_false_config | port: boot_port + 7, payments_source: "payments"}
+    |> Map.put(:credit_per_usd, "2.0")
+  )
+
+check.(
+  "init/1 with a valid credit_per_usd \"2.0\" boots and stores the parsed Decimal",
+  Decimal.equal?(state_per_usd.credit_per_usd, Decimal.new("2.0"))
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_per_usd)
+
+# The untouched default "1.0" still boots (prime invariant: no credit config ->
+# no behavior change).
+{:ok, state_default_per_usd} =
+  Genswarms.LlmProxy.init(%{credits_false_config | port: boot_port + 8})
+
+check.(
+  "init/1 without credit_per_usd keeps booting on the default \"1.0\"",
+  Decimal.equal?(state_default_per_usd.credit_per_usd, Decimal.new("1.0"))
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_default_per_usd)
+
 # ─────────────────────────────────────────────────────────────────────────────
 failed = Agent.get(failures, & &1)
 IO.puts("")
