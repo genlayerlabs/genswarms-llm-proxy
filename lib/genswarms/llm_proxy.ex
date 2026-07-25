@@ -1474,14 +1474,23 @@ defmodule Genswarms.LlmProxy do
   defp read_stuck_payments(msg, state) do
     case stuck_lookup(state, stuck_key_arg(msg)) do
       {:ok, rows} ->
-        shown = Enum.take(rows, @stuck_read_limit)
+        # ONE STUCK PAYMENT IS ONE ROW HERE, however many times it was recorded.
+        # The durable queue deliberately has no key uniqueness — a settlement
+        # can become stuck again after a restart or a mirror eviction and every
+        # repeat is operator evidence worth keeping — but this surface reports
+        # MONEY. Counting rows would show a single stuck settlement N times and
+        # add its amount into `total_usd` N times, which is a number nobody can
+        # act on. A key-less row (no idempotency_key derivable) is its own
+        # identity: collapsing those together would hide distinct money.
+        payments = Enum.uniq_by(rows, &(row_value(&1, :idempotency_key) || &1))
+        shown = Enum.take(payments, @stuck_read_limit)
 
         body = %{
           action: "stuck_payments",
           ok: true,
           count: length(shown),
           total_usd: money2(stuck_total(shown)),
-          complete: length(rows) <= @stuck_read_limit,
+          complete: length(payments) <= @stuck_read_limit,
           rows: Enum.map(shown, &stuck_row_view/1)
         }
 

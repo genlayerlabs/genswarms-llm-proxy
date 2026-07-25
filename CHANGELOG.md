@@ -8,7 +8,10 @@
   the cursor for the poll, `already_settled` for the hub's release, unreadable,
   and unrendered. Added two optional store callbacks —
   `list_llm_stuck_payments/1` (unresolved rows, or one key; excluding cleared
-  rows and rows already in the credit ledger; bounded server-side) and
+  rows and rows whose money is already in the credit ledger under EITHER key
+  domain — the row's own upstream `idempotency_key` or the `method:ref` join
+  derived from the stored row, which is the key a credit entry actually carries;
+  bounded server-side) and
   `clear_llm_stuck_payment/1` — and two actions behind a NEW `operator_sources`
   allowlist that defaults to `[]` and is gated exactly like `poll_payments`
   (exact source match, explicit refusal, never a silent drop):
@@ -21,7 +24,11 @@
   credit whose durable clear fails is reported `cleared: false` rather than as a
   tidy success. `operator_sources` is deliberately a second list, not a reuse of
   `poll_sources`: driving the credit poll and reaching into the money the poll
-  refused are different authorities.
+  refused are different authorities. `stuck_payments` reports PAYMENTS, not
+  rows: the durable queue has no key uniqueness by design (a repeat is operator
+  evidence), so repeats of one key are collapsed before `count`, `total_usd`
+  and `rows` — otherwise a single stuck settlement inflates the money total
+  once per poll tick it spends inside the trailing window.
 - `notice_variant/3` now reads holds DURABLE-FIRST, like the sentence it gates.
   Reading the mirror there while the sentence read the store meant the two
   disagreed on any instance that did not record the hold: the notice was built

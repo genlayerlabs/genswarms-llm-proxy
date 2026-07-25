@@ -323,7 +323,13 @@ calls `clear_llm_stuck_payment/1`; when that fails the reply says
 `cleared: false` rather than claiming the queue is tidy. Both actions require
 `credits_enabled` and a sender on `operator_sources`; both refuse explicitly.
 `list_llm_stuck_payments/1` MUST bound its own answer — the caller passes no
-limit.
+limit — and MUST exclude rows whose money is already in the credit ledger under
+EITHER key domain: the row's own `idempotency_key` (the upstream settlement
+key) or the `method:ref` join derived from the stored row (the credit key).
+Those two strings differ for every row the poll produces, so a store that joins
+key-to-key self-heals nothing. The read reports PAYMENTS, not rows: the queue
+has no key uniqueness by design, and repeats of one key are collapsed for
+`count`, `total_usd` and `rows`.
 
 **The hold surfaces are durable-first when the store allows it.** The mirror
 above is bounded and process-local, so a deploy erases it — and it is the only

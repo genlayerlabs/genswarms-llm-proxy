@@ -109,8 +109,24 @@ defmodule Genswarms.LlmProxy.Store do
 
   "Unresolved" is the store's judgement and MUST exclude money that has since
   been credited or explicitly cleared, exactly as `list_llm_held_payments/1`
-  does: rows cleared through `clear_llm_stuck_payment/1`, and rows whose
-  `idempotency_key` now exists in the credit ledger.
+  does: rows cleared through `clear_llm_stuck_payment/1`, and rows whose money
+  is now in the credit ledger.
+
+  THE CREDITED-KEY EXCLUSION SPANS TWO KEY DOMAINS, AND A STORE THAT MATCHES
+  ONLY ONE OF THEM HAS NOT IMPLEMENTED IT. A stuck row is keyed on whatever the
+  settlement carried — for the rows this proxy's poll produces that is the
+  UPSTREAM key (e.g. `"84532:0xTX:0"`) — while the credit entry that resolves
+  it is keyed `"method:ref"` (e.g. `"usdc_base-sepolia:0xTX:0"`). Those are two
+  deliberate dedup domains and the strings never match, so a key-to-key join
+  self-heals nothing for the dominant shape. The stored `row` carries `method`
+  and `ref`, which is exactly what the credit key is built from: exclude a row
+  when EITHER its own `idempotency_key` OR the `method:ref` join derived from
+  its stored `row` is in the ledger. This matters on two ordinary paths — a
+  crash between the credit and `clear_llm_stuck_payment/1`, and the ordinary
+  poll re-crediting a previously-stuck row through its trailing window, which
+  clears nothing at all. Without both legs the queue reports money as
+  uncredited that is in the ledger, which is the one property the queue exists
+  to provide.
 
   BOUNDED SERVER-SIDE. There is no limit parameter on purpose: an unbounded
   read on a table an outsider can grow is a DoS the caller cannot fix. The
