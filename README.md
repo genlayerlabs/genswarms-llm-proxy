@@ -78,7 +78,8 @@ content stating that no user notice was sent by this path.
 Object protocol: `{"action":"usage"}`, `{"action":"health"}`,
 `{"action":"quota_status","conversation_id":"…"}`,
 `{"action":"payment_confirmed",...}`, `{"action":"payment_held",...}` (see
-Prepaid credit ledger below), and `{"action":"poll_payments"}`.
+Prepaid credit ledger below), `{"action":"poll_payments"}`, and the
+operator-gated `{"action":"stuck_payments"}` / `{"action":"retry_stuck",…}`.
 
 ### `budget_identity/1` is a pinned contract
 
@@ -259,6 +260,12 @@ low-latency push path; polling reconciles the durable settlement outbox:
 - `poll_sources` (default `[]`) — engine-stamped senders allowed to invoke
   `{"action":"poll_payments"}`. Empty means refused even when
   `settlements_fn` is configured.
+- `operator_sources` (default `[]`) — engine-stamped senders allowed to invoke
+  the STUCK-queue operator actions `{"action":"stuck_payments"}` and
+  `{"action":"retry_stuck"}`. Gated by the same exact-match mechanism as
+  `poll_sources` and deliberately a SEPARATE list: driving the credit poll and
+  reaching into the money that poll refused are different authorities. Empty
+  means the surface belongs to nobody.
 
 Poll config is boot-validated: `poll_lag` must be a non-negative integer,
 `poll_limit` a positive integer, `poll_sources` a list, and `settlements_fn`
@@ -299,6 +306,24 @@ both-callbacks-or-neither optional group. `record_llm_stuck_payment/1` and
 `record_llm_held_payment/1` are independently optional and each receive the
 full row plus reason and timestamp. See `Genswarms.LlmProxy.Store` for exact
 return shapes.
+
+**The stuck queue is readable and retryable.** A permanently-rejected row is
+recorded here and the cursor advances past it, so without a read it is money
+that arrived, was not credited, and is visible nowhere. With
+`list_llm_stuck_payments/1` exported, `{"action":"stuck_payments"}` answers
+`{count, total_usd, complete, rows}` (each row `{idempotency_key, beneficiary,
+amount_usd, method, ref, reason, at}`), and
+`{"action":"retry_stuck","idempotency_key":"…"}` re-applies ONE stored row
+through `apply_payment/3` — the same validating path the push and the poll
+use, with the same namespace, method and amount gates, and the same globally
+unique credit key, so a retry credits at most once. A row that fails again is
+answered `ok:false, error:"still_invalid", reason:…`, metered
+(`llm_payments_stuck_retry_failed`), and left in the queue. A successful retry
+calls `clear_llm_stuck_payment/1`; when that fails the reply says
+`cleared: false` rather than claiming the queue is tidy. Both actions require
+`credits_enabled` and a sender on `operator_sources`; both refuse explicitly.
+`list_llm_stuck_payments/1` MUST bound its own answer — the caller passes no
+limit.
 
 **The hold surfaces are durable-first when the store allows it.** The mirror
 above is bounded and process-local, so a deploy erases it — and it is the only

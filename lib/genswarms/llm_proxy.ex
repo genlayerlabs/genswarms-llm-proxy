@@ -71,6 +71,19 @@ defmodule Genswarms.LlmProxy do
   @default_port 4318
   @default_daily_limit "0.50"
   @payments_stuck_limit 200
+
+  # (R4-P4-I5) Rows the `stuck_payments` operator read will render. The store
+  # caps its own answer (the contract requires it); this is the second bound,
+  # and the surface says plainly when the view is truncated.
+  @stuck_read_limit 100
+
+  # (R4-P4-I3) Second bound on the DURABLE hold read. The contract requires the
+  # store to cap it server-side, because it sits on a per-request path over a
+  # table a third party can grow (permissionless deposit addresses × a
+  # saturated issuance window). This is the belt to that store-side braces: a
+  # host that forgets still cannot make the notice path unbounded, and the
+  # truncation is logged rather than silent.
+  @held_read_limit 50
   # Bounded in-memory mirror of hub-quarantined ("held") settlements, per the
   # same FIFO/eviction-logged stance as the stuck queue. It is a NOTICE mirror,
   # never a money record: it credits nothing and the hub's operator queue is
@@ -408,6 +421,14 @@ defmodule Genswarms.LlmProxy do
        poll_lag: poll_config.poll_lag,
        poll_limit: poll_config.poll_limit,
        poll_sources: poll_config.poll_sources,
+       # (R4-P4-I5) Who may drive the OPERATOR actions on the stuck queue
+       # (`stuck_payments`, `retry_stuck`). Gated by the same allowlist
+       # mechanism as `poll_payments` and DEFAULTS TO THE EMPTY LIST: an
+       # operator surface nobody configured is an operator surface nobody has.
+       # Deliberately a SECOND list rather than a reuse of poll_sources —
+       # granting the operator verbs must not also grant the ability to drive
+       # the credit poll, and vice versa.
+       operator_sources: poll_config.operator_sources,
        # (B2) Same derivation as plug_opts.credits_enabled above — kept
        # alongside payments_source on the object-side state too, one
        # resolution point for "are credits on" regardless of which side asks.
@@ -440,6 +461,11 @@ defmodule Genswarms.LlmProxy do
     poll_lag = Map.get(config, :poll_lag, 100)
     poll_limit = Map.get(config, :poll_limit, 100)
     poll_sources = Map.get(config, :poll_sources, [])
+    operator_sources = Map.get(config, :operator_sources, [])
+
+    unless is_list(operator_sources) do
+      raise ArgumentError, "operator_sources must be a list, got: #{inspect(operator_sources)}"
+    end
 
     unless is_nil(settlements_fn) or is_function(settlements_fn, 2) do
       raise ArgumentError,
@@ -470,7 +496,8 @@ defmodule Genswarms.LlmProxy do
       settlements_fn: settlements_fn,
       poll_lag: poll_lag,
       poll_limit: poll_limit,
-      poll_sources: poll_sources
+      poll_sources: poll_sources,
+      operator_sources: operator_sources
     }
   end
 
@@ -567,6 +594,12 @@ defmodule Genswarms.LlmProxy do
 
       {:ok, %{"action" => "poll_payments"}} ->
         handle_poll_payments(from, state)
+
+      {:ok, %{"action" => "stuck_payments"} = msg} ->
+        handle_stuck_payments(from, msg, state)
+
+      {:ok, %{"action" => "retry_stuck"} = msg} ->
+        handle_retry_stuck(from, msg, state)
 
       {:ok, %{"action" => "payment_confirmed"} = msg} ->
         handle_payment_confirmed(from, msg, state)
@@ -1083,7 +1116,17 @@ defmodule Genswarms.LlmProxy do
     if store_callback?(store_mod, :list_llm_held_payments, 1) and is_binary(budget_identity) do
       case safe_store_call(store_mod, :list_llm_held_payments, [budget_identity]) do
         {:ok, rows} when is_list(rows) ->
-          Enum.map(rows, &normalize_held_row(&1, budget_identity))
+          if length(rows) > @held_read_limit do
+            Logger.warning(
+              "llm_proxy: durable held-payment read for #{inspect(budget_identity)} returned " <>
+                "#{length(rows)} rows — truncating to #{@held_read_limit}; the held total the " <>
+                "user is shown is a PARTIAL sum (the store is expected to cap this read)"
+            )
+          end
+
+          rows
+          |> Enum.take(@held_read_limit)
+          |> Enum.map(&normalize_held_row(&1, budget_identity))
 
         other ->
           Logger.warning(
@@ -1347,6 +1390,340 @@ defmodule Genswarms.LlmProxy do
     do: {:ok, to_string(value)}
 
   defp scalar_string(_value), do: :error
+
+  # ── (R4-P4-I5) the stuck queue: READ it, and RETRY it ──────────────────────
+  #
+  # A settled row this proxy classifies `{:permanent, _}` is recorded as stuck
+  # and the poll cursor ADVANCES PAST IT. Money that arrived, was not credited,
+  # and is then unreachable by every path at once — below the cursor for the
+  # poll, `already_settled` for the hub's release, unreadable, unrendered — is
+  # the same one-way door the durable hold closed, relocated one lane over.
+  # These two actions are the door handle on this side:
+  #
+  #   * `stuck_payments` — SEE it. A read, nothing else.
+  #   * `retry_stuck`  — re-apply ONE row through `apply_payment/3`, the SAME
+  #     validating path the push and the poll use. It is not a credit verb: it
+  #     mints nothing, bypasses nothing, and a row that is genuinely invalid
+  #     fails again with its reason recorded and STAYS in the queue. A row that
+  #     was stuck by a since-fixed cause credits exactly once — the ledger's
+  #     global idempotency key is what guarantees the "once", not this code.
+  #
+  # AUTHORIZATION is the same shape `poll_payments` uses (an exact-match source
+  # allowlist, explicit refusal, never a silent drop) against a SEPARATE list
+  # that defaults to empty. Separate because the two authorities are different:
+  # driving the credit poll is not the same permission as reaching into the
+  # money that the credit poll rejected.
+  defp handle_stuck_payments(from, msg, state) do
+    cond do
+      not operator_source_allowed?(from, state) ->
+        stuck_refusal(state, "stuck_payments", "untrusted_operator_source", msg)
+
+      not Map.get(state, :credits_enabled, false) ->
+        stuck_refusal(state, "stuck_payments", "credits_disabled", msg)
+
+      true ->
+        read_stuck_payments(msg, state)
+    end
+  end
+
+  defp handle_retry_stuck(from, msg, state) do
+    cond do
+      not operator_source_allowed?(from, state) ->
+        stuck_refusal(state, "retry_stuck", "untrusted_operator_source", msg)
+
+      not Map.get(state, :credits_enabled, false) ->
+        stuck_refusal(state, "retry_stuck", "credits_disabled", msg)
+
+      true ->
+        case stuck_key_arg(msg) do
+          nil -> stuck_refusal(state, "retry_stuck", "bad_request", msg)
+          key -> retry_stuck_payment(key, state)
+        end
+    end
+  end
+
+  defp operator_source_allowed?(from, state),
+    do: poll_source_allowed?(from, Map.get(state, :operator_sources, []))
+
+  defp stuck_key_arg(msg) do
+    case Map.get(msg, "idempotency_key") do
+      key when is_binary(key) and key != "" -> key
+      _ -> nil
+    end
+  end
+
+  # Every refusal is explicit and echoes the key it was asked about: these are
+  # typed by a human at a console, and a silent drop is indistinguishable from
+  # a broken proxy.
+  defp stuck_refusal(state, action, error, msg) do
+    if error == "untrusted_operator_source" do
+      Logger.warning("llm_proxy: refused #{action} from a source outside operator_sources")
+    end
+
+    body = %{action: action, ok: false, error: error}
+
+    body =
+      case stuck_key_arg(msg || %{}) do
+        nil -> body
+        key -> Map.put(body, :idempotency_key, key)
+      end
+
+    {:reply, Jason.encode!(body), state}
+  end
+
+  defp read_stuck_payments(msg, state) do
+    case stuck_lookup(state, stuck_key_arg(msg)) do
+      {:ok, rows} ->
+        shown = Enum.take(rows, @stuck_read_limit)
+
+        body = %{
+          action: "stuck_payments",
+          ok: true,
+          count: length(shown),
+          total_usd: money2(stuck_total(shown)),
+          complete: length(rows) <= @stuck_read_limit,
+          rows: Enum.map(shown, &stuck_row_view/1)
+        }
+
+        # Echo the key a scoped read named, like every refusal does: a caller
+        # correlating an async reply must not have to guess "most recent".
+        body =
+          case stuck_key_arg(msg) do
+            nil -> body
+            key -> Map.put(body, :idempotency_key, key)
+          end
+
+        {:reply, Jason.encode!(body), state}
+
+      :no_store ->
+        stuck_refusal(state, "stuck_payments", "no_stuck_store", msg)
+
+      {:error, _why} ->
+        stuck_refusal(state, "stuck_payments", "store_unavailable", msg)
+    end
+  end
+
+  defp retry_stuck_payment(key, state) do
+    case stuck_lookup(state, key) do
+      {:ok, []} ->
+        # Not a failure to hide: "this key is not in the unresolved queue" is
+        # also the answer after a successful retry, which is exactly right.
+        {:reply,
+         Jason.encode!(%{
+           action: "retry_stuck",
+           ok: false,
+           error: "not_stuck",
+           idempotency_key: key
+         }), state}
+
+      {:ok, [row | _]} ->
+        apply_stuck_retry(key, row, state)
+
+      :no_store ->
+        stuck_refusal(state, "retry_stuck", "no_stuck_store", %{"idempotency_key" => key})
+
+      {:error, _why} ->
+        stuck_refusal(state, "retry_stuck", "store_unavailable", %{"idempotency_key" => key})
+    end
+  end
+
+  defp apply_stuck_retry(key, row, state) do
+    payload = row_value(row, :row)
+
+    if is_map(payload) do
+      # THE SAME validating path a push and a poll take — including the
+      # namespace gate and the reserved-method gate. `apply_payment/3` is the
+      # only way credit is ever applied in this module and this is not an
+      # exception to that.
+      case apply_payment(poll_payment_message(payload), state, "retry") do
+        {:applied, credited, balance, credit_key} ->
+          finish_stuck_retry(key, state, %{
+            credited_usd: money2(credited),
+            balance_usd: money2(balance),
+            credit_key: credit_key,
+            duplicate: false
+          })
+
+        {:duplicate, credit_key} ->
+          # The money is already in the ledger; the queue row is stale. Clearing
+          # it is the whole point of answering `:duplicate` here.
+          finish_stuck_retry(key, state, %{credit_key: credit_key, duplicate: true})
+
+        {:transient, _credit_key} ->
+          bump_store_metric(
+            resolve_store_mod(state),
+            "llm_payments_stuck_retry_failed",
+            %{idempotency_key: key, reason: "store_unavailable"},
+            1
+          )
+
+          {:reply,
+           Jason.encode!(%{
+             action: "retry_stuck",
+             ok: false,
+             error: "store_unavailable",
+             retryable: true,
+             idempotency_key: key
+           }), state}
+
+        {:permanent, reason, _credit_key} ->
+          # Idempotent in the direction that matters: an invalid row fails the
+          # SAME way every time, the reason is recorded durably (metric) and in
+          # the reply, and the row is NOT cleared — it stays in the queue,
+          # visible, rather than being silently re-stuck or silently dropped.
+          Logger.error(
+            "llm_proxy: retry_stuck #{inspect(key)} rejected again: #{inspect(reason)} — the row stays in the stuck queue"
+          )
+
+          bump_store_metric(
+            resolve_store_mod(state),
+            "llm_payments_stuck_retry_failed",
+            %{idempotency_key: key, reason: reason},
+            1
+          )
+
+          {:reply,
+           Jason.encode!(%{
+             action: "retry_stuck",
+             ok: false,
+             error: "still_invalid",
+             reason: reason,
+             idempotency_key: key
+           }), state}
+      end
+    else
+      Logger.error(
+        "llm_proxy: stuck row #{inspect(key)} carries no settlement payload to retry: #{inspect(payload)}"
+      )
+
+      {:reply,
+       Jason.encode!(%{
+         action: "retry_stuck",
+         ok: false,
+         error: "invalid_stuck_row",
+         idempotency_key: key
+       }), state}
+    end
+  end
+
+  # The credit landed (or was already there). Clearing the queue row is
+  # best-effort and NEVER undoes the credit — but it must be DURABLE to be
+  # worth anything, so a failed clear is said out loud (`cleared: false`)
+  # rather than reported as a tidy success.
+  defp finish_stuck_retry(key, state, detail) do
+    cleared = durable_clear_stuck_payment(state, key)
+    forget_stuck_payment(state, key)
+
+    bump_store_metric(
+      resolve_store_mod(state),
+      "llm_payments_stuck_retried",
+      %{idempotency_key: key, duplicate: detail.duplicate, cleared: cleared},
+      1
+    )
+
+    Logger.warning(
+      "llm_proxy: retry_stuck #{key} credited (duplicate=#{detail.duplicate}); #{cleared} durable queue row(s) cleared"
+    )
+
+    body =
+      detail
+      |> Map.take([:credited_usd, :balance_usd, :duplicate])
+      |> Map.merge(%{
+        action: "retry_stuck",
+        ok: true,
+        idempotency_key: key,
+        cleared: cleared > 0
+      })
+
+    {:reply, Jason.encode!(body), state}
+  end
+
+  defp stuck_lookup(state, key) do
+    store_mod = resolve_store_mod(state)
+
+    if store_callback?(store_mod, :list_llm_stuck_payments, 1) do
+      case safe_store_call(store_mod, :list_llm_stuck_payments, [key]) do
+        {:ok, rows} when is_list(rows) ->
+          {:ok, rows}
+
+        other ->
+          Logger.error("llm_proxy: stuck-payment read failed: #{inspect(other)}")
+          {:error, other}
+      end
+    else
+      :no_store
+    end
+  end
+
+  defp durable_clear_stuck_payment(state, key) do
+    store_mod = resolve_store_mod(state)
+
+    if store_callback?(store_mod, :clear_llm_stuck_payment, 1) do
+      case safe_store_call(store_mod, :clear_llm_stuck_payment, [key]) do
+        {:ok, count} when is_integer(count) and count >= 0 ->
+          count
+
+        other ->
+          Logger.error(
+            "llm_proxy: durable stuck-payment CLEAR failed for #{inspect(key)}: #{inspect(other)}"
+          )
+
+          bump_store_metric(
+            store_mod,
+            "llm_payments_stuck_clear_failed",
+            %{idempotency_key: key},
+            1
+          )
+
+          0
+      end
+    else
+      0
+    end
+  end
+
+  # The mirror is this module's dedupe horizon for `record_stuck_payment/4`.
+  # Leaving a retried key in it would make a genuine LATER re-stuck of the same
+  # key invisible (deduped away), and would keep inflating `quota_status`'s
+  # stuck count for money that is now credited.
+  defp forget_stuck_payment(state, key) do
+    Agent.update(Map.get(state, :state_pid, @state_name), fn mirror ->
+      stuck = Map.get(mirror, :stuck_payments, [])
+      Map.put(mirror, :stuck_payments, Enum.reject(stuck, &(stuck_key(&1) == key)))
+    end)
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp stuck_total(rows) do
+    Enum.reduce(rows, Decimal.new("0"), fn row, acc ->
+      payload = row_value(row, :row)
+      amount = if is_map(payload), do: row_value(payload, :amount_usd), else: nil
+      Decimal.add(acc, decimal(amount || 0))
+    end)
+  end
+
+  defp stuck_row_view(row) do
+    payload = if is_map(row_value(row, :row)), do: row_value(row, :row), else: %{}
+
+    %{
+      idempotency_key: row_value(row, :idempotency_key),
+      beneficiary: row_value(payload, :beneficiary),
+      amount_usd: money2(decimal(row_value(payload, :amount_usd) || 0)),
+      method: row_value(payload, :method),
+      ref: row_value(payload, :ref),
+      reason: row_value(row, :reason),
+      at: stuck_at_text(row_value(row, :at))
+    }
+  end
+
+  defp stuck_at_text(%DateTime{} = at), do: DateTime.to_iso8601(at)
+  defp stuck_at_text(value) when is_binary(value), do: value
+  defp stuck_at_text(_), do: nil
 
   defp poll_payments(state) do
     consumer = Map.get(state, :payments_consumer, "llm_proxy")
@@ -5080,9 +5457,23 @@ defmodule Genswarms.LlmProxy.Plug do
   #
   # PRIME INVARIANT: credits off (or a non-:budget cap) -> nil -> the dedup key
   # is the plain 3-tuple, byte-identical to 0.3.0.
+  # (R4-P4-I2) DURABLE-FIRST, exactly like the sentence itself. Reading the
+  # mirror here while `held_notice_line/2` reads durable is the C1 fix applied
+  # to the notice's CONTENT but not to its DUE decision, and the two then
+  # disagree across instances: the instance serving the blocked user builds the
+  # hold sentence from the durable row (correct) but computes the plain dedup
+  # key from its own empty mirror, so if that identity was already notified
+  # today with the plain text the notice is SUPPRESSED — and
+  # `synthetic_block_content/2` then tells the agent the user was already
+  # notified. The user is blocked, has already paid, and is told nothing for a
+  # whole notice_repeat_ms window. Same read, same authority, one argument.
   defp notice_variant(opts, session, :budget) do
     if Map.get(opts, :credits_enabled, false) do
-      case Proxy.held_payments(Map.get(opts, :state_pid), session.budget_identity) do
+      case Proxy.held_payments(
+             Map.get(opts, :state_pid),
+             Map.get(opts, :store_mod),
+             session.budget_identity
+           ) do
         [] -> nil
         _held -> :held
       end

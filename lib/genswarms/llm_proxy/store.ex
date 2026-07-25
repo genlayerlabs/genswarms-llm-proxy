@@ -89,6 +89,60 @@ defmodule Genswarms.LlmProxy.Store do
   @callback record_llm_stuck_payment(payment :: map()) :: :ok | {:error, term()}
 
   @doc """
+  UNRESOLVED permanently-rejected settlements — the read half of
+  `record_llm_stuck_payment/1`, and the reason it exists.
+
+  A settled row the proxy classifies `{:permanent, _}` is written to the stuck
+  queue and the poll cursor ADVANCES PAST IT. From that moment the money is
+  unreachable by every path at once: below the cursor, so no poll re-presents
+  it; already `settled` at the hub, so the operator release answers
+  `already_settled` and pushes nothing; and — until this callback — unreadable,
+  so no surface anywhere could even show that it existed. That is the same
+  one-way door the durable hold fixed, one lane over.
+
+  `idempotency_key` is `nil` for the whole unresolved queue, or a key to scope
+  to one row (what `retry_stuck` uses to fetch the row it re-applies).
+
+  Rows carry `idempotency_key`, `reason`, `at`, and `row` — the FULL settlement
+  map as it was rejected, because that map is what a retry re-applies. `row`
+  keys may be strings or atoms; the proxy reads both.
+
+  "Unresolved" is the store's judgement and MUST exclude money that has since
+  been credited or explicitly cleared, exactly as `list_llm_held_payments/1`
+  does: rows cleared through `clear_llm_stuck_payment/1`, and rows whose
+  `idempotency_key` now exists in the credit ledger.
+
+  BOUNDED SERVER-SIDE. There is no limit parameter on purpose: an unbounded
+  read on a table an outsider can grow is a DoS the caller cannot fix. The
+  store caps the rows it returns and the operator surface says the view may be
+  truncated. Optional and independent; without it the stuck queue is
+  write-only, as it was before 0.4.0.
+  """
+  @callback list_llm_stuck_payments(idempotency_key :: String.t() | nil) ::
+              {:ok, [map()]} | {:error, term()}
+
+  @doc """
+  Mark a stuck payment RESOLVED, durably.
+
+  Called after `retry_stuck` re-applied the row through the ordinary validating
+  credit path and it credited (or was already credited). Without a DURABLE
+  clear the row would reappear in the queue on the next read and an operator
+  would retry money that is already in the ledger — harmless (the credit key
+  dedupes) but indistinguishable from money that still needs attention, which
+  is the property the queue exists to provide.
+
+  A row that fails the validator again is NOT cleared: it stays visible, with
+  its reason, so the queue keeps showing exactly the money that still needs an
+  operator.
+
+  Returns the number of rows it resolved (0 is legitimate). Optional and
+  independent; without it a retry still credits — it just cannot durably tidy
+  the queue, which the reply says plainly rather than claiming otherwise.
+  """
+  @callback clear_llm_stuck_payment(idempotency_key :: String.t()) ::
+              {:ok, non_neg_integer()} | {:error, term()}
+
+  @doc """
   Append one HELD (hub-quarantined) settlement to the durable
   operator/user-facing record.
 
@@ -130,6 +184,19 @@ defmodule Genswarms.LlmProxy.Store do
   (`budget_identity`, `idempotency_key`, `ref`, `amount_usd` as a `Decimal`,
   `reason`, `at`). Optional and independent: without it the hold surfaces read
   the in-memory mirror exactly as they did before, i.e. memory-only.
+
+  BOUNDED SERVER-SIDE, and this is a requirement, not a suggestion. There is no
+  limit parameter on purpose — a limit the caller passes is a limit the caller
+  can get wrong, and this read sits on a PER-REQUEST path (every blocked
+  request builds the notice line from it, and `quota_status` reads it again).
+  The mirror this replaced was capped at 200 with logged eviction; the durable
+  table it reads is deliberately non-unique on `idempotency_key` and deposit
+  addresses are permissionless, so a saturated issuance window (which
+  quarantines everything) lets a third party grow one identity's row count at
+  will. The store MUST cap the rows it returns — the proxy additionally
+  truncates and logs, but a store that streams the whole table has already
+  spent the cost. Truncation is acceptable and must be visible; unboundedness
+  is not.
   """
   @callback list_llm_held_payments(budget_identity :: String.t()) ::
               {:ok, [map()]} | {:error, term()}
@@ -168,6 +235,8 @@ defmodule Genswarms.LlmProxy.Store do
                       llm_payments_cursor: 1,
                       put_llm_payments_cursor: 2,
                       record_llm_stuck_payment: 1,
+                      list_llm_stuck_payments: 1,
+                      clear_llm_stuck_payment: 1,
                       record_llm_held_payment: 1,
                       list_llm_held_payments: 1,
                       clear_llm_held_payment: 3

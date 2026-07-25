@@ -1177,6 +1177,112 @@ check.(
     not Proxy.notice_due?(off_pid, "llmb_off", :budget, today, now: ~U[2026-07-01 09:01:00Z])
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 8: (R4-P4-I2) the DUE decision is durable-first too]")
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The C1 fix moved the notice's CONTENT to the durable read and left its DUE
+# decision on the mirror. Those two then disagree on any instance that did not
+# record the hold — the rolling-restart replica, the second orchestrator, or
+# simply the process that serves the user after a deploy. That instance builds
+# the held sentence correctly from the durable row, but computes the dedup key
+# from its own EMPTY mirror, so if the identity was already notified today with
+# the plain text the notice is SUPPRESSED and synthetic_block_content/2 tells
+# the agent the user was already told. The user is blocked, has already paid,
+# and hears nothing for a whole notice_repeat_ms window.
+
+defmodule DurableNoticeStore do
+  @name __MODULE__
+
+  def start_link do
+    case Agent.start_link(fn -> [] end, name: @name) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+      err -> err
+    end
+  end
+
+  def hold(identity, key, amount) do
+    Agent.update(@name, fn rows ->
+      rows ++
+        [
+          %{
+            budget_identity: identity,
+            idempotency_key: key,
+            ref: key,
+            amount_usd: Decimal.new(amount),
+            reason: "max_payment",
+            at: ~U[2026-07-01 09:10:00Z]
+          }
+        ]
+    end)
+  end
+
+  # The durable read — the ONLY place this instance can learn about the hold.
+  def list_llm_held_payments(identity),
+    do: {:ok, Agent.get(@name, fn rows -> Enum.filter(rows, &(&1.budget_identity == identity)) end)}
+
+  # budget/credit surface delegated to the section-6 store so the block fires
+  # for the same reason it does everywhere else in this file.
+  def llm_budget_status(i, d, s, l), do: HeldNoticeStore.llm_budget_status(i, d, s, l)
+  def record_llm_call(a, b, c, d), do: HeldNoticeStore.record_llm_call(a, b, c, d)
+  def llm_credit_balance(bi), do: HeldNoticeStore.llm_credit_balance(bi)
+  def record_llm_credit_entry(e), do: HeldNoticeStore.record_llm_credit_entry(e)
+end
+
+{:ok, _} = DurableNoticeStore.start_link()
+
+# A FRESH state pid: this is the instance that never saw the payment_held cast,
+# i.e. its hold mirror is empty by construction.
+{:ok, other_np} = Proxy.start_state_link()
+
+i2_attrs = %{conversation_id: "tg:held3:0", slot: :held_agent, kind: :dm, workspace_key: "default"}
+i2_identity = Proxy.budget_identity(i2_attrs)
+{:ok, i2_token} = Proxy.register_session(other_np, i2_attrs)
+HeldNoticeStore.seed(i2_identity, today)
+
+i2_opts = %{notice_opts | state_pid: other_np, store_mod: DurableNoticeStore}
+
+set_clock.(~U[2026-07-01 09:00:00Z])
+reset_captured.()
+post.(i2_token, i2_opts)
+
+check.(
+  "(R4-P4-I2) precondition: the pre-hold notice went out with the plain text",
+  notices.() == [base_line]
+)
+
+# The hold is recorded by ANOTHER instance: durable row, empty mirror here.
+DurableNoticeStore.hold(i2_identity, "8453:0xi2:0", "5.00")
+
+check.(
+  "(R4-P4-I2) sanity: this instance's mirror really is empty — only the store knows",
+  Agent.get(other_np, &Map.get(&1, :held_payments, [])) == []
+)
+
+reset_captured.()
+set_clock.(~U[2026-07-01 09:20:00Z])
+post.(i2_token, i2_opts)
+
+check.(
+  "(R4-P4-I2) a hold recorded by ANOTHER instance still makes the notice DUE here — " <>
+    "the dedup key comes from the same durable read as the sentence",
+  notices.() == [
+    base_line <>
+      "\n" <>
+      "Payment received but held for review: $5.00 — not credited yet. An operator has to release it."
+  ]
+)
+
+reset_captured.()
+set_clock.(~U[2026-07-01 09:25:00Z])
+post.(i2_token, i2_opts)
+
+check.(
+  "(R4-P4-I2) …and the new key then rate-limits normally — one extra notice, not a loop",
+  notices.() == []
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 failed = Agent.get(failures, & &1)
 IO.puts("")

@@ -2,6 +2,38 @@
 
 ## 0.4.0 — 2026-07-25
 
+- The STUCK queue is no longer a one-way door. A settled row this proxy
+  classifies `{:permanent, _}` is recorded as stuck and the poll cursor advances
+  past it, after which the money was unreachable by every path at once: below
+  the cursor for the poll, `already_settled` for the hub's release, unreadable,
+  and unrendered. Added two optional store callbacks —
+  `list_llm_stuck_payments/1` (unresolved rows, or one key; excluding cleared
+  rows and rows already in the credit ledger; bounded server-side) and
+  `clear_llm_stuck_payment/1` — and two actions behind a NEW `operator_sources`
+  allowlist that defaults to `[]` and is gated exactly like `poll_payments`
+  (exact source match, explicit refusal, never a silent drop):
+  `stuck_payments` (see it) and `retry_stuck` (re-apply ONE row through
+  `apply_payment/3` — the same validating path the push and the poll use).
+  The retry mints nothing and bypasses nothing: a row stuck by a since-fixed
+  cause credits exactly once (the ledger's global key dedupe is what guarantees
+  the "once"), a row that is genuinely invalid fails again with its reason
+  recorded (`llm_payments_stuck_retry_failed`) and STAYS in the queue, and a
+  credit whose durable clear fails is reported `cleared: false` rather than as a
+  tidy success. `operator_sources` is deliberately a second list, not a reuse of
+  `poll_sources`: driving the credit poll and reaching into the money the poll
+  refused are different authorities.
+- `notice_variant/3` now reads holds DURABLE-FIRST, like the sentence it gates.
+  Reading the mirror there while the sentence read the store meant the two
+  disagreed on any instance that did not record the hold: the notice was built
+  correctly but the dedup key was the plain 3-tuple, so an identity already
+  notified that day was told nothing at all — while the agent was told the user
+  had already been notified — for a whole `notice_repeat_ms` window.
+- The durable hold read is now bounded on both sides. The contract states that
+  the store MUST cap it server-side (it sits on a per-request path over a table
+  a third party can grow, since deposit addresses are permissionless and a
+  saturated issuance window quarantines everything), and the proxy truncates at
+  50 rows with a warning rather than trusting that.
+
 - The hold notice now SURVIVES A RESTART. Added two optional store callbacks —
   `list_llm_held_payments/1` (unresolved holds for one budget identity,
   excluding cleared rows and rows already present in the credit ledger) and
