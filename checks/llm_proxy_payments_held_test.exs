@@ -1130,8 +1130,11 @@ check.(
   notices.() == []
 )
 
-# a SECOND hold (a second deposit the user watched leave their wallet) re-notifies
-# with the new summed amount
+# A SECOND hold does NOT mint a fresh dedup key. Folding the hold COUNT in would
+# make every settlement its own notice, and deposit addresses are permissionless:
+# with a saturated C1 window quarantining everything, a third party could drive
+# an unbounded notice loop through the rate limiter this machinery exists to be.
+# The variant is a flag; the larger sum rides the next due notice.
 {:reply, _, _} =
   Proxy.handle_message(
     "payments",
@@ -1144,8 +1147,18 @@ set_clock.(~U[2026-07-01 09:45:00Z])
 post.(m2_token, notice_opts)
 
 check.(
-  "(R4-M2) a SECOND hold re-notifies with the new summed amount (the count, not a " <>
-    "boolean, is folded into the dedup key)",
+  "(R4-NEW1) a SECOND hold does NOT re-notify — the variant is a flag, so the " <>
+    "count cannot bypass notice_repeat_ms",
+  notices.() == []
+)
+
+# ...and once the window reopens, the notice carries the SUMMED amount.
+reset_captured.()
+set_clock.(~U[2026-07-01 14:30:00Z])
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) the next due notice carries the summed held amount",
   notices.() == [
     base_line <>
       "\n" <>

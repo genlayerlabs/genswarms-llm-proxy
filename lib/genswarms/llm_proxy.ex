@@ -4958,9 +4958,13 @@ defmodule Genswarms.LlmProxy.Plug do
   # agent "the user was already notified earlier today; do not send a separate
   # user reply". That statement is true of the OLD text and false of the new.
   #
-  # The count (not a boolean) is folded in so a SECOND hold — a second deposit
-  # the user watched leave their wallet — also re-notifies with the new summed
-  # amount. It cannot spam: each increment requires a real settlement.
+  # The variant is a FLAG, never the hold count. Folding the count in mints a
+  # fresh dedup key per hold, which turns notice_repeat_ms into one notice per
+  # settlement — and deposit addresses are permissionless, so a saturated C1
+  # window (which quarantines everything) lets a third party drive that. The
+  # flag keeps what it was added for: the no-hold -> held transition changes the
+  # key once, so the first hold re-notifies instead of being swallowed. A later
+  # hold's larger sum rides the next due notice.
   #
   # PRIME INVARIANT: credits off (or a non-:budget cap) -> nil -> the dedup key
   # is the plain 3-tuple, byte-identical to 0.3.0.
@@ -4968,7 +4972,7 @@ defmodule Genswarms.LlmProxy.Plug do
     if Map.get(opts, :credits_enabled, false) do
       case Proxy.held_payments(Map.get(opts, :state_pid), session.budget_identity) do
         [] -> nil
-        held -> {:held, length(held)}
+        _held -> :held
       end
     end
   end
