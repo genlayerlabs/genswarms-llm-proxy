@@ -5,21 +5,48 @@
 - Added the `payment_held` action: the consumer side of the settlement hub's
   issuance caps. It **never credits** — behind the same trust gate a forged
   `payment_confirmed` faces, it records the hold in a 200-entry FIFO mirror
-  (deduped, evictions logged), calls the new optional
-  `record_llm_held_payment/1` store callback (failure logged, metered, never
-  fatal), and emits `llm_payments_held` / `llm_payments_held_refused` /
-  `llm_payments_held_cleared`. `method` and `namespace` are optional in the
-  payload (the shipped hub sends neither); a *present* namespace must match.
+  (evictions logged), calls the new optional `record_llm_held_payment/1` store
+  callback (failure logged, metered, never fatal), and emits
+  `llm_payments_held` / `llm_payments_held_refused` /
+  `llm_payments_held_cleared`. The hub sends `method`, `namespace` and `at`
+  (genswarms-payments ≥ `01ab1dd`); all three stay optional so redeliveries
+  from an older hub still work, but a *present* namespace must match
+  `credit_namespace`, and a present-but-unusable `method` (empty, non-string,
+  or containing `":"`) is refused as `bad_payment_held` exactly as the credit
+  path refuses it.
+- Both held-mirror predicates — the dedup and the clearing — are scoped on
+  `(budget_identity, key)`, never the key alone. Money is per-identity and the
+  key shapes share a keyspace (the hub's `ref` legitimately contains a colon),
+  so a global predicate would let one beneficiary's settlement clear another
+  beneficiary's hold, or swallow a second identity's hold as a "duplicate"
+  while acking the hub `ok:true`.
 - A user whose money is held is no longer told nothing: while a hold is
   unresolved, the identity's budget-block notice gains one sentence
   ("Payment received but held for review: $X — not credited yet. An operator
   has to release it."), summed across holds and appended once. It rides the
   existing notice delivery, `{identity, cap, day}` dedup and
-  `notice_repeat_ms` rate limit — no second notification channel. A later
-  credit for the same `ref` (the operator release) clears the hold.
+  `notice_repeat_ms` rate limit — no second notification channel — except that
+  a *newly appeared* hold changes the dedup key, so the first notice after a
+  quarantine is always due instead of waiting out the repeat window. While the
+  sentence is showing, the `topup_hint_fun` line is **suppressed**: the cap
+  that produced the hold is likely still saturated, so telling a blocked user
+  to send more USDC would just freeze more of their money. The hint returns
+  once the hold clears. A later credit for the same beneficiary and `ref` (the
+  operator release) clears the hold.
+  *Known limitation:* a credit is the only thing that clears a hold, so a
+  voided/refunded hold, or a manual credit under a synthetic ref, leaves the
+  sentence standing for the life of the process — to be closed with a
+  `payment_voided` action or a bounded TTL before the operator release
+  affordances land.
 - `quota_status.payments_poll` gained `held` (the most recent 10 unresolved
   holds for the asked identity, newest first) and `held_count`. Both are
   identity-scoped; the whole block remains absent without `settlements_fn`.
+  Note that `quota_status` remains unauthenticated (as it already was for
+  balances and spend), so any object that can name a `conversation_id` can now
+  also read that conversation's hold refs and amounts — a conscious
+  carry-forward of the existing authorization model, not a new class.
+- `Genswarms.LlmProxy.notice_due?/5` gained an optional `:variant` term folded
+  into the dedup key. Default `nil` = the pre-0.4.0 3-tuple key, unchanged.
 - **D9 boot gate — credits imply pricing.** With `payments_source` configured,
   `init/1` now refuses to boot unless `prices` is a complete non-negative
   rate card with at least one positive per-Mtok price, in every pricing mode.

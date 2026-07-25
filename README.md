@@ -153,7 +153,9 @@ config:
   **only while `credits_enabled` is on** (same strict derivation as every
   other credit surface): with credits off this object silently drops every
   `payment_confirmed`, so the hint would point a blocked user at a payment
-  path that cannot credit them — the fun is not even called.
+  path that cannot credit them — the fun is not even called. It is likewise
+  **suppressed while that identity has an unresolved hold** — see
+  [Held payments](#held-payments-hub-quarantine).
 
 **Credits imply pricing (boot gate).** With `payments_source` configured, the
 operator rate card must be able to VALUE a call: `prices` must be a complete,
@@ -172,19 +174,27 @@ configures no payments source.
 The settlement hub quarantines a settlement that trips its issuance caps: the
 row is durable, deduped, alarmed, and **never creditable** until an operator
 releases it. On quarantine it casts, one-shot and best-effort,
-`{"action":"payment_held","beneficiary":…,"amount_usd":"5.00","ref":…,"reason":"max_payment"|"aggregate"}`.
-`method` and `namespace` are **optional** (the shipped hub sends neither); a
-*present* `namespace` must match `credit_namespace` or the notice is refused.
+`{"action":"payment_held","beneficiary":…,"amount_usd":"5.00","method":"8453","ref":…,"namespace":"llm_quota","at":"2026-07-25T09:00:00Z","reason":"max_payment"|"aggregate"}`.
+
+The current hub sends `method`, `namespace` and `at` — the same shape
+`payment_confirmed` carries (genswarms-payments ≥ `01ab1dd`). All three remain
+**optional** so that redeliveries from an older hub still work, but do not read
+that as "the field is not in play": because `namespace` is now always stamped,
+a host whose `credit_namespace` diverges from the hub's settlement namespace
+loses **every** hold notice (silently, metered `namespace_mismatch`). A
+*present* `namespace` must match `credit_namespace` or the notice is refused; a
+present-but-unusable `method` (empty, non-string, or containing `":"`) is
+refused as `bad_payment_held`, exactly as the credit path refuses it.
 
 The proxy's handler **never credits**. Behind the same trust gate a forged
 `payment_confirmed` faces (credits enabled **and** sender ==
 `payments_source`), it:
 
 - records the hold in a 200-entry FIFO in-memory mirror (deduped on
-  `"<method>:<ref>"`, or the bare `ref` when the hub sends no method; every
-  eviction is logged) and, when the store exports it, calls the optional
-  `record_llm_held_payment/1` — whose failure is logged, metered
-  (`llm_payments_held_store_failed`) and never fatal;
+  `(budget_identity, "<method>:<ref>")` — or the bare `ref` when an older hub
+  sends no method; every eviction is logged) and, when the store exports it,
+  calls the optional `record_llm_held_payment/1` — whose failure is logged,
+  metered (`llm_payments_held_store_failed`) and never fatal;
 - emits `llm_payments_held` with the key and reason. Refusals emit
   `llm_payments_held_refused` (`namespace_mismatch` — silent, like a
   foreign-namespace confirmation — or `bad_payment_held`);
@@ -195,16 +205,36 @@ The proxy's handler **never credits**. Behind the same trust gate a forged
   `{identity, cap, day}` dedup and `notice_repeat_ms` rate limit — deliberately:
   a silent hold on money the user watched leave their wallet is a support
   incident by design, and a second notification channel for it is how users get
-  spammed or get a hold notice with no context about why they are blocked. The
-  line sits between the base text and the `topup_hint_fun` line, and is gated
-  on `credits_enabled` like every other credit surface.
+  spammed or get a hold notice with no context about why they are blocked. A
+  *newly appeared* hold does change the dedup key, so the first notice after a
+  quarantine is always due rather than waiting out the repeat window. The line
+  is gated on `credits_enabled` like every other credit surface, and while it
+  is showing it **replaces** the `topup_hint_fun` line: the cap that produced
+  the hold is likely still saturated, so telling a blocked user to send more
+  USDC while their last payment is quarantined just freezes more of their
+  money. The hint returns once the hold clears.
 
-A hold is cleared by a later credit for the same money — the operator release
-re-emits `payment_confirmed` with the same `method`/`ref` — matched on the
-joined key **or** the bare `ref`, and metered as `llm_payments_held_cleared`.
-Nothing downstream reads the held mirror as truth about money: it credits
-nothing, and the hub's operator queue remains authoritative, so a lost one-shot
-notice cannot corrupt consumer state.
+Both mirror predicates — the dedup and the clearing — are scoped on
+`(budget_identity, key)`, never the key alone. Money is per-identity, and the
+key shapes share a keyspace (the hub's `ref` legitimately contains a colon), so
+a global predicate would let one user's settlement swallow or erase another
+user's hold.
+
+A hold is cleared by a later credit **for the same beneficiary** for the same
+money — the operator release re-emits `payment_confirmed` with the same
+`method`/`ref` — matched on the joined key **or** the bare `ref`, and metered as
+`llm_payments_held_cleared`. Nothing downstream reads the held mirror as truth
+about money: it credits nothing, and the hub's operator queue remains
+authoritative, so a lost one-shot notice cannot corrupt consumer state.
+
+**Known limitation.** A credit is the *only* thing that clears a hold. A hold
+that is voided or refunded rather than released never produces one, and a
+manual credit minted under a synthetic ref will not match — in both cases the
+sentence persists for the life of the proxy process. The designed release path
+(settle the same row, mint a fresh outbox seq, hence the same `method`/`ref`)
+clears correctly, so this is a forward-compat hazard; it needs a
+`payment_voided` action or a bounded hold TTL before the operator release
+affordances land.
 
 ### Payments outbox polling (optional)
 
@@ -257,7 +287,11 @@ identity, newest first, each `{ref, amount_usd, reason, at}`; `held_count` is
 that identity's full count. Both are identity-scoped (which is why the entries
 carry no beneficiary) so a per-conversation reply never enumerates another
 user's holds; a `quota_status` with no `conversation_id` has no identity and
-gets an empty list.
+gets an empty list. Note that `quota_status` itself is **unauthenticated** — it
+is answered to any sender, as it already was for balances and spend — so any
+object that can name a `conversation_id` can read that conversation's holds.
+The swarm's object topology is the access control; this is a conscious
+carry-forward, not a new exposure.
 
 The durable cursor callbacks
 `llm_payments_cursor/1` + `put_llm_payments_cursor/2` are a

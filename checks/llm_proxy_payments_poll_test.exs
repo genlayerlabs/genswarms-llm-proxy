@@ -17,7 +17,25 @@ check = fn label, ok ->
 end
 
 defmodule PaymentsPollStore do
+  # The state lives in :persistent_term, which has no compare-and-swap: a
+  # read-modify-write is NOT atomic. The overlapping-poll case at the bottom of
+  # this file drives two concurrent ticks, so the winner's
+  # record_llm_credit_entry/1 write and the loser's bump_metric/1 +
+  # put_llm_payments_cursor/2 writes interleave and the later put silently
+  # discards the earlier one's mutation — a HARNESS race that made
+  # "overlapping polls credit exactly once" fail intermittently (reproduced at
+  # ~1-3 runs in 12, on this branch AND on its baseline). It is not a library
+  # defect: the seen-mark it exercises is a single atomic Agent message. Every
+  # mutation is therefore serialized through a lock Agent so the assertion
+  # measures the proxy, not the fake store.
+  @lock __MODULE__.Lock
+
   def reset(opts \\ []) do
+    case Agent.start(fn -> :ok end, name: @lock) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
     :persistent_term.put(
       {__MODULE__, :state},
       %{
@@ -35,7 +53,11 @@ defmodule PaymentsPollStore do
   end
 
   def state, do: :persistent_term.get({__MODULE__, :state})
-  defp update(fun), do: :persistent_term.put({__MODULE__, :state}, fun.(state()))
+  defp update(fun) do
+    Agent.get_and_update(@lock, fn lock ->
+      {:persistent_term.put({__MODULE__, :state}, fun.(state())), lock}
+    end)
+  end
 
   def heal(key) do
     update(fn state ->
