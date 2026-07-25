@@ -300,6 +300,21 @@ both-callbacks-or-neither optional group. `record_llm_stuck_payment/1` and
 full row plus reason and timestamp. See `Genswarms.LlmProxy.Store` for exact
 return shapes.
 
+**The hold surfaces are durable-first when the store allows it.** The mirror
+above is bounded and process-local, so a deploy erases it — and it is the only
+source of the user's "your payment is held" sentence. When the store exports
+`list_llm_held_payments/1`, `held_payments/3`, `held_notice_line/3` and the
+`quota_status` hold block read through it and treat its answer as
+authoritative *including when it is empty* (same shape as `credit_balance/3`);
+a missing callback keeps the previous memory-only behaviour, and a failing one
+falls back to the mirror, where a stale sentence beats a lost one. The
+matching `clear_llm_held_payment/3` is called whenever a credit resolves a
+hold — unconditionally, not only when this instance's mirror matched, because
+the instance that credits a released payment is usually not the one that
+recorded the hold. Without that durable clear a released payment would
+resurrect its notice on the next restart, which is the same defect pointed the
+other way.
+
 `payment_confirmed` is trusted-source **and** namespace gated; the required
 fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` is
 **STRINGS-ONLY by contract** — it must be a JSON *string* that parses as a

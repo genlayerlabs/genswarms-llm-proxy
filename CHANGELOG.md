@@ -2,6 +2,22 @@
 
 ## 0.4.0 — 2026-07-25
 
+- The hold notice now SURVIVES A RESTART. Added two optional store callbacks —
+  `list_llm_held_payments/1` (unresolved holds for one budget identity,
+  excluding cleared rows and rows already present in the credit ledger) and
+  `clear_llm_held_payment/3` (mark resolved; scoped to the credited identity,
+  matching key **or** bare ref) — plus `held_payments/3` and
+  `held_notice_line/3`, the durable-first arities the block notice and
+  `quota_status` now use. Before this, the only consumer-side record of a hold
+  was the bounded in-process mirror, so one deploy left a user blocked, already
+  paid, being told to pay again, with `quota_status` asserting there was no
+  hold. A durable answer is authoritative even when empty; a missing callback
+  keeps the previous memory-only behaviour byte-for-byte, and a failing read
+  falls back to the mirror. The durable clear runs on every credit that
+  resolves a hold, not only when this instance's mirror matched, so a released
+  payment cannot resurrect its notice on the next restart
+  (`llm_payments_held_clear_failed` covers the failure).
+
 - Added the `payment_held` action: the consumer side of the settlement hub's
   issuance caps. It **never credits** — behind the same trust gate a forged
   `payment_confirmed` faces, it records the hold in a 200-entry FIFO mirror

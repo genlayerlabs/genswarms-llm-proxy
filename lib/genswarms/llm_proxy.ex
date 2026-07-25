@@ -969,16 +969,24 @@ defmodule Genswarms.LlmProxy do
         {matched, Map.put(mirror, :held_payments, kept)}
       end)
 
-    if cleared != [] do
+    # (C1) The durable clear is NOT conditional on the mirror having matched.
+    # The instance that credits a released payment is frequently NOT the one
+    # that recorded the hold (a deploy in between, or a second orchestrator),
+    # and its mirror is empty by construction — clearing only what the mirror
+    # knows would leave the durable row behind, and the next restart would
+    # resurrect a "held for review" notice for money that is already credited.
+    durable_cleared = durable_clear_held_payment(state, key, ref, beneficiary)
+
+    if cleared != [] or durable_cleared > 0 do
       Logger.info(
         "llm_proxy: hold cleared by a credit for #{inspect(beneficiary)} key=#{key} " <>
-          "(#{length(cleared)} entr" <> if(length(cleared) == 1, do: "y)", else: "ies)")
+          "(#{length(cleared)} mirror, #{durable_cleared} durable)"
       )
 
       bump_store_metric(
         resolve_store_mod(state),
         "llm_payments_held_cleared",
-        %{idempotency_key: key, entries: length(cleared)},
+        %{idempotency_key: key, entries: length(cleared), durable: durable_cleared},
         1
       )
     end
@@ -986,13 +994,80 @@ defmodule Genswarms.LlmProxy do
     :ok
   end
 
+  # Best-effort by design and never fatal: a credit that landed must not be
+  # undone because the notice bookkeeping failed. A failure here is loud
+  # (log + counter) and self-healing — `list_llm_held_payments/1` also excludes
+  # rows whose key is already in the credit ledger, so the stale notice does not
+  # outlive the next read even if this write never succeeds.
+  defp durable_clear_held_payment(state, key, ref, beneficiary) do
+    store_mod = resolve_store_mod(state)
+
+    if store_callback?(store_mod, :clear_llm_held_payment, 3) do
+      case safe_store_call(store_mod, :clear_llm_held_payment, [beneficiary, key, ref]) do
+        {:ok, count} when is_integer(count) and count >= 0 ->
+          count
+
+        :ok ->
+          0
+
+        other ->
+          Logger.error(
+            "llm_proxy: durable held-payment CLEAR failed for #{inspect(key)}: #{inspect(other)}"
+          )
+
+          bump_store_metric(
+            store_mod,
+            "llm_payments_held_clear_failed",
+            %{idempotency_key: key},
+            1
+          )
+
+          0
+      end
+    else
+      0
+    end
+  end
+
   @doc """
   Unresolved held (hub-quarantined) payments for ONE budget identity, oldest
-  first. Read-only, never raises. Only ever consulted behind a
-  `credits_enabled` gate, so a feature-off install never touches it.
+  first, from the in-memory mirror ONLY. Read-only, never raises. Only ever
+  consulted behind a `credits_enabled` gate, so a feature-off install never
+  touches it.
+
+  Prefer `held_payments/3`: the mirror is bounded and process-local, so this
+  answer is erased by every restart.
   """
   @doc since: "0.4.0"
   def held_payments(pid \\ @state_name, budget_identity) do
+    mirror_held_payments(pid, budget_identity)
+  end
+
+  @doc """
+  Unresolved held payments for ONE budget identity — DURABLE-FIRST, with the
+  same shape `credit_balance/3` uses.
+
+  (C1) A hold is money the user watched leave their wallet and did not get
+  credited. The only thing that tells them so is a sentence built from this
+  list, and until 0.4.0 that list lived exclusively in a bounded in-process
+  mirror: one deploy and the user was blocked, already paid, being told to pay
+  again, with `quota_status` asserting there was no hold. So when the store
+  exports `list_llm_held_payments/1` it is AUTHORITATIVE — including when it
+  answers an empty list, which means "resolved", not "unknown". The mirror is
+  the fallback for a store that does not export it (behaviour identical to
+  0.3.0) or that fails, where a stale sentence beats a lost one.
+
+  Never raises.
+  """
+  @doc since: "0.4.0"
+  def held_payments(pid, store_mod, budget_identity) do
+    case durable_held_payments(store_mod, budget_identity) do
+      rows when is_list(rows) -> rows
+      nil -> mirror_held_payments(pid, budget_identity)
+    end
+  end
+
+  defp mirror_held_payments(pid, budget_identity) do
     Agent.get(pid, fn mirror ->
       mirror
       |> Map.get(:held_payments, [])
@@ -1004,8 +1079,37 @@ defmodule Genswarms.LlmProxy do
     _, _ -> []
   end
 
-  defp held_for_identity(state_pid, budget_identity),
-    do: held_payments(state_pid, budget_identity)
+  defp durable_held_payments(store_mod, budget_identity) do
+    if store_callback?(store_mod, :list_llm_held_payments, 1) and is_binary(budget_identity) do
+      case safe_store_call(store_mod, :list_llm_held_payments, [budget_identity]) do
+        {:ok, rows} when is_list(rows) ->
+          Enum.map(rows, &normalize_held_row(&1, budget_identity))
+
+        other ->
+          Logger.warning(
+            "llm_proxy: durable held-payment read failed for #{inspect(budget_identity)}: #{inspect(other)} — falling back to the in-memory mirror"
+          )
+
+          nil
+      end
+    end
+  end
+
+  # The durable rows come from a host schema, so they are normalized to the
+  # mirror's own shape before any surface reads them: `amount_usd` MUST be a
+  # Decimal (the notice sums it) and `budget_identity` must be present (the
+  # surfaces filter on it).
+  defp normalize_held_row(row, budget_identity) when is_map(row) do
+    row
+    |> Map.put_new(:budget_identity, budget_identity)
+    |> Map.put(:amount_usd, decimal(Map.get(row, :amount_usd, Map.get(row, "amount_usd", 0))))
+  end
+
+  defp normalize_held_row(_row, budget_identity),
+    do: %{budget_identity: budget_identity, amount_usd: Decimal.new("0")}
+
+  defp held_for_identity(state_pid, store_mod, budget_identity),
+    do: held_payments(state_pid, store_mod, budget_identity)
 
   @doc """
   The single user-visible sentence appended to a budget-block notice when the
@@ -1020,8 +1124,16 @@ defmodule Genswarms.LlmProxy do
   @doc since: "0.4.0"
   def held_notice_line(pid \\ @state_name, budget_identity)
 
-  def held_notice_line(pid, budget_identity) when is_binary(budget_identity) do
-    case held_payments(pid, budget_identity) do
+  def held_notice_line(pid, budget_identity), do: held_notice_line(pid, nil, budget_identity)
+
+  @doc """
+  The same sentence, built DURABLE-FIRST (see `held_payments/3`). This is the
+  arity the block notice uses: the notice is the user's only signal that their
+  money is held, so it must not be erased by a deploy.
+  """
+  @doc since: "0.4.0"
+  def held_notice_line(pid, store_mod, budget_identity) when is_binary(budget_identity) do
+    case held_payments(pid, store_mod, budget_identity) do
       [] ->
         nil
 
@@ -1040,7 +1152,7 @@ defmodule Genswarms.LlmProxy do
     _, _ -> nil
   end
 
-  def held_notice_line(_pid, _budget_identity), do: nil
+  def held_notice_line(_pid, _store_mod, _budget_identity), do: nil
 
   defp credit_payment(msg, state) do
     case apply_payment(msg, state, "push") do
@@ -2317,7 +2429,7 @@ defmodule Genswarms.LlmProxy do
 
           held =
             if is_binary(budget_identity),
-              do: held_for_identity(state_pid, budget_identity),
+              do: held_for_identity(state_pid, resolve_store_mod(state), budget_identity),
               else: []
 
           Map.put(reply, :payments_poll, %{
@@ -5300,7 +5412,13 @@ defmodule Genswarms.LlmProxy.Plug do
   # feature-off path from even reading the Agent, byte-identical to 0.3.0.
   defp held_notice_line(opts, session) do
     if Map.get(opts, :credits_enabled, false) do
-      Proxy.held_notice_line(Map.get(opts, :state_pid), session.budget_identity)
+      # Durable-first: this line is the user's ONLY signal that money they sent
+      # is held, and the in-memory mirror behind it does not survive a deploy.
+      Proxy.held_notice_line(
+        Map.get(opts, :state_pid),
+        Map.get(opts, :store_mod),
+        session.budget_identity
+      )
     end
   end
 
