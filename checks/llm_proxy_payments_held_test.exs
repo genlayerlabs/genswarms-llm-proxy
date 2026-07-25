@@ -98,13 +98,41 @@ defmodule HeldStore do
   def metrics(event), do: Enum.filter(state().metrics, fn {e, _, _} -> e == event end)
 end
 
+# (R4-I3) The DEFAULT fixture is the payload the hub ACTUALLY emits today —
+# verified by reading the emit site, genswarms-payments
+# `finish_recorded_settlement/6`, "quarantined" arm, at commit 01ab1dd
+# ("payment_held carries method, namespace and at like payment_confirmed"):
+# action, beneficiary, amount_usd, method, ref, namespace, at, reason.
+#
+# Everything the check asserts therefore runs against the production shape.
+# The legacy (pre-01ab1dd) shape — no method, no namespace, no at — is still
+# accepted and gets its own explicitly-labelled backward-compatibility cases,
+# because a redelivery of a quarantine recorded before that commit, or a host
+# still running an older hub, is a real in-flight payload.
 held_msg = fn overrides ->
   Jason.encode!(
     Map.merge(
       %{
-        # Verified against the shipped hub emit site (genswarms-payments
-        # finish_recorded_settlement/6, "quarantined" arm, 2026-07-25): action,
-        # beneficiary, amount_usd, ref, reason — NO method, NO namespace, NO at.
+        "action" => "payment_held",
+        "beneficiary" => "llmb_alice",
+        "amount_usd" => "5.00",
+        "method" => "8453",
+        "ref" => "0xdeadbeef:0",
+        "namespace" => "llm_quota",
+        "at" => "2026-07-25T09:00:00Z",
+        "reason" => "max_payment"
+      },
+      overrides
+    )
+  )
+end
+
+# The pre-01ab1dd hub shape: the three fields the hub grew are DROPPED, not
+# overridden (a nil override would still be a present JSON null).
+legacy_held_msg = fn overrides ->
+  Jason.encode!(
+    Map.merge(
+      %{
         "action" => "payment_held",
         "beneficiary" => "llmb_alice",
         "amount_usd" => "5.00",
@@ -173,9 +201,14 @@ check.(
     match?(%DateTime{}, row1.at)
 )
 
+# (R4-I3) The REAL hub payload, pinned field by field in one assertion: method,
+# namespace and "at" are carried together, and the key is the credit path's
+# "<method>:<ref>" join so a hold and the release that credits it share a key.
 check.(
-  "the shipped hub payload has no \"method\" -> the key falls back to the bare ref",
-  row1.method == nil and row1.idempotency_key == "0xdeadbeef:0"
+  "the REAL hub payload (method + namespace + at, genswarms-payments 01ab1dd) is " <>
+    "recorded whole: <method>:<ref> key, normalized namespace, ISO8601 \"at\" parsed",
+  row1.method == "8453" and row1.idempotency_key == "8453:0xdeadbeef:0" and
+    row1.namespace == "llm_quota" and row1.at == ~U[2026-07-25 09:00:00Z]
 )
 
 check.(
@@ -185,9 +218,9 @@ check.(
 )
 
 check.(
-  "llm_payments_held metered once with the method:ref-ish key and the reason",
+  "llm_payments_held metered once with the method:ref key and the reason",
   HeldStore.metrics("llm_payments_held") == [
-    {"llm_payments_held", %{idempotency_key: "0xdeadbeef:0", reason: "max_payment"}, 1}
+    {"llm_payments_held", %{idempotency_key: "8453:0xdeadbeef:0", reason: "max_payment"}, 1}
   ]
 )
 
@@ -207,21 +240,67 @@ check.(
     length(HeldStore.state().held) == 1
 )
 
-# a hub that DOES send method keys on the full "<method>:<ref>" join
+# BACKWARD COMPATIBILITY (pre-01ab1dd hub / redelivery of an old quarantine):
+# method, namespace and "at" are all absent. The tolerant reader still accepts
+# it — bare-ref key, namespace defaulted to the host's credit_namespace, "at"
+# stamped from the wall clock.
+{:reply, r1c, _} =
+  Proxy.handle_message(
+    "payments",
+    legacy_held_msg.(%{"ref" => "0xlegacy:7", "beneficiary" => "llmb_bob"}),
+    s1
+  )
+
+legacy_row = Enum.find(Agent.get(p1, &Map.get(&1, :held_payments, [])), &(&1.ref == "0xlegacy:7"))
+
+check.(
+  "LEGACY SHAPE (no method / no namespace / no at) is still accepted: the key falls " <>
+    "back to the bare ref, namespace defaults to credit_namespace, at is stamped",
+  Jason.decode!(r1c)["held"] == true and legacy_row.method == nil and
+    legacy_row.idempotency_key == "0xlegacy:7" and legacy_row.namespace == "llm_quota" and
+    match?(%DateTime{}, legacy_row.at)
+)
+
+# a garbage "at" must not break a hold notice — it degrades to the wall clock
 {:reply, _, _} =
   Proxy.handle_message(
     "payments",
-    held_msg.(%{"method" => "8453", "ref" => "0xfeed:1", "beneficiary" => "llmb_bob"}),
+    held_msg.(%{"ref" => "0xbadat:1", "beneficiary" => "llmb_bob", "at" => "not-a-timestamp"}),
     s1
   )
 
 check.(
-  "a payload WITH \"method\" keys the hold on \"<method>:<ref>\" (credit-path shape)",
-  Enum.any?(
-    Agent.get(p1, &Map.get(&1, :held_payments, [])),
-    &(&1.idempotency_key == "8453:0xfeed:1" and &1.method == "8453")
+  "an unparseable \"at\" degrades to the wall clock instead of refusing the hold",
+  match?(
+    %DateTime{},
+    Enum.find(Agent.get(p1, &Map.get(&1, :held_payments, [])), &(&1.ref == "0xbadat:1")).at
   )
 )
+
+# (R4-M4) A present-but-unusable method is REFUSED, exactly like the credit
+# path refuses it — never silently downgraded to a bare-ref key.
+for {label, method} <- [
+      {"colon-bearing", "84:53"},
+      {"empty string", ""},
+      {"JSON number", 8453}
+    ] do
+  {:reply, bad_reply, _} =
+    Proxy.handle_message(
+      "payments",
+      held_msg.(%{"method" => method, "ref" => "0xmethod:#{label}"}),
+      s1
+    )
+
+  check.(
+    "a present-but-unusable method (#{label}) is REFUSED as bad_payment_held, not " <>
+      "silently downgraded to a bare-ref key (credit-path parity)",
+    Jason.decode!(bad_reply) == %{"ok" => false, "error" => "bad_payment_held"} and
+      not Enum.any?(
+        Agent.get(p1, &Map.get(&1, :held_payments, [])),
+        &(&1.ref == "0xmethod:#{label}")
+      )
+  )
+end
 
 # ────────────────────────────────────────────────────────────────────────────
 IO.puts("\n[Section 2: refusals — untrusted source, credits off, namespace, payload]")
@@ -256,25 +335,53 @@ check.(
   Agent.get(p2, &Map.get(&1, :held_payments, [])) == []
 )
 
-# a PRESENT-but-foreign namespace: silent (no reply), but metered
+# (R4-I3) The namespace check is the LIVE path, not a dormant forward-compat
+# branch: the hub now stamps "namespace" on EVERY payment_held, so a host whose
+# credit_namespace diverges from the hub's settlement namespace loses every
+# hold notice. A foreign namespace is silent (no reply) but metered.
 {:noreply, _} =
   Proxy.handle_message("payments", held_msg.(%{"namespace" => "someone_else"}), s2)
 
 check.(
-  "a foreign namespace is a SILENT but METERED refusal (no mirror row)",
+  "a foreign namespace is a SILENT but METERED refusal (no mirror row) — and this is " <>
+    "the LIVE path, since the hub stamps namespace on every hold",
   Agent.get(p2, &Map.get(&1, :held_payments, [])) == [] and
     HeldStore.metrics("llm_payments_held_refused") == [
       {"llm_payments_held_refused",
-       %{reason: "namespace_mismatch", idempotency_key: "0xdeadbeef:0"}, 1}
+       %{reason: "namespace_mismatch", idempotency_key: "8453:0xdeadbeef:0"}, 1}
     ]
 )
 
-# the MATCHING namespace is accepted (forward compatibility with a hub that grows the field)
-{:reply, _, _} = Proxy.handle_message("payments", held_msg.(%{"namespace" => "llm_quota"}), s2)
+# the default fixture IS the hub shape, namespace included -> accepted
+{:reply, _, _} = Proxy.handle_message("payments", held_msg.(%{}), s2)
 
 check.(
-  "a matching namespace is accepted; an ABSENT one is accepted too (shipped hub shape)",
+  "the real hub payload's matching namespace is accepted",
   length(Agent.get(p2, &Map.get(&1, :held_payments, []))) == 1
+)
+
+# BACKWARD COMPATIBILITY: an ABSENT namespace (pre-01ab1dd hub) is accepted —
+# there is nothing to compare against, and refusing would drop every hold
+# notice an older hub emits.
+{:reply, _, _} =
+  Proxy.handle_message("payments", legacy_held_msg.(%{"ref" => "0xnons:2"}), s2)
+
+check.(
+  "LEGACY SHAPE: an ABSENT namespace is accepted (pre-01ab1dd hub)",
+  Enum.any?(Agent.get(p2, &Map.get(&1, :held_payments, [])), &(&1.ref == "0xnons:2"))
+)
+
+# ...and an explicit JSON null is treated as absent, not as a mismatch
+{:reply, _, _} =
+  Proxy.handle_message(
+    "payments",
+    held_msg.(%{"namespace" => nil, "ref" => "0xnullns:3"}),
+    s2
+  )
+
+check.(
+  "an explicit JSON-null namespace is treated as ABSENT, not as a mismatch",
+  Enum.any?(Agent.get(p2, &Map.get(&1, :held_payments, [])), &(&1.ref == "0xnullns:3"))
 )
 
 HeldStore.reset()
@@ -424,7 +531,8 @@ check.(
 )
 
 check.(
-  "and it CLEARS the hold — matched on the ref, since the hub's hold carried no method",
+  "and it CLEARS the hold — matched on the exact \"<method>:<ref>\" key the hub's hold " <>
+    "and its release share",
   Proxy.held_payments(p4, "llmb_alice") == [] and
     length(HeldStore.metrics("llm_payments_held_cleared")) == 1
 )
@@ -432,6 +540,32 @@ check.(
 check.(
   "an unrelated identity's hold is untouched by another's release",
   Proxy.held_payments(p4, "llmb_bob") == []
+)
+
+# BACKWARD COMPATIBILITY: a LEGACY hold (no method, keyed on the bare ref) is
+# still cleared by the release, which does carry a method — the ref arm of the
+# predicate is what covers it.
+{:reply, _, _} =
+  Proxy.handle_message("payments", legacy_held_msg.(%{"ref" => "0xlegacyclear:4"}), s4)
+
+{:reply, _, _} =
+  Proxy.handle_message(
+    "payments",
+    Jason.encode!(%{
+      "action" => "payment_confirmed",
+      "beneficiary" => "llmb_alice",
+      "amount_usd" => "3.00",
+      "method" => "8453",
+      "ref" => "0xlegacyclear:4",
+      "namespace" => "llm_quota"
+    }),
+    s4
+  )
+
+check.(
+  "LEGACY SHAPE: a method-less hold (bare-ref key) is still cleared by a release " <>
+    "that carries a method — matched on the ref",
+  Proxy.held_payments(p4, "llmb_alice") == []
 )
 
 # a hold for a DIFFERENT ref survives a release
@@ -455,6 +589,137 @@ check.(
 check.(
   "a credit for a DIFFERENT ref leaves the hold standing",
   match?([%{ref: "0xother:9"}], Proxy.held_payments(p4, "llmb_alice"))
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 4b: (R4-I1/I2) both mirror predicates are IDENTITY-SCOPED]")
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Money is per-identity. Both the clearing predicate and the dedup predicate
+# must consult the :budget_identity the record already carries — matching on
+# the key alone is how one user's settlement erases or swallows another user's
+# hold. These two cases are the reviewer's demonstrated probes.
+
+# (R4-I1) A credit for beneficiary B must NOT clear beneficiary A's hold, even
+# when both settlements name the same ref. The victim's hold was recorded
+# method-less (bare-ref key "0xshared:0"); the attacker's credit carries
+# method "8453" for the SAME ref.
+HeldStore.reset()
+{:ok, p4b} = Proxy.start_state_link()
+s4b = build_state.(p4b, %{})
+
+{:reply, _, _} =
+  Proxy.handle_message(
+    "payments",
+    legacy_held_msg.(%{"beneficiary" => "llmb_victim", "ref" => "0xshared:0"}),
+    s4b
+  )
+
+{:reply, attacker_reply, _} =
+  Proxy.handle_message(
+    "payments",
+    Jason.encode!(%{
+      "action" => "payment_confirmed",
+      "beneficiary" => "llmb_attacker",
+      "amount_usd" => "1.00",
+      "method" => "8453",
+      "ref" => "0xshared:0",
+      "namespace" => "llm_quota"
+    }),
+    s4b
+  )
+
+check.(
+  "(R4-I1) a credit for ANOTHER beneficiary sharing the ref does NOT clear the " <>
+    "victim's hold — the mirror row, the user sentence and the cleared metric all " <>
+    "stay exactly as they were",
+  Jason.decode!(attacker_reply)["ok"] == true and
+    length(Proxy.held_payments(p4b, "llmb_victim")) == 1 and
+    Proxy.held_notice_line(p4b, "llmb_victim") ==
+      "Payment received but held for review: $5.00 — not credited yet. " <>
+        "An operator has to release it." and
+    HeldStore.metrics("llm_payments_held_cleared") == []
+)
+
+check.(
+  "(R4-I1) the victim's OWN credit still clears their hold (the scope narrows the " <>
+    "match, it does not break it)",
+  match?(
+    {:reply, _, _},
+    Proxy.handle_message(
+      "payments",
+      Jason.encode!(%{
+        "action" => "payment_confirmed",
+        "beneficiary" => "llmb_victim",
+        "amount_usd" => "5.00",
+        "method" => "8453",
+        "ref" => "0xshared:0",
+        "namespace" => "llm_quota"
+      }),
+      s4b
+    )
+  ) and Proxy.held_payments(p4b, "llmb_victim") == [] and
+    Proxy.held_notice_line(p4b, "llmb_victim") == nil
+)
+
+# (R4-I2) The two key SHAPES share a keyspace, because the hub's ref
+# legitimately contains a colon (tx_hash:log_index). Identity #1's
+# method-bearing hold keys "8453:0xaa"; identity #2's method-less hold on ref
+# "8453:0xaa" keys the same string. Both must be recorded.
+HeldStore.reset()
+{:ok, p4c} = Proxy.start_state_link()
+s4c = build_state.(p4c, %{})
+
+{:reply, c1_reply, _} =
+  Proxy.handle_message(
+    "payments",
+    held_msg.(%{"beneficiary" => "llmb_c1", "method" => "8453", "ref" => "0xaa"}),
+    s4c
+  )
+
+{:reply, c2_reply, _} =
+  Proxy.handle_message(
+    "payments",
+    legacy_held_msg.(%{
+      "beneficiary" => "llmb_c2",
+      "ref" => "8453:0xaa",
+      "amount_usd" => "99.00"
+    }),
+    s4c
+  )
+
+check.(
+  "(R4-I2) two identities whose hold keys COLLIDE (\"8453\"+\"0xaa\" vs bare " <>
+    "\"8453:0xaa\") each keep their own hold — the second is not swallowed as a duplicate",
+  Jason.decode!(c1_reply) == %{"ok" => true, "held" => true, "duplicate" => false} and
+    Jason.decode!(c2_reply) == %{"ok" => true, "held" => true, "duplicate" => false} and
+    length(Proxy.held_payments(p4c, "llmb_c1")) == 1 and
+    length(Proxy.held_payments(p4c, "llmb_c2")) == 1
+)
+
+check.(
+  "(R4-I2) and the swallowed hold's full trail exists too: durable row, metric, and " <>
+    "the $99.00 user sentence",
+  length(HeldStore.state().held) == 2 and
+    length(HeldStore.metrics("llm_payments_held")) == 2 and
+    Proxy.held_notice_line(p4c, "llmb_c2") ==
+      "Payment received but held for review: $99.00 — not credited yet. " <>
+        "An operator has to release it."
+)
+
+check.(
+  "(R4-I2) dedup still fires WITHIN one identity: the same key redelivered for the " <>
+    "SAME beneficiary is still a duplicate",
+  Jason.decode!(
+    elem(
+      Proxy.handle_message(
+        "payments",
+        held_msg.(%{"beneficiary" => "llmb_c1", "method" => "8453", "ref" => "0xaa"}),
+        s4c
+      ),
+      1
+    )
+  )["duplicate"] == true and length(Proxy.held_payments(p4c, "llmb_c1")) == 1
 )
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -717,19 +982,29 @@ check.(
   ]
 )
 
-# the topup hint stays LAST — it is still the right action for a NEW payment
+# (R4-I4) The held sentence REPLACES the top-up hint. Advising a user to send
+# more money while their last payment is quarantined is bad advice: the hold
+# came from an aggregate issuance cap over a window (still saturated) or a
+# per-settlement max, and the per-beneficiary small-top-up carve-out is by
+# definition already consumed — so the new deposit is likely held too, and the
+# user ends up with more money frozen, still blocked, having been told to send
+# USDC twice.
+hint_opts = Map.put(notice_opts, :topup_hint_fun, fn _bi -> "Top up: send USDC to 0xABC" end)
+
 check.(
-  "ordering: base, then the held sentence, then the top-up hint",
-  ProxyPlug.budget_notice(
-    %{day: today},
-    nil,
-    Map.put(notice_opts, :topup_hint_fun, fn _bi -> "Top up: send USDC to 0xABC" end),
-    %{budget_identity: n_identity}
-  ) ==
+  "(R4-I4) while a hold is unresolved the notice is base + held sentence and the " <>
+    "top-up hint is SUPPRESSED (never tell a user to send good money after bad)",
+  ProxyPlug.budget_notice(%{day: today}, nil, hint_opts, %{budget_identity: n_identity}) ==
     base_line <>
       "\n" <>
-      "Payment received but held for review: $7.50 — not credited yet. An operator has to release it." <>
-      "\n" <> "Top up: send USDC to 0xABC"
+      "Payment received but held for review: $7.50 — not credited yet. An operator has to release it."
+)
+
+check.(
+  "(R4-I4) the hint is present for the SAME opts on an identity with no hold — the " <>
+    "suppression is the hold's doing, not a lost hint",
+  ProxyPlug.budget_notice(%{day: today}, nil, hint_opts, %{budget_identity: "llmb_nohold"}) ==
+    base_line <> "\n" <> "Top up: send USDC to 0xABC"
 )
 
 check.(
@@ -783,6 +1058,110 @@ check.(
   Proxy.held_notice_line(np, n_identity) == nil and
     ProxyPlug.budget_notice(%{day: today}, nil, notice_opts, %{budget_identity: n_identity}) ==
       base_line
+)
+
+check.(
+  "(R4-I4) and the top-up hint RETURNS once the hold is cleared — suppression is " <>
+    "scoped to the held state, not permanent",
+  ProxyPlug.budget_notice(%{day: today}, nil, hint_opts, %{budget_identity: n_identity}) ==
+    base_line <> "\n" <> "Top up: send USDC to 0xABC"
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+IO.puts("\n[Section 7: (R4-M2) a NEW hold makes the next block notice due]")
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The sentence rides the {identity, cap, day} dedup, so without this a user
+# blocked at 09:00 (notice sent, no hold yet) whose payment is quarantined at
+# 09:30 learns nothing until 13:00 — while synthetic_block_content/2 tells the
+# agent "the user was already notified earlier today; do not send a separate
+# user reply", a statement true of the OLD text and false of the new. A newly
+# appeared hold therefore changes the dedup key.
+
+m2_attrs = %{conversation_id: "tg:held2:0", slot: :held_agent, kind: :dm, workspace_key: "default"}
+m2_identity = Proxy.budget_identity(m2_attrs)
+{:ok, m2_token} = Proxy.register_session(np, m2_attrs)
+HeldNoticeStore.seed(m2_identity, today)
+
+set_clock.(~U[2026-07-01 09:00:00Z])
+reset_captured.()
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) precondition: the pre-hold notice went out (base text only)",
+  notices.() == [base_line]
+)
+
+# a repeat inside the window with NO state change is still suppressed
+reset_captured.()
+set_clock.(~U[2026-07-01 09:20:00Z])
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) nothing changed -> still deduped inside notice_repeat_ms (no new spam channel)",
+  notices.() == []
+)
+
+# now the hub quarantines — still deep inside the 4h window
+{:reply, _, _} =
+  Proxy.handle_message(
+    "payments",
+    held_msg.(%{"beneficiary" => m2_identity, "ref" => "0xm2:0"}),
+    n_state
+  )
+
+reset_captured.()
+set_clock.(~U[2026-07-01 09:35:00Z])
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) a NEWLY APPEARED hold makes the next notice DUE inside the repeat " <>
+    "window — the user is not left uninformed until 13:00",
+  notices.() == [base_line <> "\n" <> held_line]
+)
+
+# ...and the new key then rate-limits normally
+reset_captured.()
+set_clock.(~U[2026-07-01 09:40:00Z])
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) the post-hold notice is itself rate-limited — one extra notice, not a loop",
+  notices.() == []
+)
+
+# a SECOND hold (a second deposit the user watched leave their wallet) re-notifies
+# with the new summed amount
+{:reply, _, _} =
+  Proxy.handle_message(
+    "payments",
+    held_msg.(%{"beneficiary" => m2_identity, "ref" => "0xm2:1", "amount_usd" => "2.50"}),
+    n_state
+  )
+
+reset_captured.()
+set_clock.(~U[2026-07-01 09:45:00Z])
+post.(m2_token, notice_opts)
+
+check.(
+  "(R4-M2) a SECOND hold re-notifies with the new summed amount (the count, not a " <>
+    "boolean, is folded into the dedup key)",
+  notices.() == [
+    base_line <>
+      "\n" <>
+      "Payment received but held for review: $7.50 — not credited yet. An operator has to release it."
+  ]
+)
+
+# PRIME INVARIANT: with credits off the variant is nil, so the dedup key is the
+# plain 3-tuple and the machinery behaves exactly as it did in 0.3.0.
+{:ok, off_pid} = Proxy.start_state_link()
+
+check.(
+  "PRIME INVARIANT: notice_due?/5 without a :variant is unchanged — first call due, " <>
+    "immediate repeat suppressed",
+  Proxy.notice_due?(off_pid, "llmb_off", :budget, today, now: ~U[2026-07-01 09:00:00Z]) and
+    not Proxy.notice_due?(off_pid, "llmb_off", :budget, today, now: ~U[2026-07-01 09:01:00Z])
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

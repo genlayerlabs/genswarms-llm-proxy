@@ -146,6 +146,15 @@ defmodule Genswarms.LlmProxy do
     :ok
   end
 
+  # (R4-M3) "At least one positive" deliberately admits a partly-zero card,
+  # e.g. prompt 0 / completion 0.42: a call returning an EMPTY completion (a
+  # real case — see checks/llm_proxy_empty_completion_test.exs) is then valued
+  # at $0.00 and consumes no credit. That is accepted, not overlooked: with
+  # only two prices, "at least one positive" means either every call with input
+  # tokens is priced or every call with output is, and a deliberately
+  # prompt-free (or completion-free) card is a legitimate operator choice. The
+  # gate's purpose is rejecting the all-zero and INCOMPLETE cards that make
+  # paid-in credit permanently unconsumable, and it serves that exactly.
   defp prices_can_value_call?(prices) when is_map(prices) do
     rate_card_complete?(prices) and
       (positive_price?(Map.get(prices, :prompt_per_mtok) || Map.get(prices, "prompt_per_mtok")) or
@@ -493,6 +502,16 @@ defmodule Genswarms.LlmProxy do
       },
       health: %{input: ~s({"action":"health"}), output: ~s({"ok":true})},
       quota_status: %{
+        # (R4-M5) CONSCIOUS CARRY-FORWARD: this action is answered to ANY
+        # sender — no arm gates on `from` — and as of 0.4.0 its payments_poll
+        # block also carries the asked identity's hold refs and amounts. The
+        # held list is correctly identity-scoped (entries omit `beneficiary`,
+        # held_for_identity/2 filters on budget_identity, no conversation_id
+        # yields []), but any object that can NAME a conversation_id can read
+        # that conversation's holds. This is the same pre-existing
+        # authorization class as the balances and spend the call already
+        # returns, not a regression — the swarm's object topology is the
+        # access control. Gate on `from` here if that ever stops being true.
         input:
           ~s({"action":"quota_status","conversation_id":"tg:903489662:0","kind":"dm","workspace_key":"default"}),
         output: "read-only per-identity request quota, spend, and global cap status"
@@ -517,16 +536,19 @@ defmodule Genswarms.LlmProxy do
       },
       payment_held: %{
         input:
-          ~s({"action":"payment_held","beneficiary":"llmb_...","amount_usd":"5.00","ref":"0xabc:0","reason":"max_payment"}),
+          ~s({"action":"payment_held","beneficiary":"llmb_...","amount_usd":"5.00","method":"8453","ref":"0xabc:0","namespace":"llm_quota","at":"2026-07-25T09:00:00Z","reason":"max_payment"}),
         output:
           "records + meters a hub-quarantined settlement and surfaces it to the user on " <>
             "the next budget-block notice — it NEVER credits; only from the configured " <>
             "payments_source",
         note:
-          "\"method\" and \"namespace\" are OPTIONAL (the shipped hub omits both); when " <>
-            "\"namespace\" IS present it must equal the host's credit_namespace or the " <>
-            "notice is refused. The hold is cleared by a later payment_confirmed for the " <>
-            "same ref — the phase-4 operator release path."
+          "the current hub sends \"method\", \"namespace\" and \"at\" (genswarms-payments " <>
+            ">= 01ab1dd); all three stay OPTIONAL for redeliveries from older hubs. A " <>
+            "PRESENT \"namespace\" must equal the host's credit_namespace or the notice " <>
+            "is refused; a present-but-unusable \"method\" (empty, non-string, or " <>
+            "containing \":\") is refused like it is on the credit path. The hold is " <>
+            "cleared by a later payment_confirmed for the SAME beneficiary and " <>
+            "method/ref — the phase-4 operator release path."
       }
     }
   end
@@ -649,6 +671,17 @@ defmodule Genswarms.LlmProxy do
   # enabled AND the sender must be the configured payments_source. An
   # untrusted sender could otherwise paint "your payment is held" onto any
   # conversation's block notice.
+  #
+  # KNOWN LIMITATION (R4-M1): the ONLY thing that clears a hold is a
+  # payment_confirmed matching the same beneficiary + key/ref. A hold that is
+  # VOIDED or REFUNDED rather than released never produces a credit, and a
+  # phase-4 manual credit minted under a synthetic ref ("manual:op-1") will not
+  # match — in both cases "An operator has to release it." persists for the
+  # life of this BEAM process, indefinitely and untruthfully. The DESIGNED
+  # release path does clear correctly (release = settle the SAME row and mint a
+  # fresh outbox_seq, hence the same method/ref), so this is a forward-compat
+  # hazard, not a present bug. It must be closed — a `payment_voided` action or
+  # a bounded hold TTL — BEFORE phase 4's operator affordances land.
   defp handle_payment_held(from, msg, state) do
     source = Map.get(state, :payments_source)
 
@@ -685,16 +718,25 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
-  # The hub's `payment_held` payload (verified against the shipped emit site in
-  # genswarms-payments' `finish_recorded_settlement/6` for a `"quarantined"`
-  # row, 2026-07-25) carries ONLY: action, beneficiary, amount_usd, ref,
-  # reason — no "namespace", and no "method". So:
+  # The hub's `payment_held` payload (verified against the emit site in
+  # genswarms-payments' `finish_recorded_settlement/6`, "quarantined" arm, at
+  # `01ab1dd`) carries: action, beneficiary, amount_usd, method, ref,
+  # namespace, at, reason — the same shape `payment_confirmed` carries. So the
+  # namespace check below is the LIVE path on every current hub delivery, not a
+  # dormant forward-compat branch.
   #
-  #   * an ABSENT "namespace" is accepted (the hub scopes delivery by its
-  #     configured targets; there is nothing to compare against and refusing
-  #     would drop every hold notice the shipped hub emits);
-  #   * a PRESENT "namespace" MUST match — a hub that grows the field must not
-  #     be able to cross-post another namespace's holds into this consumer.
+  # `method`, `namespace` and `at` nonetheless stay OPTIONAL: hubs older than
+  # `01ab1dd` omit all three, and a redelivery of a quarantine recorded before
+  # that commit still carries the old shape. Hence:
+  #
+  #   * an ABSENT "namespace" is accepted (there is nothing to compare against,
+  #     and the hub scopes delivery by its configured targets anyway);
+  #   * a PRESENT "namespace" MUST match — one hub serves several consumers and
+  #     must not be able to cross-post another namespace's holds into this one.
+  #     Because the field is now always sent, a host whose `credit_namespace`
+  #     diverges from the hub's settlement namespace loses EVERY hold notice
+  #     (metered `namespace_mismatch`, no user sentence) — coherent with
+  #     `payment_confirmed`, and covered by the namespace-coherence boot gate.
   defp held_namespace_match?(msg, state) do
     case Map.fetch(msg, "namespace") do
       :error -> true
@@ -709,9 +751,9 @@ defmodule Genswarms.LlmProxy do
     with beneficiary when is_binary(beneficiary) and beneficiary != "" <-
            Map.get(msg, "beneficiary"),
          ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref"),
+         {:ok, method} <- held_method(msg),
          {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
          true <- Decimal.compare(amount, Decimal.new(0)) == :gt do
-      method = held_method(msg)
       key = held_key(method, ref)
 
       record = %{
@@ -761,15 +803,34 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
-  # The shipped hub omits "method" on a hold. Keep the credit path's
-  # "<method>:<ref>" key WHEN a method is present (so a hold and its later
-  # release share one key), and fall back to the bare ref otherwise —
-  # clear_held_payment/3 matches on ref too, so a method-less hold is still
-  # cleared by the release that credits it.
+  # The current hub sends "method"; hubs older than 01ab1dd omit it. Keep the
+  # credit path's "<method>:<ref>" key WHEN a method is present (so a hold and
+  # its later release share one key), and fall back to the bare ref when it is
+  # absent — clear_held_payment/4 matches on ref too, so a method-less hold is
+  # still cleared by the release that credits it.
+  #
+  # (R4-M4) A PRESENT-but-unusable method is REFUSED, not silently downgraded
+  # to nil. `apply_validated_payment/3` refuses a colon-bearing method for the
+  # credit path (the "<method>:<ref>" join would be ambiguous); the hold path
+  # now says the same thing. Downgrading instead would key the hold on the bare
+  # ref, which (a) widens the shared keyspace the per-identity dedup exists to
+  # close and (b) leaves a hold that can never key-match its own release.
+  #   :error       -> bad_payment_held (present, but empty / non-binary / has ":")
+  #   {:ok, nil}   -> absent or JSON null (legacy hub) -> key on the bare ref
+  #   {:ok, m}     -> usable -> key on "<method>:<ref>"
   defp held_method(msg) do
-    case Map.get(msg, "method") do
-      m when is_binary(m) and m != "" -> if String.contains?(m, ":"), do: nil, else: m
-      _ -> nil
+    case Map.fetch(msg, "method") do
+      :error ->
+        {:ok, nil}
+
+      {:ok, nil} ->
+        {:ok, nil}
+
+      {:ok, m} when is_binary(m) and m != "" ->
+        if String.contains?(m, ":"), do: :error, else: {:ok, m}
+
+      {:ok, _other} ->
+        :error
     end
   end
 
@@ -782,8 +843,17 @@ defmodule Genswarms.LlmProxy do
   # that is missing.
   defp held_refusal_key(msg) do
     case Map.get(msg, "ref") do
-      ref when is_binary(ref) and ref != "" -> held_key(held_method(msg), ref)
-      _ -> Map.get(msg, "idempotency_key")
+      ref when is_binary(ref) and ref != "" ->
+        case held_method(msg) do
+          {:ok, method} -> held_key(method, ref)
+          # An unusable method is itself the refusal reason (R4-M4): the join
+          # would be ambiguous, so name the ref alone rather than mint a key
+          # that cannot be trusted to identify anything.
+          :error -> ref
+        end
+
+      _ ->
+        Map.get(msg, "idempotency_key")
     end
   end
 
@@ -800,15 +870,29 @@ defmodule Genswarms.LlmProxy do
   # deduped on the held key, capped at @payments_held_limit, and every
   # eviction is logged (a silently truncated hold queue is how a user's held
   # money stops being visible).
+  #
+  # (R4-I2) The dedup is scoped to `(budget_identity, key)`, NEVER the key
+  # alone. The mirror is multi-tenant and the key shapes share a keyspace: the
+  # hub's `ref` legitimately contains a colon (`tx_hash:log_index`), so a
+  # method-less hold keyed on the bare ref `"8453:0xaa"` collides with a
+  # method-bearing hold keyed `"8453" <> ":" <> "0xaa"` belonging to somebody
+  # else. A global dedup swallows the second identity's hold as a "duplicate":
+  # no mirror row, no durable record, no metric, no user sentence — and the hub
+  # is acked `ok:true`, so nothing anywhere flags the loss.
   defp remember_held_payment(state, record) do
     state_pid = Map.get(state, :state_pid, @state_name)
     key = record.idempotency_key
+    identity = record.budget_identity
 
     {status, evicted} =
       Agent.get_and_update(state_pid, fn mirror ->
         held = Map.get(mirror, :held_payments, [])
 
-        if Enum.any?(held, &(Map.get(&1, :idempotency_key) == key)) do
+        if Enum.any?(
+             held,
+             &(Map.get(&1, :budget_identity) == identity and
+                 Map.get(&1, :idempotency_key) == key)
+           ) do
           {{:already_present, []}, mirror}
         else
           appended = held ++ [record]
@@ -857,10 +941,18 @@ defmodule Genswarms.LlmProxy do
 
   # A credit that lands for the same money RESOLVES the hold: the phase-4
   # release re-emits `payment_confirmed` with the same method+ref, so both the
-  # exact "<method>:<ref>" key and the bare ref (a method-less hold, which is
-  # what the shipped hub sends) are matched. `:duplicate` clears too — it also
-  # means "this key is credited", just not by this delivery.
-  defp clear_held_payment(state, key, ref) do
+  # exact "<method>:<ref>" key and the bare ref (a method-less hold, the
+  # pre-01ab1dd hub shape) are matched. `:duplicate` clears too — it also means
+  # "this key is credited", just not by this delivery.
+  #
+  # (R4-I1) The match is scoped to the CREDITED BENEFICIARY. Money is
+  # per-identity: a settlement for beneficiary B must never clear beneficiary
+  # A's hold. Without the scope, two settlements sharing a `ref` across
+  # beneficiaries let one user's credit silently erase another user's hold —
+  # the victim's money stays quarantined at the hub while their block notice
+  # reverts to the base text and their `quota_status` row vanishes, which is
+  # exactly the silence C1 exists to prevent.
+  defp clear_held_payment(state, key, ref, beneficiary) do
     state_pid = Map.get(state, :state_pid, @state_name)
 
     cleared =
@@ -869,8 +961,9 @@ defmodule Genswarms.LlmProxy do
 
         {matched, kept} =
           Enum.split_with(held, fn row ->
-            Map.get(row, :idempotency_key) == key or
-              (is_binary(ref) and ref != "" and Map.get(row, :ref) == ref)
+            Map.get(row, :budget_identity) == beneficiary and
+              (Map.get(row, :idempotency_key) == key or
+                 (is_binary(ref) and ref != "" and Map.get(row, :ref) == ref))
           end)
 
         {matched, Map.put(mirror, :held_payments, kept)}
@@ -878,8 +971,8 @@ defmodule Genswarms.LlmProxy do
 
     if cleared != [] do
       Logger.info(
-        "llm_proxy: hold cleared by a credit for key=#{key} (#{length(cleared)} entr" <>
-          if(length(cleared) == 1, do: "y)", else: "ies)")
+        "llm_proxy: hold cleared by a credit for #{inspect(beneficiary)} key=#{key} " <>
+          "(#{length(cleared)} entr" <> if(length(cleared) == 1, do: "y)", else: "ies)")
       )
 
       bump_store_metric(
@@ -1032,11 +1125,11 @@ defmodule Genswarms.LlmProxy do
 
       case apply_credit_entry(state_pid, store_mod, entry) do
         :duplicate ->
-          clear_held_payment(state, key, ref)
+          clear_held_payment(state, key, ref, beneficiary)
           {:duplicate, key}
 
         {:ok, balance} ->
-          clear_held_payment(state, key, ref)
+          clear_held_payment(state, key, ref, beneficiary)
           {:applied, credited, balance, key}
 
         {:error, :store_unavailable} ->
@@ -1692,6 +1785,10 @@ defmodule Genswarms.LlmProxy do
     * `:repeat_ms` — minimum interval between notices for the same key.
       Defaults to #{@default_notice_repeat_ms} ms (4h). `0` or `nil` =
       legacy once-per-day (never repeat within the same UTC day).
+    * `:variant` — an extra term folded into the dedup key (default `nil` =
+      the plain 3-tuple key, byte-identical to the pre-0.4.0 behaviour). A
+      caller passes it when the notice's CONTENT materially changed, so the
+      new text is not swallowed by a rate limit set for the old text.
 
   State is **per proxy process lifetime** (a restart clears it and MAY
   re-notify — non-durable by design) and pruned to the requested `day` on
@@ -1703,14 +1800,19 @@ defmodule Genswarms.LlmProxy do
   def notice_due?(pid, budget_identity, reason, %Date{} = day, opts) when is_list(opts) do
     now = notice_now(Keyword.get(opts, :now))
     repeat_ms = Keyword.get(opts, :repeat_ms, @default_notice_repeat_ms)
-    key = {budget_identity, reason, day}
+
+    key =
+      case Keyword.get(opts, :variant) do
+        nil -> {budget_identity, reason, day}
+        variant -> {budget_identity, reason, day, variant}
+      end
 
     Agent.get_and_update(pid, fn state ->
       pruned =
         state
         |> Map.get(:notified)
         |> normalize_notified()
-        |> Enum.filter(fn {{_bid, _reason, d}, _at} -> d == day end)
+        |> Enum.filter(fn {k, _at} -> notice_key_day(k) == day end)
         |> Map.new()
 
       due? =
@@ -1738,6 +1840,14 @@ defmodule Genswarms.LlmProxy do
   # (worst case: one extra notice, same as a restart).
   defp normalize_notified(%{} = map) when not is_struct(map), do: map
   defp normalize_notified(_), do: %{}
+
+  # Day pruning must survive BOTH key shapes: the plain {bid, reason, day} and
+  # the variant-bearing {bid, reason, day, variant}. Anything else (a key left
+  # by an older boot) is dropped by returning a value that can never equal a
+  # %Date{}.
+  defp notice_key_day({_bid, _reason, day}), do: day
+  defp notice_key_day({_bid, _reason, day, _variant}), do: day
+  defp notice_key_day(_other), do: :unknown
 
   defp notice_now(nil), do: DateTime.utc_now()
   defp notice_now(%DateTime{} = dt), do: dt
@@ -4827,7 +4937,8 @@ defmodule Genswarms.LlmProxy.Plug do
 
       Proxy.notice_due?(opts.state_pid, session.budget_identity, reason, request_ctx.day,
         now: Map.get(opts, :clock, &DateTime.utc_now/0).(),
-        repeat_ms: Map.get(opts, :notice_repeat_ms, Proxy.default_notice_repeat_ms())
+        repeat_ms: Map.get(opts, :notice_repeat_ms, Proxy.default_notice_repeat_ms()),
+        variant: notice_variant(opts, session, reason)
       ) ->
         msg = Jason.encode!(%{action: "slot_reply", slot: session.slot, content: notice})
         opts.deliver_fn.(opts.swarm_name, opts.sender, :llm_proxy, msg)
@@ -4837,6 +4948,32 @@ defmodule Genswarms.LlmProxy.Plug do
         :suppressed
     end
   end
+
+  # (R4-M2) A newly-appeared hold changes the dedup key, so the FIRST notice
+  # after a quarantine is always due.
+  #
+  # Without it: the user is blocked at 09:00 (notice sent, no hold yet), the hub
+  # quarantines at 09:30, and every block until 13:00 returns :suppressed — the
+  # user is never told about the hold, while synthetic_block_content/2 tells the
+  # agent "the user was already notified earlier today; do not send a separate
+  # user reply". That statement is true of the OLD text and false of the new.
+  #
+  # The count (not a boolean) is folded in so a SECOND hold — a second deposit
+  # the user watched leave their wallet — also re-notifies with the new summed
+  # amount. It cannot spam: each increment requires a real settlement.
+  #
+  # PRIME INVARIANT: credits off (or a non-:budget cap) -> nil -> the dedup key
+  # is the plain 3-tuple, byte-identical to 0.3.0.
+  defp notice_variant(opts, session, :budget) do
+    if Map.get(opts, :credits_enabled, false) do
+      case Proxy.held_payments(Map.get(opts, :state_pid), session.budget_identity) do
+        [] -> nil
+        held -> {:held, length(held)}
+      end
+    end
+  end
+
+  defp notice_variant(_opts, _session, _reason), do: nil
 
   # Sessions registered with notify: false (background work, e.g. summarizers)
   # must never target the user with a block notice. Map.get: sessions registered
@@ -5121,20 +5258,33 @@ defmodule Genswarms.LlmProxy.Plug do
   # line only when credits_enabled is true (R3-M2), the fun is present, its
   # result non-empty, and the fun doesn't raise.
   #
-  # (C1) The HELD line sits between the two: a user whose money demonstrably
-  # left their wallet, and who is now looking at a "you are blocked" message,
-  # must be told that the payment arrived and is NOT credited yet. It rides
-  # the EXISTING notice — same delivery, same {identity, cap, day} dedup and
+  # (C1) The HELD line replaces the hint: a user whose money demonstrably left
+  # their wallet, and who is now looking at a "you are blocked" message, must
+  # be told that the payment arrived and is NOT credited yet. It rides the
+  # EXISTING notice — same delivery, same {identity, cap, day} dedup and
   # notice_repeat_ms rate limit (see block_notice_delivery/5) — deliberately:
   # a second notification channel for held money is how users get spammed or,
-  # worse, get a hold notice with no context about why they are blocked. The
-  # hint stays last because it is still the right action for a NEW payment.
+  # worse, get a hold notice with no context about why they are blocked.
+  #
+  # (R4-I4) While a hold is unresolved the top-up hint is SUPPRESSED. It is not
+  # "still the right action for a NEW payment": the mechanism that produced the
+  # hold is an aggregate issuance cap over a window, or a per-settlement
+  # max_payment_usd. Under the aggregate cap the window is still saturated, so
+  # a second deposit made on the strength of the hint is likely quarantined
+  # too; and the per-beneficiary small-top-up carve-out cannot rescue it,
+  # because this beneficiary has by definition already consumed theirs.
+  # "Your $5 is held pending an operator" followed immediately by "send USDC to
+  # 0xABC" tells the user to send good money after bad — $15 frozen instead of
+  # $5, still blocked, the same instruction twice. That is a worse support
+  # incident than the silence C1 was written to prevent. Once the hold clears,
+  # the hint returns unchanged.
   @doc false
   def budget_notice(request_ctx, _budget, opts, session) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
     base = "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
+    held = held_notice_line(opts, session)
 
-    [base, held_notice_line(opts, session), topup_hint(opts, session)]
+    [base, held, if(is_nil(held), do: topup_hint(opts, session))]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
   end
