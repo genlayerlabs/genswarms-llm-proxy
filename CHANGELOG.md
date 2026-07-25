@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-07-25
+
+- Added the default-off `poll_payments` durable outbox consumer with a
+  trailing-window read, per-consumer cursor, unfiltered-page `next_seq`
+  advancement, per-row applied/duplicate/transient/stuck disposition, and
+  cursor-ahead protection.
+- Added optional coherent cursor callbacks and a durable stuck-payment
+  operator-queue callback to `Genswarms.LlmProxy.Store`; the in-memory stuck
+  mirror is FIFO-bounded to 200 entries.
+- Added `llm_payments_lag`, stuck, cursor anomaly, and cursor read/write
+  telemetry through the existing `bump_metric/3` store seam. Configured
+  polling is visible in `quota_status.payments_poll`.
+- Payment-created credit entries now stamp the conversion rate in force,
+  source (`push` or `poll`), and outbox sequence when present without dropping
+  existing metadata. The push action remains the latency path and retains its
+  existing replies and trust behavior.
+
 ## 0.3.0 — 2026-07-23
 
 - Fixed (review R3-I1): a NONCONFORMING `record_llm_credit_entry/1` return

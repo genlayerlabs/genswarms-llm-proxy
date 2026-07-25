@@ -131,6 +131,42 @@ config:
   `payment_confirmed`, so the hint would point a blocked user at a payment
   path that cannot credit them — the fun is not even called.
 
+### Payments outbox polling (optional)
+
+Polling is additive and default-off. `payment_confirmed` remains the
+low-latency push path; polling reconciles the durable settlement outbox:
+
+- `settlements_fn` (default `nil`) — a two-arity function accepting
+  `(after_seq, limit)` and returning
+  `{:ok, %{settlements: rows, max_seq: m, next_seq: n, complete: boolean}}`.
+  `next_seq` is the hub cursor for the unfiltered store page and is used
+  directly, so pages containing only another namespace still advance.
+- `payments_consumer` (default `"llm_proxy"`) — durable cursor key.
+- `poll_lag` (default `100`) — each read starts at
+  `max(0, cursor - poll_lag)`; duplicate application makes the trailing
+  window safe.
+- `poll_limit` (default `100`) — positive page size.
+- `poll_sources` (default `[]`) — engine-stamped senders allowed to invoke
+  `{"action":"poll_payments"}`. Empty means refused even when
+  `settlements_fn` is configured.
+
+Polling also requires credits to be enabled. Each row uses the same amount,
+namespace, method, reference, and idempotency validation as the push path.
+Applied and duplicate rows resolve; a durable credit-write outage stops before
+the failed row; permanent validation failures enter the optional durable stuck
+queue and a 200-entry FIFO memory mirror, emit `llm_payments_stuck`, and do not
+poison the namespace. Successful polls emit `llm_payments_lag`.
+
+When `settlements_fn` is configured, `quota_status` adds
+`payments_poll: {cursor, lag, stuck}`. With it unset, this block is absent and
+existing output is unchanged.
+
+The durable cursor callbacks
+`llm_payments_cursor/1` + `put_llm_payments_cursor/2` are a
+both-callbacks-or-neither optional group. `record_llm_stuck_payment/1` is
+independently optional and receives the full settlement row plus rejection
+reason and timestamp. See `Genswarms.LlmProxy.Store` for exact return shapes.
+
 `payment_confirmed` is trusted-source **and** namespace gated; the required
 fields are `beneficiary`, `amount_usd`, `method`, and `ref`: `amount_usd` is
 **STRINGS-ONLY by contract** — it must be a JSON *string* that parses as a
