@@ -70,6 +70,7 @@ defmodule Genswarms.LlmProxy do
   @bandit_name __MODULE__.Bandit
   @default_port 4318
   @default_daily_limit "0.50"
+  @payments_stuck_limit 200
   # Minimum interval between repeated block notices for the same
   # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
   # `notice_repeat_ms` config/opt; 0 or nil = legacy once-per-day.
@@ -331,6 +332,13 @@ defmodule Genswarms.LlmProxy do
        payments_source: Map.get(config, :payments_source),
        credit_namespace: Map.get(config, :credit_namespace, "default"),
        credit_per_usd: validate_credit_per_usd!(Map.get(config, :credit_per_usd, "1.0")),
+       # Durable outbox consumer. `settlements_fn: nil` and `poll_sources: []`
+       # keep polling fully off; both defaults are deliberately inert.
+       settlements_fn: Map.get(config, :settlements_fn),
+       payments_consumer: Map.get(config, :payments_consumer, "llm_proxy") |> to_string(),
+       poll_lag: non_negative_integer(Map.get(config, :poll_lag), 100),
+       poll_limit: positive_integer(Map.get(config, :poll_limit), 100),
+       poll_sources: Map.get(config, :poll_sources, []) |> List.wrap(),
        # (B2) Same derivation as plug_opts.credits_enabled above — kept
        # alongside payments_source on the object-side state too, one
        # resolution point for "are credits on" regardless of which side asks.
@@ -357,6 +365,15 @@ defmodule Genswarms.LlmProxy do
       _ -> false
     end
   end
+
+  defp non_negative_integer(value, _default)
+       when is_integer(value) and value >= 0,
+       do: value
+
+  defp non_negative_integer(_value, default), do: default
+
+  defp positive_integer(value, _default) when is_integer(value) and value > 0, do: value
+  defp positive_integer(_value, default), do: default
 
   # (M3) Boot-reject a garbage credit_per_usd the same way a bad pricing
   # config is boot-rejected (validate_pricing_config!/3): the tolerant
@@ -422,6 +439,9 @@ defmodule Genswarms.LlmProxy do
 
       {:ok, %{"action" => "quota_status"} = msg} ->
         {:reply, Jason.encode!(quota_status(msg, state)), state}
+
+      {:ok, %{"action" => "poll_payments"}} ->
+        handle_poll_payments(from, state)
 
       {:ok, %{"action" => "payment_confirmed"} = msg} ->
         handle_payment_confirmed(from, msg, state)
@@ -500,35 +520,74 @@ defmodule Genswarms.LlmProxy do
   defp normalize_namespace(v) when is_binary(v) or is_atom(v) or is_number(v), do: to_string(v)
   defp normalize_namespace(v), do: v
 
-  # (M1) "debit:<request_id>" is the ledger's RESERVED internal keyspace
-  # (see do_maybe_debit_credit/4): a top-up whose method is literally "debit"
-  # would mint idempotency keys a real debit's "debit:" <> request_id can
-  # collide with — the colliding debit would then be swallowed as :duplicate
-  # and the balance never drawn down. Refuse it outright, non-retryable (the
-  # payload can never become valid; the hub must not redeliver).
-  defp credit_payment(%{"method" => "debit"}, state) do
-    {:reply, Jason.encode!(%{ok: false, error: "reserved_method"}), state}
+  defp credit_payment(msg, state) do
+    case apply_payment(msg, state, "push") do
+      {:duplicate, _key} ->
+        {:reply, Jason.encode!(%{ok: true, duplicate: true}), state}
+
+      {:applied, credited, balance, _key} ->
+        {:reply,
+         Jason.encode!(%{ok: true, credited_usd: money2(credited), balance_usd: money2(balance)}),
+         state}
+
+      {:transient, key} ->
+        # (X4) Fail CLOSED per spec: apply_credit_entry/3 has released its
+        # seen-mark, so the exact key remains retryable.
+        Logger.error(
+          "llm_proxy: credit entry store write FAILED — credit NOT applied (fails " <>
+            "closed per spec; retryable, key not consumed); key=#{key}"
+        )
+
+        store_mod = resolve_store_mod(state)
+        bump_credit_degraded_metric(store_mod)
+
+        {:reply,
+         Jason.encode!(%{
+           ok: false,
+           error: "store_unavailable",
+           retryable: true
+         }), state}
+
+      {:permanent, "reserved_method", _key} ->
+        {:reply, Jason.encode!(%{ok: false, error: "reserved_method"}), state}
+
+      {:permanent, _reason, _key} ->
+        {:reply, Jason.encode!(%{ok: false, error: "bad_payment_confirmed"}), state}
+    end
   end
 
-  defp credit_payment(msg, state) do
+  # One validating payment-to-credit path for both push and poll. The push
+  # handler retains its existing trust/namespace behavior; the poll consumer
+  # uses the same guards and classifies their failures as permanent rows.
+  defp apply_payment(msg, state, source) do
+    cond do
+      not payment_namespace_match?(msg, state) ->
+        {:permanent, "namespace_mismatch", payment_key(msg)}
+
+      Map.get(msg, "method") == "debit" ->
+        # "debit:<request_id>" is the ledger's reserved internal keyspace.
+        {:permanent, "reserved_method", payment_key(msg)}
+
+      true ->
+        apply_validated_payment(msg, state, source)
+    end
+  end
+
+  defp apply_validated_payment(msg, state, source) do
     with {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
          true <- Decimal.compare(amount, Decimal.new(0)) == :gt,
          beneficiary when is_binary(beneficiary) and beneficiary != "" <-
            Map.get(msg, "beneficiary"),
          method when is_binary(method) and method != "" <- Map.get(msg, "method"),
-         # (R3-M1) The idempotency key below is the plain join
-         # "#{method}:#{ref}" with GLOBAL uniqueness on the joined string, so
-         # a colon inside `method` makes the join ambiguous: ("a", "b:c") and
-         # ("a:b", "c") would mint the SAME key "a:b:c" and the second —
-         # legitimately distinct — payment would be permanently swallowed as
-         # duplicate:true. Rejecting ":" in `method` (ref may contain colons
-         # freely, e.g. tx hashes "0xT:0") makes the join unambiguous: the
-         # separator can never occur in the left component.
+         # The idempotency key is the plain "#{method}:#{ref}" join. A colon
+         # in method makes distinct component pairs collide; ref may contain
+         # colons freely.
          false <- String.contains?(method, ":"),
          ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref") do
       per_usd = decimal(Map.get(state, :credit_per_usd, Decimal.new("1.0")))
       credited = Decimal.mult(amount, per_usd)
       key = "#{method}:#{ref}"
+      meta = payment_credit_meta(msg, per_usd, source, method, ref)
 
       entry = %{
         idempotency_key: key,
@@ -536,45 +595,519 @@ defmodule Genswarms.LlmProxy do
         amount_usd: credited,
         kind: "credit",
         at: DateTime.utc_now(),
-        meta: %{"method" => method, "ref" => ref}
+        meta: meta
       }
 
       state_pid = Map.get(state, :state_pid, @state_name)
-      # (X5c) Same resolver quota_status/2 uses — see resolve_store_mod/1.
       store_mod = resolve_store_mod(state)
 
       case apply_credit_entry(state_pid, store_mod, entry) do
-        :duplicate ->
-          {:reply, Jason.encode!(%{ok: true, duplicate: true}), state}
-
-        {:ok, balance} ->
-          {:reply,
-           Jason.encode!(%{ok: true, credited_usd: money2(credited), balance_usd: money2(balance)}),
-           state}
-
-        # (X4) Fail CLOSED per spec: the durable write failed and
-        # apply_credit_entry/3 has already released its seen-mark, so this
-        # exact (method, ref) is retryable — NOT applied to the mirror, NOT
-        # permanently consumed. The hub is expected to redeliver.
-        {:error, :store_unavailable} ->
-          Logger.error(
-            "llm_proxy: credit entry store write FAILED — credit NOT applied (fails " <>
-              "closed per spec; retryable, key not consumed); key=#{key}"
-          )
-
-          bump_credit_degraded_metric(store_mod)
-
-          {:reply,
-           Jason.encode!(%{
-             ok: false,
-             error: "store_unavailable",
-             retryable: true
-           }), state}
+        :duplicate -> {:duplicate, key}
+        {:ok, balance} -> {:applied, credited, balance, key}
+        {:error, :store_unavailable} -> {:transient, key}
       end
     else
-      _ ->
-        {:reply, Jason.encode!(%{ok: false, error: "bad_payment_confirmed"}), state}
+      _ -> {:permanent, "bad_payment_confirmed", payment_key(msg)}
     end
+  end
+
+  defp payment_namespace_match?(msg, state) do
+    normalize_namespace(Map.get(msg, "namespace")) ==
+      normalize_namespace(Map.get(state, :credit_namespace, "default"))
+  end
+
+  defp payment_key(msg) do
+    case {Map.get(msg, "method"), Map.get(msg, "ref")} do
+      {method, ref} when is_binary(method) and is_binary(ref) -> "#{method}:#{ref}"
+      _ -> Map.get(msg, "idempotency_key")
+    end
+  end
+
+  defp payment_credit_meta(msg, per_usd, source, method, ref) do
+    existing =
+      case Map.get(msg, "meta") do
+        meta when is_map(meta) -> meta
+        _ -> %{}
+      end
+
+    stamped = %{
+      "method" => method,
+      "ref" => ref,
+      "credit_per_usd" => Decimal.to_string(per_usd, :normal),
+      "source" => source
+    }
+
+    stamped =
+      case Map.get(msg, "outbox_seq") do
+        seq when is_integer(seq) and seq >= 0 -> Map.put(stamped, "outbox_seq", seq)
+        _ -> stamped
+      end
+
+    Map.merge(existing, stamped)
+  end
+
+  # Durable outbox consumer. Every refusal is an explicit reply because cron
+  # ticks must be diagnosable; push remains the unchanged low-latency path.
+  defp handle_poll_payments(from, state) do
+    cond do
+      not poll_source_allowed?(from, Map.get(state, :poll_sources, [])) ->
+        poll_error(state, "untrusted_poll_source")
+
+      not is_function(Map.get(state, :settlements_fn), 2) ->
+        poll_error(state, "settlements_fn_not_configured")
+
+      not Map.get(state, :credits_enabled, false) ->
+        poll_error(state, "credits_disabled")
+
+      true ->
+        poll_payments(state)
+    end
+  end
+
+  defp poll_error(state, error) do
+    {:reply,
+     Jason.encode!(%{
+       action: "poll_payments",
+       ok: false,
+       error: error
+     }), state}
+  end
+
+  defp poll_source_allowed?(from, sources) when is_list(sources) do
+    with {:ok, stamped} <- scalar_string(from) do
+      Enum.any?(sources, fn configured ->
+        case scalar_string(configured) do
+          {:ok, source} -> source == stamped
+          :error -> false
+        end
+      end)
+    else
+      :error -> false
+    end
+  end
+
+  defp poll_source_allowed?(_from, _sources), do: false
+
+  defp scalar_string(value) when is_binary(value) or is_atom(value) or is_number(value),
+    do: {:ok, to_string(value)}
+
+  defp scalar_string(_value), do: :error
+
+  defp poll_payments(state) do
+    consumer = Map.get(state, :payments_consumer, "llm_proxy")
+
+    case read_payments_cursor(state, consumer) do
+      {:ok, cursor} ->
+        lag_window = non_negative_integer(Map.get(state, :poll_lag), 100)
+        limit = positive_integer(Map.get(state, :poll_limit), 100)
+        after_seq = max(0, cursor - lag_window)
+
+        case call_settlements_fn(Map.get(state, :settlements_fn), after_seq, limit) do
+          {:ok, page} -> finish_payments_poll(page, cursor, state, consumer)
+          {:error, reason} -> poll_read_error(reason, state)
+        end
+
+      {:error, reason} ->
+        Logger.error(
+          "llm_proxy: payments cursor read failed for #{inspect(consumer)}: #{inspect(reason)}"
+        )
+
+        bump_store_metric(
+          resolve_store_mod(state),
+          "llm_payments_cursor_read_failed",
+          %{consumer: consumer},
+          1
+        )
+
+        poll_error(state, "cursor_unavailable")
+    end
+  end
+
+  defp call_settlements_fn(settlements_fn, after_seq, limit) do
+    case settlements_fn.(after_seq, limit) do
+      {:ok,
+       %{
+         settlements: rows,
+         max_seq: max_seq,
+         next_seq: next_seq,
+         complete: complete
+       }}
+      when is_list(rows) and is_integer(max_seq) and max_seq >= 0 and
+             is_integer(next_seq) and next_seq >= 0 and is_boolean(complete) ->
+        if Enum.all?(rows, &is_map/1) do
+          {:ok,
+           %{
+             settlements: rows,
+             max_seq: max_seq,
+             next_seq: next_seq,
+             complete: complete
+           }}
+        else
+          {:error, :bad_settlements_reply}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:bad_settlements_reply, other}}
+    end
+  rescue
+    e -> {:error, {:raised, Exception.message(e)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp poll_read_error(reason, state) do
+    Logger.error("llm_proxy: settlements poll read failed: #{inspect(reason)}")
+
+    bump_store_metric(
+      resolve_store_mod(state),
+      "llm_payments_read_failed",
+      %{reason: inspect(reason)},
+      1
+    )
+
+    poll_error(state, "settlements_unavailable")
+  end
+
+  defp finish_payments_poll(%{max_seq: max_seq} = page, cursor, state, consumer)
+       when cursor > max_seq do
+    Logger.error(
+      "llm_proxy: payments cursor ahead of hub max_seq; consumer=#{inspect(consumer)} " <>
+        "cursor=#{cursor} max_seq=#{max_seq}; refusing rewind"
+    )
+
+    store_mod = resolve_store_mod(state)
+
+    bump_store_metric(
+      store_mod,
+      "llm_payments_cursor_ahead",
+      %{consumer: consumer, cursor: cursor, max_seq: max_seq},
+      1
+    )
+
+    lag = max_seq - cursor
+    bump_store_metric(store_mod, "llm_payments_lag", %{consumer: consumer}, lag)
+    remember_poll_status(state, cursor, max_seq, lag)
+
+    {:reply,
+     Jason.encode!(%{
+       action: "poll_payments",
+       ok: true,
+       applied: 0,
+       duplicates: 0,
+       stuck: 0,
+       deferred: length(page.settlements),
+       cursor: cursor,
+       max_seq: max_seq,
+       lag: lag,
+       anomaly: "cursor_ahead"
+     }), state}
+  end
+
+  defp finish_payments_poll(page, cursor, state, consumer) do
+    rows = Enum.sort_by(page.settlements, &settlement_sort_key/1)
+    total = length(rows)
+
+    disposition =
+      Enum.reduce_while(rows, empty_disposition(cursor), fn row, acc ->
+        msg = poll_payment_message(row)
+
+        case apply_payment(msg, state, "poll") do
+          {:applied, _credited, _balance, _key} ->
+            {:cont,
+             acc
+             |> Map.update!(:applied, &(&1 + 1))
+             |> resolved_row(row)}
+
+          {:duplicate, _key} ->
+            {:cont,
+             acc
+             |> Map.update!(:duplicates, &(&1 + 1))
+             |> resolved_row(row)}
+
+          {:transient, key} ->
+            Logger.error(
+              "llm_proxy: payments poll stopped at transient credit write failure; " <>
+                "key=#{inspect(key)} outbox_seq=#{inspect(row_value(row, :outbox_seq))}"
+            )
+
+            {:halt, %{acc | stopped: true}}
+
+          {:permanent, reason, key} ->
+            settlement_key = row_value(row, :idempotency_key) || key
+            record_stuck_payment(row, reason, settlement_key, state)
+
+            {:cont,
+             acc
+             |> Map.update!(:stuck, &(&1 + 1))
+             |> resolved_row(row)}
+        end
+      end)
+
+    deferred = total - disposition.resolved
+
+    requested_cursor =
+      if disposition.stopped do
+        disposition.last_resolved_seq
+      else
+        # Binding pin: this is the hub's UNFILTERED page cursor. Never derive
+        # it from the filtered settlement rows.
+        page.next_seq
+      end
+
+    effective_cursor =
+      case write_payments_cursor(state, consumer, requested_cursor) do
+        :ok ->
+          requested_cursor
+
+        {:error, reason} ->
+          Logger.error(
+            "llm_proxy: payments cursor write failed for #{inspect(consumer)} at " <>
+              "#{requested_cursor}: #{inspect(reason)}; credits remain idempotently replayable"
+          )
+
+          bump_store_metric(
+            resolve_store_mod(state),
+            "llm_payments_cursor_write_failed",
+            %{consumer: consumer, cursor: requested_cursor},
+            1
+          )
+
+          cursor
+      end
+
+    lag = page.max_seq - effective_cursor
+    store_mod = resolve_store_mod(state)
+    bump_store_metric(store_mod, "llm_payments_lag", %{consumer: consumer}, lag)
+    remember_poll_status(state, effective_cursor, page.max_seq, lag)
+
+    {:reply,
+     Jason.encode!(%{
+       action: "poll_payments",
+       ok: true,
+       applied: disposition.applied,
+       duplicates: disposition.duplicates,
+       stuck: disposition.stuck,
+       deferred: deferred,
+       cursor: effective_cursor,
+       max_seq: page.max_seq,
+       lag: lag
+     }), state}
+  end
+
+  defp empty_disposition(cursor) do
+    %{
+      applied: 0,
+      duplicates: 0,
+      stuck: 0,
+      resolved: 0,
+      stopped: false,
+      # The durable cursor proves rows through it were previously resolved.
+      # This floor prevents a transient encountered in the trailing reread
+      # from rewinding the cursor behind already-resolved history.
+      last_resolved_seq: cursor
+    }
+  end
+
+  defp resolved_row(acc, row) do
+    seq = row_value(row, :outbox_seq)
+
+    %{
+      acc
+      | resolved: acc.resolved + 1,
+        last_resolved_seq:
+          if(is_integer(seq) and seq >= 0,
+            do: max(acc.last_resolved_seq, seq),
+            else: acc.last_resolved_seq
+          )
+    }
+  end
+
+  defp settlement_sort_key(row) do
+    case row_value(row, :outbox_seq) do
+      seq when is_integer(seq) and seq >= 0 -> {0, seq}
+      _ -> {1, 0}
+    end
+  end
+
+  # The direct hub seam returns its store-native Decimal. Convert that one
+  # trusted representation to the same plain decimal string the push wire
+  # carries; JSON numbers remain numbers and are rejected by parse_money/1.
+  defp poll_payment_message(row) do
+    amount =
+      case row_value(row, :amount_usd) do
+        %Decimal{} = decimal -> Decimal.to_string(decimal, :normal)
+        other -> other
+      end
+
+    %{
+      "beneficiary" => row_value(row, :beneficiary),
+      "amount_usd" => amount,
+      "method" => row_value(row, :method),
+      "ref" => row_value(row, :ref),
+      "namespace" => row_value(row, :namespace),
+      "idempotency_key" => row_value(row, :idempotency_key),
+      "outbox_seq" => row_value(row, :outbox_seq),
+      "meta" => row_value(row, :meta)
+    }
+  end
+
+  defp row_value(row, key) when is_map(row) do
+    Map.get(row, key, Map.get(row, Atom.to_string(key)))
+  end
+
+  defp row_value(_row, _key), do: nil
+
+  defp read_payments_cursor(state, consumer) do
+    store_mod = resolve_store_mod(state)
+
+    if cursor_store_ready?(store_mod) do
+      case safe_store_call(store_mod, :llm_payments_cursor, [consumer]) do
+        {:ok, nil} -> {:ok, 0}
+        {:ok, cursor} when is_integer(cursor) and cursor >= 0 -> {:ok, cursor}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:bad_cursor_reply, other}}
+      end
+    else
+      {:ok,
+       Agent.get(Map.get(state, :state_pid, @state_name), fn mirror ->
+         mirror
+         |> Map.get(:payments_cursors, %{})
+         |> Map.get(consumer, 0)
+       end)}
+    end
+  end
+
+  defp write_payments_cursor(state, consumer, cursor)
+       when is_integer(cursor) and cursor >= 0 do
+    store_mod = resolve_store_mod(state)
+
+    if cursor_store_ready?(store_mod) do
+      case safe_store_call(store_mod, :put_llm_payments_cursor, [consumer, cursor]) do
+        :ok -> :ok
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:bad_cursor_write_reply, other}}
+      end
+    else
+      Agent.update(Map.get(state, :state_pid, @state_name), fn mirror ->
+        cursors = Map.get(mirror, :payments_cursors, %{})
+        Map.put(mirror, :payments_cursors, Map.put(cursors, consumer, cursor))
+      end)
+
+      :ok
+    end
+  end
+
+  defp cursor_store_ready?(store_mod) do
+    is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+      function_exported?(store_mod, :llm_payments_cursor, 1) and
+      function_exported?(store_mod, :put_llm_payments_cursor, 2)
+  end
+
+  defp safe_store_call(store_mod, function, args) do
+    apply(store_mod, function, args)
+  rescue
+    e -> {:error, {:raised, Exception.message(e)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp record_stuck_payment(row, reason, key, state) do
+    record =
+      row
+      |> Map.put(:reason, reason)
+      |> Map.put_new(:at, DateTime.utc_now())
+
+    store_mod = resolve_store_mod(state)
+
+    if store_callback?(store_mod, :record_llm_stuck_payment, 1) do
+      case safe_store_call(store_mod, :record_llm_stuck_payment, [record]) do
+        :ok ->
+          :ok
+
+        other ->
+          Logger.error(
+            "llm_proxy: durable stuck-payment record failed for #{inspect(key)}: #{inspect(other)}"
+          )
+
+          bump_store_metric(
+            store_mod,
+            "llm_payments_stuck_store_failed",
+            %{idempotency_key: key},
+            1
+          )
+      end
+    end
+
+    remember_stuck_payment(state, record, key)
+
+    bump_store_metric(
+      store_mod,
+      "llm_payments_stuck",
+      %{idempotency_key: key},
+      1
+    )
+  end
+
+  defp remember_stuck_payment(state, record, key) do
+    state_pid = Map.get(state, :state_pid, @state_name)
+
+    evicted =
+      Agent.get_and_update(state_pid, fn mirror ->
+        stuck = Map.get(mirror, :stuck_payments, [])
+
+        stuck =
+          if is_nil(key) do
+            stuck
+          else
+            Enum.reject(stuck, &(stuck_key(&1) == key))
+          end
+
+        appended = stuck ++ [record]
+        overflow = max(length(appended) - @payments_stuck_limit, 0)
+        evicted = Enum.take(appended, overflow)
+        {evicted, Map.put(mirror, :stuck_payments, Enum.drop(appended, overflow))}
+      end)
+
+    Enum.each(evicted, fn old ->
+      Logger.warning(
+        "llm_proxy: evicting oldest in-memory stuck payment mirror entry; " <>
+          "idempotency_key=#{inspect(stuck_key(old))}"
+      )
+    end)
+  end
+
+  defp stuck_key(row) do
+    row_value(row, :idempotency_key) ||
+      case {row_value(row, :method), row_value(row, :ref)} do
+        {method, ref} when is_binary(method) and is_binary(ref) -> "#{method}:#{ref}"
+        _ -> nil
+      end
+  end
+
+  defp store_callback?(store_mod, function, arity) do
+    is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+      function_exported?(store_mod, function, arity)
+  end
+
+  defp bump_store_metric(store_mod, event, meta, value) do
+    if store_callback?(store_mod, :bump_metric, 3) do
+      store_mod.bump_metric(event, meta, value)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp remember_poll_status(state, cursor, max_seq, lag) do
+    Agent.update(Map.get(state, :state_pid, @state_name), fn mirror ->
+      Map.put(mirror, :payments_poll, %{cursor: cursor, max_seq: max_seq, lag: lag})
+    end)
   end
 
   # Decimal.parse/1 also accepts "NaN"/"Infinity"/"-Infinity" (represented with
@@ -1094,6 +1627,7 @@ defmodule Genswarms.LlmProxy do
         reset_at: "#{Date.to_iso8601(Date.add(day, 1))} 00:00 UTC"
       }
     }
+    |> maybe_add_payments_poll(state)
   end
 
   defp money2(value), do: value |> decimal() |> Decimal.round(2) |> Decimal.to_string(:normal)
@@ -1140,7 +1674,7 @@ defmodule Genswarms.LlmProxy do
     d |> Decimal.round(places) |> Decimal.to_string(:normal)
   end
 
-  defp quota_status(msg, _state) do
+  defp quota_status(msg, state) do
     %{
       action: "quota_status",
       ok: false,
@@ -1151,6 +1685,43 @@ defmodule Genswarms.LlmProxy do
       # the safe default rather than omitting it.
       credit: %{balance_usd: money2(Decimal.new("0"))}
     }
+    |> maybe_add_payments_poll(state)
+  end
+
+  defp maybe_add_payments_poll(reply, state) do
+    if is_nil(Map.get(state, :settlements_fn)) do
+      reply
+    else
+      state_pid = Map.get(state, :state_pid, @state_name)
+
+      {poll_status, stuck_count} =
+        Agent.get(state_pid, fn mirror ->
+          {
+            Map.get(mirror, :payments_poll, %{}),
+            mirror |> Map.get(:stuck_payments, []) |> length()
+          }
+        end)
+
+      consumer = Map.get(state, :payments_consumer, "llm_proxy")
+
+      cursor =
+        case read_payments_cursor(state, consumer) do
+          {:ok, value} -> value
+          {:error, _reason} -> Map.get(poll_status, :cursor, 0)
+        end
+
+      Map.put(reply, :payments_poll, %{
+        cursor: cursor,
+        lag: Map.get(poll_status, :lag),
+        stuck: stuck_count
+      })
+    end
+  rescue
+    _ ->
+      Map.put(reply, :payments_poll, %{cursor: 0, lag: nil, stuck: 0})
+  catch
+    _, _ ->
+      Map.put(reply, :payments_poll, %{cursor: 0, lag: nil, stuck: 0})
   end
 
   defp quota_default_limit(quota, session) do

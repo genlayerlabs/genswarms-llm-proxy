@@ -3,11 +3,11 @@ defmodule Genswarms.LlmProxy.Store do
   The OPTIONAL durable-accounting seam. The proxy always keeps an in-memory
   usage mirror; a host that wants budgets to survive restarts (and to be
   enforced fleet-wide) passes `store_mod:` — a module implementing any subset
-  of these callbacks. Every call site is guarded with `function_exported?`,
-  so a partial implementation is fine: missing callbacks fall back to the
-  in-memory mirror (fail-open by design — an accounting outage must not take
-  the swarm's LLM path down; the global ceiling still holds via
-  `max(durable, in-memory)`).
+  of these callbacks, subject to the coherent callback groups documented
+  below. Every call site is guarded with `function_exported?`; missing groups
+  fall back to the in-memory mirror (fail-open by design — an accounting
+  outage must not take the swarm's LLM path down; the global ceiling still
+  holds via `max(durable, in-memory)`).
 
   All money values are `Decimal`; `day` is a `Date` (UTC).
   """
@@ -55,6 +55,36 @@ defmodule Genswarms.LlmProxy.Store do
   """
   @callback record_llm_credit_entry(map()) :: :ok | {:error, :duplicate} | {:error, term()}
 
+  @doc """
+  Read the durable outbox cursor for `consumer`.
+
+  This callback and `put_llm_payments_cursor/2` are one coherent optional
+  group: hosts should export both or neither. A missing pair uses the bounded
+  in-memory poll mirror; an exported pair is authoritative.
+  """
+  @callback llm_payments_cursor(consumer :: String.t()) ::
+              {:ok, non_neg_integer() | nil} | {:error, term()}
+
+  @doc """
+  Persist the durable outbox cursor for `consumer`.
+
+  See `llm_payments_cursor/1`; the cursor pair is consumed together.
+  """
+  @callback put_llm_payments_cursor(
+              consumer :: String.t(),
+              seq :: non_neg_integer()
+            ) ::
+              :ok | {:error, term()}
+
+  @doc """
+  Append a permanently rejected settlement to the durable operator queue.
+
+  The map is the full settlement row plus `reason` and `at`. This callback is
+  optional independently of the cursor pair; the proxy also retains a bounded
+  in-memory FIFO mirror for operator visibility.
+  """
+  @callback record_llm_stuck_payment(payment :: map()) :: :ok | {:error, term()}
+
   @optional_callbacks record_llm_call: 5,
                       record_llm_budget_origin: 1,
                       llm_usage_for_budget: 3,
@@ -62,5 +92,8 @@ defmodule Genswarms.LlmProxy.Store do
                       llm_usage_by_budget: 2,
                       list_llm_usage: 1,
                       llm_credit_balance: 1,
-                      record_llm_credit_entry: 1
+                      record_llm_credit_entry: 1,
+                      llm_payments_cursor: 1,
+                      put_llm_payments_cursor: 2,
+                      record_llm_stuck_payment: 1
 end
