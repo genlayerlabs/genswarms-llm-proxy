@@ -2,6 +2,35 @@
 
 ## 0.4.0 — 2026-07-25
 
+- Added the `payment_held` action: the consumer side of the settlement hub's
+  issuance caps. It **never credits** — behind the same trust gate a forged
+  `payment_confirmed` faces, it records the hold in a 200-entry FIFO mirror
+  (deduped, evictions logged), calls the new optional
+  `record_llm_held_payment/1` store callback (failure logged, metered, never
+  fatal), and emits `llm_payments_held` / `llm_payments_held_refused` /
+  `llm_payments_held_cleared`. `method` and `namespace` are optional in the
+  payload (the shipped hub sends neither); a *present* namespace must match.
+- A user whose money is held is no longer told nothing: while a hold is
+  unresolved, the identity's budget-block notice gains one sentence
+  ("Payment received but held for review: $X — not credited yet. An operator
+  has to release it."), summed across holds and appended once. It rides the
+  existing notice delivery, `{identity, cap, day}` dedup and
+  `notice_repeat_ms` rate limit — no second notification channel. A later
+  credit for the same `ref` (the operator release) clears the hold.
+- `quota_status.payments_poll` gained `held` (the most recent 10 unresolved
+  holds for the asked identity, newest first) and `held_count`. Both are
+  identity-scoped; the whole block remains absent without `settlements_fn`.
+- **D9 boot gate — credits imply pricing.** With `payments_source` configured,
+  `init/1` now refuses to boot unless `prices` is a complete non-negative
+  rate card with at least one positive per-Mtok price, in every pricing mode.
+  A proxy that takes a user's money and charges $0.00 per call never consumes
+  the credit — the liability stays open forever. A `0/0` card is still legal
+  with credits off (free tier); the gate cannot fire on an install with no
+  payments source.
+- **C4 — `budget_identity/1` documented as a pinned host-facing contract** and
+  guarded by a golden vector (`checks/llm_proxy_budget_identity_golden_test.exs`),
+  asserted identically host-side: hosts derive deposit beneficiaries from it,
+  so a shape change silently re-keys every user's deposit address.
 - Added the default-off `poll_payments` durable outbox consumer with a
   trailing-window read, per-consumer cursor, unfiltered-page `next_seq`
   advancement, per-row applied/duplicate/transient/stuck disposition, and
