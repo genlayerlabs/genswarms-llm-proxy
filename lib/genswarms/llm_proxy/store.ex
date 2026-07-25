@@ -88,6 +88,25 @@ defmodule Genswarms.LlmProxy.Store do
   """
   @callback record_llm_stuck_payment(payment :: map()) :: :ok | {:error, term()}
 
+  @doc """
+  Append one HELD (hub-quarantined) settlement to the durable
+  operator/user-facing record.
+
+  The map is `%{budget_identity, beneficiary, idempotency_key, method (may be
+  nil), ref, amount_usd (Decimal), reason, namespace, at (DateTime)}`. A held
+  settlement is money that arrived and was deliberately NOT credited pending an
+  operator release, so this is a NOTICE record, never a ledger entry — nothing
+  in the credit path reads it back.
+
+  Optional and independent of every other group. The proxy also keeps a
+  bounded in-memory FIFO mirror (that mirror, not this callback, is what
+  dedupes and what feeds the user-visible block-notice line and
+  `quota_status`), so a failure here is logged and metered
+  (`llm_payments_held_store_failed`) and never crashes the handler. After a
+  restart or a mirror eviction one repeated append per key is acceptable.
+  """
+  @callback record_llm_held_payment(payment :: map()) :: :ok | {:error, term()}
+
   @optional_callbacks record_llm_call: 5,
                       record_llm_budget_origin: 1,
                       llm_usage_for_budget: 3,
@@ -98,5 +117,6 @@ defmodule Genswarms.LlmProxy.Store do
                       record_llm_credit_entry: 1,
                       llm_payments_cursor: 1,
                       put_llm_payments_cursor: 2,
-                      record_llm_stuck_payment: 1
+                      record_llm_stuck_payment: 1,
+                      record_llm_held_payment: 1
 end

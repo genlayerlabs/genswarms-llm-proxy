@@ -134,7 +134,11 @@ quota = Jason.decode!(quota_json)
 
 check.(
   "quota_status exposes configured poll cursor, lag, and bounded stuck count",
-  quota["payments_poll"] == %{"cursor" => 205, "lag" => 0, "stuck" => 200}
+  # 0.4.0: the block gained "held"/"held_count" (identity-scoped hub-quarantine
+  # surface). This exact-map assertion is updated — NOT weakened — for the new
+  # keys; no hold was recorded here, so both are empty.
+  quota["payments_poll"] ==
+    %{"cursor" => 205, "lag" => 0, "stuck" => 200, "held" => [], "held_count" => 0}
 )
 
 failed = Agent.get(failures, & &1)

@@ -71,6 +71,11 @@ defmodule Genswarms.LlmProxy do
   @default_port 4318
   @default_daily_limit "0.50"
   @payments_stuck_limit 200
+  # Bounded in-memory mirror of hub-quarantined ("held") settlements, per the
+  # same FIFO/eviction-logged stance as the stuck queue. It is a NOTICE mirror,
+  # never a money record: it credits nothing and the hub's operator queue is
+  # authoritative.
+  @payments_held_limit 200
   @payments_poll_max_fetch 500
   # Minimum interval between repeated block notices for the same
   # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
@@ -107,6 +112,58 @@ defmodule Genswarms.LlmProxy do
   end
 
   def validate_pricing_config!(_mode, _prices, _margin_pct), do: :ok
+
+  @doc false
+  # (D9) CREDITS IMPLY PRICING. A user who pays USDC into a proxy that then
+  # charges $0.00 per call has bought nothing: the credit is never consumed,
+  # the balance never moves, and the books say the liability is still
+  # outstanding forever — an accounting fiction, and the most expensive kind of
+  # silent failure on the money path. So: with credits ON (payments_source
+  # configured, the same strict derivation `credits_enabled?/1` uses), the
+  # operator rate card must be able to VALUE a call.
+  #
+  # "Cannot value a call" is deliberately mode-independent. In
+  # `:rate_card_first` the card IS the charge; in `:cost_plus` the card is the
+  # fallback whenever provider cost is zero/missing/invalid (that is why
+  # `validate_pricing_config!/3` already demands a complete card there) — in
+  # BOTH modes an all-zero or incomplete card is the $0.00-per-call mode. A
+  # complete card with at least one positive per-Mtok price is the bar.
+  #
+  # A 0/0 card remains perfectly legal with credits OFF (a genuine free tier);
+  # this gate never fires on an install that configures no payments source, so
+  # the prime invariant holds.
+  def validate_credits_pricing!(config, pricing_mode, prices) do
+    if credits_enabled?(config) and not prices_can_value_call?(prices) do
+      raise ArgumentError,
+            "credits are enabled (payments_source is configured) but pricing_mode " <>
+              "#{inspect(pricing_mode)} cannot value a call: prices must be a COMPLETE " <>
+              "non-negative prompt/completion rate card with at least one positive " <>
+              "per-Mtok price, got: #{inspect(prices)} — otherwise every call costs " <>
+              "$0.00, paid-in credit is never consumed, and the balance is an " <>
+              "accounting fiction"
+    end
+
+    :ok
+  end
+
+  defp prices_can_value_call?(prices) when is_map(prices) do
+    rate_card_complete?(prices) and
+      (positive_price?(Map.get(prices, :prompt_per_mtok) || Map.get(prices, "prompt_per_mtok")) or
+         positive_price?(
+           Map.get(prices, :completion_per_mtok) || Map.get(prices, "completion_per_mtok")
+         ))
+  end
+
+  defp prices_can_value_call?(_prices), do: false
+
+  defp positive_price?(value) do
+    case strict_decimal(value) do
+      %Decimal{} = d -> finite_decimal?(d) and Decimal.compare(d, Decimal.new(0)) == :gt
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
 
   defp rate_card_price?(value) do
     case strict_decimal(value) do
@@ -170,6 +227,7 @@ defmodule Genswarms.LlmProxy do
     margin_pct = Map.get(config, :margin_pct, 0)
     pricing_mode = pricing_mode(Map.get(config, :pricing_mode))
     :ok = validate_pricing_config!(pricing_mode, prices, margin_pct)
+    :ok = validate_credits_pricing!(config, pricing_mode, prices)
     poll_config = validate_poll_config!(config)
 
     # A concurrent double-boot (or a leftover registered Agent) must NOT crash the object
@@ -456,6 +514,19 @@ defmodule Genswarms.LlmProxy do
           "\"namespace\" must equal the host's configured credit_namespace (default " <>
             "\"default\") — a mismatched namespace is silently ignored, not an error. " <>
             "\"amount_usd\" is a STRING by contract, never a JSON number (see README)."
+      },
+      payment_held: %{
+        input:
+          ~s({"action":"payment_held","beneficiary":"llmb_...","amount_usd":"5.00","ref":"0xabc:0","reason":"max_payment"}),
+        output:
+          "records + meters a hub-quarantined settlement and surfaces it to the user on " <>
+            "the next budget-block notice — it NEVER credits; only from the configured " <>
+            "payments_source",
+        note:
+          "\"method\" and \"namespace\" are OPTIONAL (the shipped hub omits both); when " <>
+            "\"namespace\" IS present it must equal the host's credit_namespace or the " <>
+            "notice is refused. The hold is cleared by a later payment_confirmed for the " <>
+            "same ref — the phase-4 operator release path."
       }
     }
   end
@@ -477,6 +548,9 @@ defmodule Genswarms.LlmProxy do
 
       {:ok, %{"action" => "payment_confirmed"} = msg} ->
         handle_payment_confirmed(from, msg, state)
+
+      {:ok, %{"action" => "payment_held"} = msg} ->
+        handle_payment_held(from, msg, state)
 
       _ ->
         {:noreply, state}
@@ -551,6 +625,329 @@ defmodule Genswarms.LlmProxy do
   # mismatches (ignored), never raising out of the handler.
   defp normalize_namespace(v) when is_binary(v) or is_atom(v) or is_number(v), do: to_string(v)
   defp normalize_namespace(v), do: v
+
+  # ── payment_held (C1 consumer side) ───────────────────────────────────────
+  #
+  # The settlement hub QUARANTINES a settlement that trips its issuance caps:
+  # the row is durable, deduped, alarmed, and NEVER creditable until an
+  # operator releases it. On quarantine the hub casts `payment_held` to its
+  # targets, ONE-SHOT and best-effort — the hub's operator queue, not this
+  # message, is the authoritative record. Two consequences pinned here:
+  #
+  #   * this handler NEVER credits. It records (bounded mirror + optional
+  #     durable callback), meters, and makes the hold VISIBLE to the user via
+  #     the existing block-notice machinery (see `budget_notice/4`). A silent
+  #     hold on money the user watched leave their wallet is a support
+  #     incident by design;
+  #   * a LOST notice must not corrupt state. Nothing downstream reads the
+  #     held mirror as truth about money: it only adds one honest sentence to
+  #     a notice and one operator block to `quota_status`. The release path
+  #     (phase 4) re-emits `payment_confirmed` for the same method:ref, and
+  #     THAT is what both credits and clears the hold.
+  #
+  # Trust is the same gate a forged `payment_confirmed` faces: credits must be
+  # enabled AND the sender must be the configured payments_source. An
+  # untrusted sender could otherwise paint "your payment is held" onto any
+  # conversation's block notice.
+  defp handle_payment_held(from, msg, state) do
+    source = Map.get(state, :payments_source)
+
+    cond do
+      not Map.get(state, :credits_enabled, false) ->
+        {:noreply, state}
+
+      is_nil(source) or source == "" ->
+        {:noreply, state}
+
+      to_string(from) != to_string(source) ->
+        Logger.warning(
+          "llm_proxy: payment_held from untrusted source #{inspect(from)} — ignored"
+        )
+
+        {:noreply, state}
+
+      not held_namespace_match?(msg, state) ->
+        # Silent-but-metered refusal, exactly like a foreign-namespace
+        # confirmation: multiple consumers share one hub and a foreign
+        # namespace is neither an error nor ours to warn about — but unlike a
+        # credit, a dropped user-visible notice is worth a counter.
+        bump_store_metric(
+          resolve_store_mod(state),
+          "llm_payments_held_refused",
+          %{reason: "namespace_mismatch", idempotency_key: held_refusal_key(msg)},
+          1
+        )
+
+        {:noreply, state}
+
+      true ->
+        record_held_payment(msg, state)
+    end
+  end
+
+  # The hub's `payment_held` payload (verified against the shipped emit site in
+  # genswarms-payments' `finish_recorded_settlement/6` for a `"quarantined"`
+  # row, 2026-07-25) carries ONLY: action, beneficiary, amount_usd, ref,
+  # reason — no "namespace", and no "method". So:
+  #
+  #   * an ABSENT "namespace" is accepted (the hub scopes delivery by its
+  #     configured targets; there is nothing to compare against and refusing
+  #     would drop every hold notice the shipped hub emits);
+  #   * a PRESENT "namespace" MUST match — a hub that grows the field must not
+  #     be able to cross-post another namespace's holds into this consumer.
+  defp held_namespace_match?(msg, state) do
+    case Map.fetch(msg, "namespace") do
+      :error -> true
+      {:ok, nil} -> true
+      {:ok, ns} -> normalize_namespace(ns) == normalize_namespace(held_namespace(state))
+    end
+  end
+
+  defp held_namespace(state), do: Map.get(state, :credit_namespace, "default")
+
+  defp record_held_payment(msg, state) do
+    with beneficiary when is_binary(beneficiary) and beneficiary != "" <-
+           Map.get(msg, "beneficiary"),
+         ref when is_binary(ref) and ref != "" <- Map.get(msg, "ref"),
+         {:ok, amount} <- parse_money(Map.get(msg, "amount_usd")),
+         true <- Decimal.compare(amount, Decimal.new(0)) == :gt do
+      method = held_method(msg)
+      key = held_key(method, ref)
+
+      record = %{
+        budget_identity: beneficiary,
+        beneficiary: beneficiary,
+        idempotency_key: key,
+        method: method,
+        ref: ref,
+        amount_usd: amount,
+        reason: to_string(Map.get(msg, "reason") || "unknown"),
+        namespace: normalize_namespace(Map.get(msg, "namespace") || held_namespace(state)),
+        at: held_at(msg)
+      }
+
+      case remember_held_payment(state, record) do
+        :already_present ->
+          {:reply, Jason.encode!(%{ok: true, held: true, duplicate: true}), state}
+
+        :recorded ->
+          store_mod = resolve_store_mod(state)
+          durable_held_payment(store_mod, record, key)
+
+          bump_store_metric(
+            store_mod,
+            "llm_payments_held",
+            %{idempotency_key: key, reason: record.reason},
+            1
+          )
+
+          Logger.warning(
+            "llm_proxy: payment HELD (#{record.reason}) — #{Decimal.to_string(amount, :normal)} " <>
+              "USD for #{inspect(beneficiary)} recorded, NOT credited; key=#{key}"
+          )
+
+          {:reply, Jason.encode!(%{ok: true, held: true, duplicate: false}), state}
+      end
+    else
+      _ ->
+        bump_store_metric(
+          resolve_store_mod(state),
+          "llm_payments_held_refused",
+          %{reason: "bad_payment_held", idempotency_key: held_refusal_key(msg)},
+          1
+        )
+
+        {:reply, Jason.encode!(%{ok: false, error: "bad_payment_held"}), state}
+    end
+  end
+
+  # The shipped hub omits "method" on a hold. Keep the credit path's
+  # "<method>:<ref>" key WHEN a method is present (so a hold and its later
+  # release share one key), and fall back to the bare ref otherwise —
+  # clear_held_payment/3 matches on ref too, so a method-less hold is still
+  # cleared by the release that credits it.
+  defp held_method(msg) do
+    case Map.get(msg, "method") do
+      m when is_binary(m) and m != "" -> if String.contains?(m, ":"), do: nil, else: m
+      _ -> nil
+    end
+  end
+
+  defp held_key(nil, ref), do: ref
+  defp held_key(method, ref), do: "#{method}:#{ref}"
+
+  # A refusal must still be diagnosable. payment_key/1 needs BOTH method and
+  # ref (the credit wire always carries both); a hold usually carries only the
+  # ref, so it gets its own tolerant derivation — ref-only, or nil when even
+  # that is missing.
+  defp held_refusal_key(msg) do
+    case Map.get(msg, "ref") do
+      ref when is_binary(ref) and ref != "" -> held_key(held_method(msg), ref)
+      _ -> Map.get(msg, "idempotency_key")
+    end
+  end
+
+  defp held_at(msg) do
+    with at when is_binary(at) <- Map.get(msg, "at"),
+         {:ok, dt, _offset} <- DateTime.from_iso8601(at) do
+      dt
+    else
+      _ -> DateTime.utc_now()
+    end
+  end
+
+  # Bounded FIFO mirror, same shape and stance as the stuck-payment mirror:
+  # deduped on the held key, capped at @payments_held_limit, and every
+  # eviction is logged (a silently truncated hold queue is how a user's held
+  # money stops being visible).
+  defp remember_held_payment(state, record) do
+    state_pid = Map.get(state, :state_pid, @state_name)
+    key = record.idempotency_key
+
+    {status, evicted} =
+      Agent.get_and_update(state_pid, fn mirror ->
+        held = Map.get(mirror, :held_payments, [])
+
+        if Enum.any?(held, &(Map.get(&1, :idempotency_key) == key)) do
+          {{:already_present, []}, mirror}
+        else
+          appended = held ++ [record]
+          overflow = max(length(appended) - @payments_held_limit, 0)
+
+          {{:recorded, Enum.take(appended, overflow)},
+           Map.put(mirror, :held_payments, Enum.drop(appended, overflow))}
+        end
+      end)
+
+    Enum.each(evicted, fn old ->
+      Logger.warning(
+        "llm_proxy: evicting oldest in-memory HELD payment mirror entry; " <>
+          "idempotency_key=#{inspect(Map.get(old, :idempotency_key))} — the user-visible " <>
+          "hold notice for it is gone; the hub's operator queue remains authoritative"
+      )
+    end)
+
+    status
+  end
+
+  defp durable_held_payment(store_mod, record, key) do
+    if store_callback?(store_mod, :record_llm_held_payment, 1) do
+      case safe_store_call(store_mod, :record_llm_held_payment, [record]) do
+        :ok ->
+          :ok
+
+        other ->
+          # Never fatal: the mirror already carries the user-visible hold and
+          # the hub owns the authoritative record.
+          Logger.error(
+            "llm_proxy: durable held-payment record failed for #{inspect(key)}: #{inspect(other)}"
+          )
+
+          bump_store_metric(
+            store_mod,
+            "llm_payments_held_store_failed",
+            %{idempotency_key: key},
+            1
+          )
+      end
+    end
+
+    :ok
+  end
+
+  # A credit that lands for the same money RESOLVES the hold: the phase-4
+  # release re-emits `payment_confirmed` with the same method+ref, so both the
+  # exact "<method>:<ref>" key and the bare ref (a method-less hold, which is
+  # what the shipped hub sends) are matched. `:duplicate` clears too — it also
+  # means "this key is credited", just not by this delivery.
+  defp clear_held_payment(state, key, ref) do
+    state_pid = Map.get(state, :state_pid, @state_name)
+
+    cleared =
+      Agent.get_and_update(state_pid, fn mirror ->
+        held = Map.get(mirror, :held_payments, [])
+
+        {matched, kept} =
+          Enum.split_with(held, fn row ->
+            Map.get(row, :idempotency_key) == key or
+              (is_binary(ref) and ref != "" and Map.get(row, :ref) == ref)
+          end)
+
+        {matched, Map.put(mirror, :held_payments, kept)}
+      end)
+
+    if cleared != [] do
+      Logger.info(
+        "llm_proxy: hold cleared by a credit for key=#{key} (#{length(cleared)} entr" <>
+          if(length(cleared) == 1, do: "y)", else: "ies)")
+      )
+
+      bump_store_metric(
+        resolve_store_mod(state),
+        "llm_payments_held_cleared",
+        %{idempotency_key: key, entries: length(cleared)},
+        1
+      )
+    end
+
+    :ok
+  end
+
+  @doc """
+  Unresolved held (hub-quarantined) payments for ONE budget identity, oldest
+  first. Read-only, never raises. Only ever consulted behind a
+  `credits_enabled` gate, so a feature-off install never touches it.
+  """
+  @doc since: "0.4.0"
+  def held_payments(pid \\ @state_name, budget_identity) do
+    Agent.get(pid, fn mirror ->
+      mirror
+      |> Map.get(:held_payments, [])
+      |> Enum.filter(&(Map.get(&1, :budget_identity) == budget_identity))
+    end)
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp held_for_identity(state_pid, budget_identity),
+    do: held_payments(state_pid, budget_identity)
+
+  @doc """
+  The single user-visible sentence appended to a budget-block notice when the
+  identity has unresolved held payments — `nil` when it has none.
+
+  (C1) A hold means money the user watched leave their wallet arrived and was
+  deliberately NOT credited. Saying nothing while blocking them is a support
+  incident by design, so this rides the existing block notice (same dedup and
+  `notice_repeat_ms` rate limit). All holds for the identity are summed into
+  ONE sentence — the line is appended at most once per notice.
+  """
+  @doc since: "0.4.0"
+  def held_notice_line(pid \\ @state_name, budget_identity)
+
+  def held_notice_line(pid, budget_identity) when is_binary(budget_identity) do
+    case held_payments(pid, budget_identity) do
+      [] ->
+        nil
+
+      held ->
+        total =
+          Enum.reduce(held, Decimal.new("0"), fn row, acc ->
+            Decimal.add(acc, decimal(Map.get(row, :amount_usd, 0)))
+          end)
+
+        "Payment received but held for review: $#{money2(total)} — not credited yet. " <>
+          "An operator has to release it."
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  def held_notice_line(_pid, _budget_identity), do: nil
 
   defp credit_payment(msg, state) do
     case apply_payment(msg, state, "push") do
@@ -634,9 +1031,16 @@ defmodule Genswarms.LlmProxy do
       store_mod = resolve_store_mod(state)
 
       case apply_credit_entry(state_pid, store_mod, entry) do
-        :duplicate -> {:duplicate, key}
-        {:ok, balance} -> {:applied, credited, balance, key}
-        {:error, :store_unavailable} -> {:transient, key}
+        :duplicate ->
+          clear_held_payment(state, key, ref)
+          {:duplicate, key}
+
+        {:ok, balance} ->
+          clear_held_payment(state, key, ref)
+          {:applied, credited, balance, key}
+
+        {:error, :store_unavailable} ->
+          {:transient, key}
       end
     else
       _ -> {:permanent, "bad_payment_confirmed", payment_key(msg)}
@@ -1423,6 +1827,37 @@ defmodule Genswarms.LlmProxy do
     _ -> nil
   end
 
+  @doc """
+  The budget identity for a session: `"llmb_" <> url-safe-base64(sha256(...))`
+  over exactly `workspace_key`, `kind`, `conversation_id`, NUL-joined in that
+  order. `workspace_key` defaults to `"default"`; all three are `to_string/1`
+  coerced, so an atom and its binary produce the SAME identity.
+
+  ## Pinned host-facing contract (C4) — DO NOT CHANGE THE SHAPE
+
+  This is a **public, stable contract**, not an internal detail. Hosts derive
+  user-facing artifacts from it — notably a payment beneficiary, and from that
+  a per-user deposit address. A change to the input list, the join, the digest,
+  the encoding or the `llmb_` prefix silently RE-KEYS every user's deposit
+  address: money already sent to the old address lands on an identity nothing
+  reads, and every existing credit balance is orphaned. There is no migration
+  that recovers a deposit made against a derivation that no longer exists.
+
+  Consequently:
+
+    * it stays public and it stays this shape;
+    * both sides pin the same golden vector, so a refactor fails loudly here
+      and in the host's composition check rather than silently:
+
+          budget_identity(%{workspace_key: "default", kind: "dm",
+                            conversation_id: "tg:1:0"})
+          #=> "llmb_xDByWmMCGVabJZ7C9tBC16tKsVUOYlcbah1O0Sz2aNI"
+
+      (see `checks/llm_proxy_budget_identity_golden_test.exs` for the full
+      vector set, including the omitted-workspace_key and atom-coercion
+      equivalences and a second non-default triple);
+    * changing it is a MAJOR, coordinated migration — never a refactor.
+  """
   def budget_identity(attrs) when is_map(attrs) do
     workspace_key = attrs |> Map.get(:workspace_key, "default") |> to_string()
     kind = attrs |> Map.fetch!(:kind) |> to_string()
@@ -1685,7 +2120,7 @@ defmodule Genswarms.LlmProxy do
         reset_at: "#{Date.to_iso8601(Date.add(day, 1))} 00:00 UTC"
       }
     }
-    |> maybe_add_payments_poll(state)
+    |> maybe_add_payments_poll(state, budget_identity)
   end
 
   defp money2(value), do: value |> decimal() |> Decimal.round(2) |> Decimal.to_string(:normal)
@@ -1743,10 +2178,16 @@ defmodule Genswarms.LlmProxy do
       # the safe default rather than omitting it.
       credit: %{balance_usd: money2(Decimal.new("0"))}
     }
-    |> maybe_add_payments_poll(state)
+    |> maybe_add_payments_poll(state, nil)
   end
 
-  defp maybe_add_payments_poll(reply, state) do
+  # The `payments_poll` operator block exists ONLY when polling is configured
+  # (`settlements_fn`) — the prime invariant: an install with no payments
+  # config gets a byte-identical reply. `held`/`held_count` are scoped to the
+  # asked budget identity (that is why the entries carry no beneficiary): a
+  # per-conversation reply must not enumerate other users' holds. A reply with
+  # no conversation_id has no identity, so the list is empty.
+  defp maybe_add_payments_poll(reply, state, budget_identity) do
     if is_nil(Map.get(state, :settlements_fn)) do
       reply
     else
@@ -1764,10 +2205,19 @@ defmodule Genswarms.LlmProxy do
               }
             end)
 
+          held =
+            if is_binary(budget_identity),
+              do: held_for_identity(state_pid, budget_identity),
+              else: []
+
           Map.put(reply, :payments_poll, %{
             cursor: cursor,
             lag: Map.get(poll_status, :lag),
-            stuck: stuck_count
+            stuck: stuck_count,
+            held_count: length(held),
+            # Most recent 10, newest first — a bounded operator/user surface,
+            # not the queue itself.
+            held: held |> Enum.reverse() |> Enum.take(10) |> Enum.map(&held_status_entry/1)
           })
 
         {:error, _reason} ->
@@ -1785,6 +2235,19 @@ defmodule Genswarms.LlmProxy do
   defp unavailable_payments_poll(reply) do
     Map.put(reply, :payments_poll, %{cursor: nil, unavailable: true})
   end
+
+  defp held_status_entry(row) do
+    %{
+      ref: Map.get(row, :ref),
+      amount_usd: money2(Map.get(row, :amount_usd, Decimal.new("0"))),
+      reason: Map.get(row, :reason),
+      at: held_at_iso(Map.get(row, :at))
+    }
+  end
+
+  defp held_at_iso(%DateTime{} = at), do: DateTime.to_iso8601(at)
+  defp held_at_iso(at) when is_binary(at), do: at
+  defp held_at_iso(_), do: nil
 
   defp quota_default_limit(quota, session) do
     cond do
@@ -4657,14 +5120,33 @@ defmodule Genswarms.LlmProxy.Plug do
   # the hint (from opts.topup_hint_fun, see init/1) is appended on its own
   # line only when credits_enabled is true (R3-M2), the fun is present, its
   # result non-empty, and the fun doesn't raise.
+  #
+  # (C1) The HELD line sits between the two: a user whose money demonstrably
+  # left their wallet, and who is now looking at a "you are blocked" message,
+  # must be told that the payment arrived and is NOT credited yet. It rides
+  # the EXISTING notice — same delivery, same {identity, cap, day} dedup and
+  # notice_repeat_ms rate limit (see block_notice_delivery/5) — deliberately:
+  # a second notification channel for held money is how users get spammed or,
+  # worse, get a hold notice with no context about why they are blocked. The
+  # hint stays last because it is still the right action for a NEW payment.
   @doc false
   def budget_notice(request_ctx, _budget, opts, session) do
     reset_date = request_ctx.day |> Date.add(1) |> Date.to_iso8601()
     base = "⏳ This chat reached its daily LLM limit. Try again tomorrow at 00:00 UTC (#{reset_date})."
 
-    case topup_hint(opts, session) do
-      nil -> base
-      hint -> base <> "\n" <> hint
+    [base, held_notice_line(opts, session), topup_hint(opts, session)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  # One sentence, appended at most once no matter how many holds the identity
+  # has (they are summed). Gated on the same strict credits_enabled derivation
+  # as every other credit surface: with credits off the handler refuses every
+  # payment_held, so the mirror is empty by construction — the gate keeps the
+  # feature-off path from even reading the Agent, byte-identical to 0.3.0.
+  defp held_notice_line(opts, session) do
+    if Map.get(opts, :credits_enabled, false) do
+      Proxy.held_notice_line(Map.get(opts, :state_pid), session.budget_identity)
     end
   end
 

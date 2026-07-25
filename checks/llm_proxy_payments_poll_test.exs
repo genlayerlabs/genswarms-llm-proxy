@@ -234,10 +234,15 @@ check.(
 
 check.(
   "configured polling adds cursor, lag, and stuck quota status",
+  # 0.4.0: the block gained "held"/"held_count" (identity-scoped hub-quarantine
+  # surface). This exact-map assertion is updated — NOT weakened — for the new
+  # keys; no hold was recorded here, so both are empty.
   Jason.decode!(configured_quota_json)["payments_poll"] == %{
     "cursor" => 0,
     "lag" => 0,
-    "stuck" => 0
+    "stuck" => 0,
+    "held" => [],
+    "held_count" => 0
   }
 )
 
