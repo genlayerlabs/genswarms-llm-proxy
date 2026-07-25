@@ -79,7 +79,7 @@ state = %{
   credit_namespace: "llm_quota",
   credit_per_usd: Decimal.new("1.0"),
   credits_enabled: true,
-  settlements_fn: fn 0, 300 ->
+  settlements_fn: fn 0, 400 ->
     {:ok, %{settlements: rows, max_seq: 205, next_seq: 205, complete: true}}
   end,
   payments_consumer: "llm_proxy",

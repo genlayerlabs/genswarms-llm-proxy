@@ -81,7 +81,10 @@ defmodule Genswarms.LlmProxy.Store do
 
   The map is the full settlement row plus `reason` and `at`. This callback is
   optional independently of the cursor pair; the proxy also retains a bounded
-  in-memory FIFO mirror for operator visibility.
+  in-memory FIFO mirror for operator visibility and uses that mirror as its
+  idempotency-key dedupe horizon. A trailing-window replay does not invoke this
+  callback again while the key remains mirrored; after a process restart or
+  mirror eviction, one repeated append per key is acceptable.
   """
   @callback record_llm_stuck_payment(payment :: map()) :: :ok | {:error, term()}
 

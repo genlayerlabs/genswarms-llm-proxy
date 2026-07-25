@@ -11,11 +11,21 @@
   mirror is FIFO-bounded to 200 entries.
 - Added `llm_payments_lag`, stuck, cursor anomaly, and cursor read/write
   telemetry through the existing `bump_metric/3` store seam. Configured
-  polling is visible in `quota_status.payments_poll`.
+  polling is visible in `quota_status.payments_poll`; cursor-store errors now
+  report `{cursor: null, unavailable: true}` instead of fabricated zeros.
+- Fixed dense-sequence poll liveness by requesting
+  `poll_lag + poll_limit` rows, giving the trailing replay window separate
+  progress capacity. Init now boot-validates the poll types and requires the
+  combined request to fit the settlements hub's 500-row cap.
+- Poll cursors are advance-only, unchanged cursor writes are skipped, and
+  trailing-window rereads dedupe stuck appends/alarms against the 200-entry
+  in-memory mirror. The mirror is the dedupe horizon; one re-append per key
+  after restart or eviction is acceptable.
 - Payment-created credit entries now stamp the conversion rate in force,
   source (`push` or `poll`), and outbox sequence when present without dropping
-  existing metadata. The push action remains the latency path and retains its
-  existing replies and trust behavior.
+  existing map metadata. Non-map hub metadata is dropped with a warning. The
+  push action remains the latency path and retains its existing replies and
+  trust behavior.
 
 ## 0.3.0 — 2026-07-23
 

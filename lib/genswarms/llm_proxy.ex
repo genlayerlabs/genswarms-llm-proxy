@@ -71,6 +71,7 @@ defmodule Genswarms.LlmProxy do
   @default_port 4318
   @default_daily_limit "0.50"
   @payments_stuck_limit 200
+  @payments_poll_max_fetch 500
   # Minimum interval between repeated block notices for the same
   # {budget_identity, reason, day}: 4 hours. Overridable per proxy via the
   # `notice_repeat_ms` config/opt; 0 or nil = legacy once-per-day.
@@ -169,6 +170,7 @@ defmodule Genswarms.LlmProxy do
     margin_pct = Map.get(config, :margin_pct, 0)
     pricing_mode = pricing_mode(Map.get(config, :pricing_mode))
     :ok = validate_pricing_config!(pricing_mode, prices, margin_pct)
+    poll_config = validate_poll_config!(config)
 
     # A concurrent double-boot (or a leftover registered Agent) must NOT crash the object
     # at boot — mirror the Bandit listener guard below: accept an already-started state
@@ -334,11 +336,11 @@ defmodule Genswarms.LlmProxy do
        credit_per_usd: validate_credit_per_usd!(Map.get(config, :credit_per_usd, "1.0")),
        # Durable outbox consumer. `settlements_fn: nil` and `poll_sources: []`
        # keep polling fully off; both defaults are deliberately inert.
-       settlements_fn: Map.get(config, :settlements_fn),
+       settlements_fn: poll_config.settlements_fn,
        payments_consumer: Map.get(config, :payments_consumer, "llm_proxy") |> to_string(),
-       poll_lag: non_negative_integer(Map.get(config, :poll_lag), 100),
-       poll_limit: positive_integer(Map.get(config, :poll_limit), 100),
-       poll_sources: Map.get(config, :poll_sources, []) |> List.wrap(),
+       poll_lag: poll_config.poll_lag,
+       poll_limit: poll_config.poll_limit,
+       poll_sources: poll_config.poll_sources,
        # (B2) Same derivation as plug_opts.credits_enabled above — kept
        # alongside payments_source on the object-side state too, one
        # resolution point for "are credits on" regardless of which side asks.
@@ -366,14 +368,44 @@ defmodule Genswarms.LlmProxy do
     end
   end
 
-  defp non_negative_integer(value, _default)
-       when is_integer(value) and value >= 0,
-       do: value
+  defp validate_poll_config!(config) do
+    settlements_fn = Map.get(config, :settlements_fn)
+    poll_lag = Map.get(config, :poll_lag, 100)
+    poll_limit = Map.get(config, :poll_limit, 100)
+    poll_sources = Map.get(config, :poll_sources, [])
 
-  defp non_negative_integer(_value, default), do: default
+    unless is_nil(settlements_fn) or is_function(settlements_fn, 2) do
+      raise ArgumentError,
+            "settlements_fn must be nil or a two-arity function, got: #{inspect(settlements_fn)}"
+    end
 
-  defp positive_integer(value, _default) when is_integer(value) and value > 0, do: value
-  defp positive_integer(_value, default), do: default
+    unless is_integer(poll_lag) and poll_lag >= 0 do
+      raise ArgumentError,
+            "poll_lag must be a non-negative integer, got: #{inspect(poll_lag)}"
+    end
+
+    unless is_integer(poll_limit) and poll_limit > 0 do
+      raise ArgumentError,
+            "poll_limit must be a positive integer, got: #{inspect(poll_limit)}"
+    end
+
+    unless is_list(poll_sources) do
+      raise ArgumentError, "poll_sources must be a list, got: #{inspect(poll_sources)}"
+    end
+
+    if poll_lag + poll_limit > @payments_poll_max_fetch do
+      raise ArgumentError,
+            "poll_lag + poll_limit must be <= #{@payments_poll_max_fetch} " <>
+              "(the settlements hub fetch cap), got: #{poll_lag} + #{poll_limit}"
+    end
+
+    %{
+      settlements_fn: settlements_fn,
+      poll_lag: poll_lag,
+      poll_limit: poll_limit,
+      poll_sources: poll_sources
+    }
+  end
 
   # (M3) Boot-reject a garbage credit_per_usd the same way a bad pricing
   # config is boot-rejected (validate_pricing_config!/3): the tolerant
@@ -625,9 +657,23 @@ defmodule Genswarms.LlmProxy do
 
   defp payment_credit_meta(msg, per_usd, source, method, ref) do
     existing =
-      case Map.get(msg, "meta") do
-        meta when is_map(meta) -> meta
-        _ -> %{}
+      case Map.fetch(msg, "meta") do
+        {:ok, nil} ->
+          %{}
+
+        :error ->
+          %{}
+
+        {:ok, meta} when is_map(meta) ->
+          meta
+
+        {:ok, _meta} ->
+          Logger.warning(
+            "llm_proxy: dropping non-map hub payment meta; " <>
+              "source=#{source}"
+          )
+
+          %{}
       end
 
     stamped = %{
@@ -698,11 +744,12 @@ defmodule Genswarms.LlmProxy do
 
     case read_payments_cursor(state, consumer) do
       {:ok, cursor} ->
-        lag_window = non_negative_integer(Map.get(state, :poll_lag), 100)
-        limit = positive_integer(Map.get(state, :poll_limit), 100)
+        lag_window = Map.get(state, :poll_lag, 100)
+        limit = Map.get(state, :poll_limit, 100)
         after_seq = max(0, cursor - lag_window)
+        fetch_limit = lag_window + limit
 
-        case call_settlements_fn(Map.get(state, :settlements_fn), after_seq, limit) do
+        case call_settlements_fn(Map.get(state, :settlements_fn), after_seq, fetch_limit) do
           {:ok, page} -> finish_payments_poll(page, cursor, state, consumer)
           {:error, reason} -> poll_read_error(reason, state)
         end
@@ -853,29 +900,34 @@ defmodule Genswarms.LlmProxy do
         disposition.last_resolved_seq
       else
         # Binding pin: this is the hub's UNFILTERED page cursor. Never derive
-        # it from the filtered settlement rows.
-        page.next_seq
+        # it from the filtered settlement rows. A stale hub cursor may never
+        # rewind the durable consumer cursor.
+        max(page.next_seq, cursor)
       end
 
     effective_cursor =
-      case write_payments_cursor(state, consumer, requested_cursor) do
-        :ok ->
-          requested_cursor
+      if requested_cursor == cursor do
+        cursor
+      else
+        case write_payments_cursor(state, consumer, requested_cursor) do
+          :ok ->
+            requested_cursor
 
-        {:error, reason} ->
-          Logger.error(
-            "llm_proxy: payments cursor write failed for #{inspect(consumer)} at " <>
-              "#{requested_cursor}: #{inspect(reason)}; credits remain idempotently replayable"
-          )
+          {:error, reason} ->
+            Logger.error(
+              "llm_proxy: payments cursor write failed for #{inspect(consumer)} at " <>
+                "#{requested_cursor}: #{inspect(reason)}; credits remain idempotently replayable"
+            )
 
-          bump_store_metric(
-            resolve_store_mod(state),
-            "llm_payments_cursor_write_failed",
-            %{consumer: consumer, cursor: requested_cursor},
-            1
-          )
+            bump_store_metric(
+              resolve_store_mod(state),
+              "llm_payments_cursor_write_failed",
+              %{consumer: consumer, cursor: requested_cursor},
+              1
+            )
 
-          cursor
+            cursor
+        end
       end
 
     lag = page.max_seq - effective_cursor
@@ -1020,56 +1072,60 @@ defmodule Genswarms.LlmProxy do
       |> Map.put(:reason, reason)
       |> Map.put_new(:at, DateTime.utc_now())
 
-    store_mod = resolve_store_mod(state)
+    case remember_stuck_payment(state, record, key) do
+      :already_present ->
+        :ok
 
-    if store_callback?(store_mod, :record_llm_stuck_payment, 1) do
-      case safe_store_call(store_mod, :record_llm_stuck_payment, [record]) do
-        :ok ->
-          :ok
+      :recorded ->
+        store_mod = resolve_store_mod(state)
 
-        other ->
-          Logger.error(
-            "llm_proxy: durable stuck-payment record failed for #{inspect(key)}: #{inspect(other)}"
-          )
+        if store_callback?(store_mod, :record_llm_stuck_payment, 1) do
+          case safe_store_call(store_mod, :record_llm_stuck_payment, [record]) do
+            :ok ->
+              :ok
 
-          bump_store_metric(
-            store_mod,
-            "llm_payments_stuck_store_failed",
-            %{idempotency_key: key},
-            1
-          )
-      end
+            other ->
+              Logger.error(
+                "llm_proxy: durable stuck-payment record failed for #{inspect(key)}: #{inspect(other)}"
+              )
+
+              bump_store_metric(
+                store_mod,
+                "llm_payments_stuck_store_failed",
+                %{idempotency_key: key},
+                1
+              )
+          end
+        end
+
+        bump_store_metric(
+          store_mod,
+          "llm_payments_stuck",
+          %{idempotency_key: key},
+          1
+        )
     end
-
-    remember_stuck_payment(state, record, key)
-
-    bump_store_metric(
-      store_mod,
-      "llm_payments_stuck",
-      %{idempotency_key: key},
-      1
-    )
   end
 
   defp remember_stuck_payment(state, record, key) do
     state_pid = Map.get(state, :state_pid, @state_name)
 
-    evicted =
+    result =
       Agent.get_and_update(state_pid, fn mirror ->
         stuck = Map.get(mirror, :stuck_payments, [])
 
-        stuck =
-          if is_nil(key) do
-            stuck
-          else
-            Enum.reject(stuck, &(stuck_key(&1) == key))
-          end
+        if not is_nil(key) and Enum.any?(stuck, &(stuck_key(&1) == key)) do
+          {{:already_present, []}, mirror}
+        else
+          appended = stuck ++ [record]
+          overflow = max(length(appended) - @payments_stuck_limit, 0)
+          evicted = Enum.take(appended, overflow)
 
-        appended = stuck ++ [record]
-        overflow = max(length(appended) - @payments_stuck_limit, 0)
-        evicted = Enum.take(appended, overflow)
-        {evicted, Map.put(mirror, :stuck_payments, Enum.drop(appended, overflow))}
+          {{:recorded, evicted}, Map.put(mirror, :stuck_payments, Enum.drop(appended, overflow))}
+        end
       end)
+
+    {status, evicted} = result
 
     Enum.each(evicted, fn old ->
       Logger.warning(
@@ -1077,6 +1133,8 @@ defmodule Genswarms.LlmProxy do
           "idempotency_key=#{inspect(stuck_key(old))}"
       )
     end)
+
+    status
   end
 
   defp stuck_key(row) do
@@ -1692,36 +1750,40 @@ defmodule Genswarms.LlmProxy do
     if is_nil(Map.get(state, :settlements_fn)) do
       reply
     else
-      state_pid = Map.get(state, :state_pid, @state_name)
-
-      {poll_status, stuck_count} =
-        Agent.get(state_pid, fn mirror ->
-          {
-            Map.get(mirror, :payments_poll, %{}),
-            mirror |> Map.get(:stuck_payments, []) |> length()
-          }
-        end)
-
       consumer = Map.get(state, :payments_consumer, "llm_proxy")
 
-      cursor =
-        case read_payments_cursor(state, consumer) do
-          {:ok, value} -> value
-          {:error, _reason} -> Map.get(poll_status, :cursor, 0)
-        end
+      case read_payments_cursor(state, consumer) do
+        {:ok, cursor} ->
+          state_pid = Map.get(state, :state_pid, @state_name)
 
-      Map.put(reply, :payments_poll, %{
-        cursor: cursor,
-        lag: Map.get(poll_status, :lag),
-        stuck: stuck_count
-      })
+          {poll_status, stuck_count} =
+            Agent.get(state_pid, fn mirror ->
+              {
+                Map.get(mirror, :payments_poll, %{}),
+                mirror |> Map.get(:stuck_payments, []) |> length()
+              }
+            end)
+
+          Map.put(reply, :payments_poll, %{
+            cursor: cursor,
+            lag: Map.get(poll_status, :lag),
+            stuck: stuck_count
+          })
+
+        {:error, _reason} ->
+          unavailable_payments_poll(reply)
+      end
     end
   rescue
     _ ->
-      Map.put(reply, :payments_poll, %{cursor: 0, lag: nil, stuck: 0})
+      unavailable_payments_poll(reply)
   catch
     _, _ ->
-      Map.put(reply, :payments_poll, %{cursor: 0, lag: nil, stuck: 0})
+      unavailable_payments_poll(reply)
+  end
+
+  defp unavailable_payments_poll(reply) do
+    Map.put(reply, :payments_poll, %{cursor: nil, unavailable: true})
   end
 
   defp quota_default_limit(quota, session) do

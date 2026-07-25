@@ -140,26 +140,41 @@ low-latency push path; polling reconciles the durable settlement outbox:
   `(after_seq, limit)` and returning
   `{:ok, %{settlements: rows, max_seq: m, next_seq: n, complete: boolean}}`.
   `next_seq` is the hub cursor for the unfiltered store page and is used
-  directly, so pages containing only another namespace still advance.
+  with a floor at the current durable cursor, so pages containing only another
+  namespace still advance but a stale hub cursor can never rewind the consumer.
 - `payments_consumer` (default `"llm_proxy"`) — durable cursor key.
 - `poll_lag` (default `100`) — each read starts at
   `max(0, cursor - poll_lag)`; duplicate application makes the trailing
   window safe.
-- `poll_limit` (default `100`) — positive page size.
+- `poll_limit` (default `100`) — progress capacity beyond the trailing window.
+  The function read limit is `poll_lag + poll_limit`, ensuring dense trailing
+  rows cannot consume the whole page and permanently hide newer settlements.
+  The settlements hub caps reads at 500, so init requires
+  `poll_lag + poll_limit <= 500`.
 - `poll_sources` (default `[]`) — engine-stamped senders allowed to invoke
   `{"action":"poll_payments"}`. Empty means refused even when
   `settlements_fn` is configured.
+
+Poll config is boot-validated: `poll_lag` must be a non-negative integer,
+`poll_limit` a positive integer, `poll_sources` a list, and `settlements_fn`
+either `nil` or a two-arity function. Invalid opt-in config raises
+`ArgumentError` instead of being silently replaced with defaults.
 
 Polling also requires credits to be enabled. Each row uses the same amount,
 namespace, method, reference, and idempotency validation as the push path.
 Applied and duplicate rows resolve; a durable credit-write outage stops before
 the failed row; permanent validation failures enter the optional durable stuck
 queue and a 200-entry FIFO memory mirror, emit `llm_payments_stuck`, and do not
-poison the namespace. Successful polls emit `llm_payments_lag`.
+poison the namespace. The mirror is also the stuck-key dedupe horizon: while a
+key remains in it, trailing-window rereads do not append or alarm it again.
+After a process restart (or FIFO eviction), one re-append and alarm per key is
+acceptable. Successful polls emit `llm_payments_lag`.
 
 When `settlements_fn` is configured, `quota_status` adds
 `payments_poll: {cursor, lag, stuck}`. With it unset, this block is absent and
-existing output is unchanged.
+existing output is unchanged. If the configured cursor store is unavailable,
+the block is exactly `payments_poll: {cursor: null, unavailable: true}` rather
+than a fabricated healthy zero.
 
 The durable cursor callbacks
 `llm_payments_cursor/1` + `put_llm_payments_cursor/2` are a
@@ -195,6 +210,8 @@ a colliding top-up key would swallow a real debit as a duplicate. Replies
 `{"ok":false,"error":"store_unavailable","retryable":true}` (durable store
 configured but the write failed — see Fail policy below); a malformed
 message replies `{"ok":false,"error":"bad_payment_confirmed"}`.
+An optional hub `meta` value is merged only when it is a map. A present,
+non-map value is dropped with a warning and never reaches the ledger entry.
 
 Durable accounting for credits is two more OPTIONAL `Store` callbacks —
 `llm_credit_balance/1` (current signed balance) and

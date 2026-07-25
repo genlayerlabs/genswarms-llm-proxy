@@ -3,6 +3,8 @@
 # Standalone — no Postgres, no network.
 alias Genswarms.LlmProxy, as: Proxy
 
+ExUnit.start(autorun: false)
+
 {:ok, failures} = Agent.start_link(fn -> [] end)
 
 check = fn label, ok ->
@@ -26,6 +28,7 @@ defmodule PaymentsPollStore do
         transient_keys: MapSet.new(Keyword.get(opts, :transient_keys, [])),
         stuck: [],
         metrics: [],
+        cursor_read_error: Keyword.get(opts, :cursor_read_error),
         cursor_write_error: Keyword.get(opts, :cursor_write_error)
       }
     )
@@ -76,7 +79,12 @@ defmodule PaymentsPollStore do
     end
   end
 
-  def llm_payments_cursor(_consumer), do: {:ok, state().cursor}
+  def llm_payments_cursor(_consumer) do
+    case state().cursor_read_error do
+      nil -> {:ok, state().cursor}
+      reason -> {:error, reason}
+    end
+  end
 
   def put_llm_payments_cursor(_consumer, cursor) do
     case state().cursor_write_error do
@@ -242,6 +250,19 @@ check.(
   Jason.decode!(pre_poll_quota_json)["payments_poll"]["lag"] == nil
 )
 
+PaymentsPollStore.reset(cursor_read_error: :db_down)
+
+{:reply, unavailable_quota_json, _} =
+  Proxy.handle_message("operator", quota_msg, atom_source_state)
+
+check.(
+  "cursor-store failure is distinct and never fabricates a healthy zero",
+  Jason.decode!(unavailable_quota_json)["payments_poll"] == %{
+    "cursor" => nil,
+    "unavailable" => true
+  }
+)
+
 # One page exercises every disposition. Cursor begins at 100: seq 101 applies,
 # 102 is already durable, 103 is permanently malformed, 104 is transient, and
 # 105 is deferred without being touched.
@@ -271,8 +292,8 @@ first = decode_poll.("cron", state)
 store_after_first = PaymentsPollStore.state()
 
 check.(
-  "poll reads from cursor-lag using configured limit",
-  Agent.get(reads, & &1) == [{0, 100}]
+  "poll reads from cursor-lag with lag plus progress capacity",
+  Agent.get(reads, & &1) == [{0, 200}]
 )
 
 check.(
@@ -331,6 +352,17 @@ check.(
     second["deferred"] == 0 and second["cursor"] == 105 and second["lag"] == 0
 )
 
+store_after_second = PaymentsPollStore.state()
+
+check.(
+  "two polls over one stuck key append and alarm exactly once within the mirror horizon",
+  length(store_after_second.stuck) == 1 and
+    Enum.count(store_after_second.metrics, fn
+      {"llm_payments_stuck", %{idempotency_key: "8453:0xBAD:0"}, 1} -> true
+      _ -> false
+    end) == 1
+)
+
 third = decode_poll.("cron", state)
 
 check.(
@@ -371,12 +403,51 @@ check.(
     not Map.has_key?(push_entry.meta, "outbox_seq")
 )
 
+parent = self()
+
+bad_meta_log =
+  ExUnit.CaptureLog.capture_log(fn ->
+    bad_meta_msg =
+      Jason.encode!(%{
+        action: "payment_confirmed",
+        beneficiary: "w:push|k:dm|c:tg:3:0",
+        amount_usd: "1.25",
+        method: "card",
+        ref: "push-bad-meta",
+        namespace: "llm_quota",
+        meta: ["not", "a", "map"]
+      })
+
+    {:reply, json, _} = Proxy.handle_message("payments", bad_meta_msg, state)
+    send(parent, {:bad_meta_reply, json})
+  end)
+
+bad_meta_json =
+  receive do
+    {:bad_meta_reply, json} -> json
+  end
+
+bad_meta_entry =
+  Enum.find(PaymentsPollStore.state().entries, &(&1.idempotency_key == "card:push-bad-meta"))
+
+check.(
+  "non-map push meta is dropped with a warning without crashing or storing garbage",
+  Jason.decode!(bad_meta_json)["ok"] == true and
+    bad_meta_entry.meta == %{
+      "credit_per_usd" => "2.0",
+      "method" => "card",
+      "ref" => "push-bad-meta",
+      "source" => "push"
+    } and
+    bad_meta_log =~ "dropping non-map hub payment meta" and bad_meta_log =~ "source=push"
+)
+
 # Empty filtered pages still advance by the unfiltered page's next_seq.
 PaymentsPollStore.reset(cursor: 10)
 
 foreign_only_state = %{
   state
-  | settlements_fn: fn 0, 100 ->
+  | settlements_fn: fn 0, 200 ->
       {:ok, %{settlements: [], max_seq: 80, next_seq: 80, complete: false}}
     end
 }
@@ -394,7 +465,7 @@ numeric_row = row.(1, "0xFLOAT:0", %{amount_usd: 5.0})
 
 numeric_state = %{
   state
-  | settlements_fn: fn 0, 100 ->
+  | settlements_fn: fn 0, 200 ->
       {:ok, %{settlements: [numeric_row], max_seq: 1, next_seq: 1, complete: true}}
     end
 }
@@ -415,7 +486,7 @@ cursor_row = row.(1, "0xCURSOR:0", %{})
 
 cursor_fail_state = %{
   state
-  | settlements_fn: fn 0, 100 ->
+  | settlements_fn: fn 0, 200 ->
       {:ok, %{settlements: [cursor_row], max_seq: 1, next_seq: 1, complete: true}}
     end
 }
@@ -448,7 +519,7 @@ PaymentsPollStore.reset(cursor: 200)
 
 ahead_state = %{
   state
-  | settlements_fn: fn 100, 100 ->
+  | settlements_fn: fn 100, 200 ->
       {:ok, %{settlements: [], max_seq: 150, next_seq: 150, complete: true}}
     end
 }
@@ -474,6 +545,69 @@ check.(
     end)
 )
 
+# A stale hub next_seq is floored at the durable cursor, and the unchanged
+# effective value is not durably rewritten.
+PaymentsPollStore.reset(cursor: 50)
+
+stale_next_state = %{
+  state
+  | settlements_fn: fn 0, 200 ->
+      {:ok, %{settlements: [], max_seq: 60, next_seq: 0, complete: true}}
+    end
+}
+
+stale_next = decode_poll.("cron", stale_next_state)
+stale_next_store = PaymentsPollStore.state()
+
+check.(
+  "stale hub next_seq cannot rewind the durable cursor",
+  stale_next["cursor"] == 50 and stale_next_store.cursor == 50
+)
+
+check.(
+  "unchanged cursor values skip the durable write",
+  stale_next_store.cursor_writes == []
+)
+
+# Exact dense-sequence liveness probe from the review: with cursor/lag/limit
+# 100/100/100, the trailing window consumes 100 rows, so the read must request
+# another 100 rows of progress capacity and credit seqs 101..150 immediately.
+dense_rows = for seq <- 1..150, do: row.(seq, "dense-#{seq}", %{})
+dense_seen = for seq <- 1..100, do: "usdc_base:dense-#{seq}"
+PaymentsPollStore.reset(cursor: 100, keys: dense_seen)
+{:ok, dense_reads} = Agent.start_link(fn -> [] end)
+
+dense_state = %{
+  state
+  | settlements_fn: fn after_seq, limit ->
+      Agent.update(dense_reads, &(&1 ++ [{after_seq, limit}]))
+
+      page =
+        dense_rows
+        |> Enum.filter(&(Map.fetch!(&1, :outbox_seq) > after_seq))
+        |> Enum.take(limit)
+
+      next_seq =
+        case List.last(page) do
+          nil -> after_seq
+          last -> Map.fetch!(last, :outbox_seq)
+        end
+
+      {:ok, %{settlements: page, max_seq: 150, next_seq: next_seq, complete: next_seq == 150}}
+    end
+}
+
+dense = decode_poll.("cron", dense_state)
+dense_store = PaymentsPollStore.state()
+
+check.(
+  "dense 1..150 review probe credits 101..150 in one poll without stalling",
+  Agent.get(dense_reads, & &1) == [{0, 200}] and dense["applied"] == 50 and
+    dense["duplicates"] == 100 and dense["cursor"] == 150 and dense["lag"] == 0 and
+    Enum.map(dense_store.entries, & &1.idempotency_key) ==
+      Enum.map(101..150, &"usdc_base:dense-#{&1}")
+)
+
 # Concurrent overlapping ticks share the existing atomic seen-mark: one
 # credits and the other dedups.
 PaymentsPollStore.reset(cursor: 0)
@@ -481,7 +615,7 @@ concurrent_row = row.(1, "0xRACE:0", %{})
 
 concurrent_state = %{
   state
-  | settlements_fn: fn 0, 100 ->
+  | settlements_fn: fn 0, 200 ->
       {:ok, %{settlements: [concurrent_row], max_seq: 1, next_seq: 1, complete: true}}
     end
 }
