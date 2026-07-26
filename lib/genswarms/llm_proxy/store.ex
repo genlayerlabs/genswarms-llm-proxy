@@ -18,6 +18,23 @@ defmodule Genswarms.LlmProxy.Store do
   @doc "Record the budget identity a session was bound under (origin audit)."
   @callback record_llm_budget_origin(map()) :: :ok | {:error, term()}
 
+  @doc """
+  Read back the origin recorded by `record_llm_budget_origin/1`, or `nil` when
+  this identity was never bound.
+
+  The credit notice needs it. A credit arrives out of band — a deposit
+  confirms minutes after the user asked for it, or after a restart — so by the
+  time there is money to announce there is usually no live session left to
+  answer into. This callback is the durable route: the conversation the
+  identity was last bound to. Without it a credit is silently unannounced,
+  which is the worst failure of the three (the money is in, the user cannot
+  tell).
+
+  The returned map carries at least `:conversation_id`. Optional: hosts that
+  do not implement `record_llm_budget_origin/1` have nothing to read back.
+  """
+  @callback llm_budget_origin(String.t()) :: {:ok, map() | nil} | {:error, term()}
+
   @doc "Spend + request count for one budget identity on `day` (limit passed for context)."
   @callback llm_usage_for_budget(String.t(), Date.t(), Decimal.t()) ::
               {:ok, %{spent: Decimal.t(), requests: non_neg_integer()}} | {:error, term()}
@@ -242,6 +259,7 @@ defmodule Genswarms.LlmProxy.Store do
 
   @optional_callbacks record_llm_call: 5,
                       record_llm_budget_origin: 1,
+                      llm_budget_origin: 1,
                       llm_usage_for_budget: 3,
                       llm_usage_today: 1,
                       llm_usage_by_budget: 2,

@@ -418,6 +418,148 @@ check.(
   slot_replies.() == []
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+# 8. No live session, but the host DOES keep a durable origin for the credited
+#    identity: the notice routes there with `send` (there is no slot to reply
+#    into). This is the normal case for a top-up — the credit lands minutes
+#    after the command, often after a restart, and a command opens no session.
+#    The store above deliberately does NOT export llm_budget_origin/1, which
+#    is why scenario 7 stays silent; this one does.
+# ────────────────────────────────────────────────────────────────────────────
+defmodule OriginStore do
+  # Same credit ledger as CreditNoticeStore, plus the origin read-back.
+  defdelegate reset(), to: CreditNoticeStore
+  defdelegate llm_credit_balance(budget_identity), to: CreditNoticeStore
+  defdelegate record_llm_credit_entry(entry), to: CreditNoticeStore
+  defdelegate bump_metric(event, meta, value), to: CreditNoticeStore
+
+  def route_to(cid), do: :persistent_term.put({__MODULE__, :route}, cid)
+
+  def llm_budget_origin(_budget_identity) do
+    case :persistent_term.get({__MODULE__, :route}, :none) do
+      :none -> {:ok, nil}
+      :error -> {:error, :store_unavailable}
+      cid -> {:ok, %{conversation_id: cid, kind: "dm", workspace_key: "default"}}
+    end
+  end
+end
+
+sends = fn ->
+  Agent.get(captured, fn msgs ->
+    msgs
+    |> Enum.filter(fn {to, msg} -> to == :sender and msg["action"] == "send" end)
+    |> Enum.map(fn {_to, msg} -> msg end)
+    |> Enum.reverse()
+  end)
+end
+
+origin_state = %{base_state | quota: %{store_mod: OriginStore}, store_mod: OriginStore}
+
+origin_cid = "tg:origin-only:0"
+
+origin_beneficiary =
+  Proxy.budget_identity(%{
+    conversation_id: origin_cid,
+    kind: kind,
+    workspace_key: workspace_key
+  })
+
+origin_msg = fn ref ->
+  Jason.encode!(%{
+    action: "payment_confirmed",
+    beneficiary: origin_beneficiary,
+    amount_usd: "2.50",
+    method: "usdc_authorization",
+    ref: ref,
+    namespace: "llm_quota"
+  })
+end
+
+CreditNoticeStore.reset()
+reset_captured.()
+OriginStore.route_to(origin_cid)
+
+{:reply, origin_json, _} = Proxy.handle_message("payments", origin_msg.("0xORIGIN:0"), origin_state)
+
+check.(
+  "a credit with no session but a durable origin still applies",
+  Jason.decode!(origin_json)["ok"] == true
+)
+
+origin_sends = sends.()
+# `|| %{}` so a regression that sends nothing REPORTS the remaining checks
+# instead of aborting the file on hd([]) and hiding scenarios 9 and 10.
+first_origin_send = List.first(origin_sends) || %{}
+
+check.(
+  "…and sends exactly one notice, addressed to the recorded conversation",
+  length(origin_sends) == 1 and first_origin_send["conversation_id"] == origin_cid
+)
+
+check.(
+  "…carrying the credited amount and the post-credit balance",
+  String.contains?(first_origin_send["content"] || "", "$2.50 credited") and
+    String.contains?(first_origin_send["content"] || "", "Prepaid balance: $2.50")
+)
+
+check.(
+  "…and never as a slot_reply (there is no slot to reply into)",
+  slot_replies.() == []
+)
+
+# The one-notice-per-payment guarantee must hold on this route too.
+reset_captured.()
+
+{:reply, origin_dup_json, _} =
+  Proxy.handle_message("payments", origin_msg.("0xORIGIN:0"), origin_state)
+
+check.(
+  "a re-delivered payment on the origin route is a duplicate",
+  Jason.decode!(origin_dup_json)["ok"] == true and sends.() == []
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# 9. A live session WINS over the durable origin: the notice stays in the
+#    thread the user is actually in, and is never sent twice.
+# ────────────────────────────────────────────────────────────────────────────
+CreditNoticeStore.reset()
+reset_captured.()
+OriginStore.route_to("tg:should-not-be-used:0")
+
+{:reply, _both_json, _} = Proxy.handle_message("payments", push_msg.("0xBOTH:0", "1.00"), origin_state)
+
+check.(
+  "with a live session the notice is a slot_reply on that session's slot",
+  length(slot_replies.()) == 1 and hd(slot_replies.())["slot"] == "slot-1"
+)
+
+check.(
+  "…and the durable origin route is NOT also used (no double notice)",
+  sends.() == []
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# 10. The origin read-back is best effort, exactly like every other seam here:
+#     an unavailable store degrades to silence, never to a crash, and the
+#     credit stands.
+# ────────────────────────────────────────────────────────────────────────────
+CreditNoticeStore.reset()
+reset_captured.()
+OriginStore.route_to(:error)
+
+{:reply, broken_json, _} =
+  Proxy.handle_message("payments", origin_msg.("0xORIGINFAIL:0"), origin_state)
+
+check.(
+  "an unavailable origin lookup still credits",
+  Jason.decode!(broken_json)["ok"] == true
+)
+
+check.(
+  "…and sends no notice rather than crashing",
+  sends.() == [] and slot_replies.() == []
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

@@ -1340,12 +1340,31 @@ defmodule Genswarms.LlmProxy do
   # swallowed with a counter bump on the last one, never a crash and never a
   # second attempt (the ledger entry is already the single source of truth
   # for "credited"; this is only the user-visible echo of it).
+  # Two routes, tried in this order, because they answer in different places:
+  #
+  #   1. A live notifiable session — the notice lands in the conversation
+  #      thread the user is already in, exactly like a block notice.
+  #   2. The DURABLE origin recorded when that identity was last bound.
+  #
+  # Route 2 is not a fallback for a rare case: it is the NORMAL case. A credit
+  # lands when the chain confirms, which is minutes after the user asked to
+  # top up and often after a restart, and a top-up is a command — it opens no
+  # LLM session at all. A first live run of the payments lane credited the
+  # user and announced nothing, because route 1 was the only route. Whichever
+  # route answers, the money was already credited before we got here.
   defp send_credit_notice(state, budget_identity, credited, balance) do
     if credit_notice_enabled?(state) do
-      state
-      |> Map.get(:state_pid, @state_name)
-      |> notifiable_session_for_budget(budget_identity)
-      |> deliver_credit_notice(state, credited, balance)
+      case state
+           |> Map.get(:state_pid, @state_name)
+           |> notifiable_session_for_budget(budget_identity) do
+        nil ->
+          state
+          |> budget_origin_conversation(budget_identity)
+          |> deliver_credit_notice_to_conversation(state, budget_identity, credited, balance)
+
+        session ->
+          deliver_credit_notice(session, state, credited, balance)
+      end
     end
 
     :ok
@@ -1353,6 +1372,32 @@ defmodule Genswarms.LlmProxy do
     _ -> :ok
   catch
     _, _ -> :ok
+  end
+
+  # The conversation this budget identity was last bound to, or nil when the
+  # host keeps no origin record (the callback is optional) or never bound it.
+  defp budget_origin_conversation(state, budget_identity) do
+    store_mod = resolve_store_mod(state)
+
+    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
+         function_exported?(store_mod, :llm_budget_origin, 1) do
+      case store_mod.llm_budget_origin(budget_identity) do
+        {:ok, origin} when is_map(origin) ->
+          case Map.get(origin, :conversation_id) || Map.get(origin, "conversation_id") do
+            cid when is_binary(cid) and cid != "" -> cid
+            _ -> nil
+          end
+
+        _ ->
+          nil
+      end
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
   end
 
   defp credit_notice_enabled?(state), do: Map.get(state, :credit_notice_enabled, true) != false
@@ -1404,6 +1449,45 @@ defmodule Genswarms.LlmProxy do
     kind, reason ->
       Logger.warning("llm_proxy: credit notice delivery #{kind}: #{inspect(reason)}")
       bump_credit_notice_failed_metric(state, session.budget_identity)
+  end
+
+  defp deliver_credit_notice_to_conversation(nil, _state, _budget_identity, _credited, _balance),
+    do: :ok
+
+  defp deliver_credit_notice_to_conversation(
+         conversation_id,
+         state,
+         budget_identity,
+         credited,
+         balance
+       ) do
+    swarm_name = Map.get(state, :swarm_name, "swarm")
+    sender = Map.get(state, :sender, :sender)
+    deliver_fn = Map.get(state, :deliver_fn)
+
+    if is_binary(swarm_name) and not is_nil(sender) and is_function(deliver_fn, 4) do
+      # "send" rather than "slot_reply": there is no slot to reply into. The
+      # target is never invented here — it is read back from the origin the
+      # proxy itself recorded when a session bound this identity.
+      msg =
+        Jason.encode!(%{
+          action: "send",
+          conversation_id: conversation_id,
+          content: credit_notice_text(credited, balance)
+        })
+
+      deliver_fn.(swarm_name, sender, :llm_proxy, msg)
+    end
+
+    :ok
+  rescue
+    e ->
+      Logger.warning("llm_proxy: credit notice delivery raised: #{Exception.message(e)}")
+      bump_credit_notice_failed_metric(state, budget_identity)
+  catch
+    kind, reason ->
+      Logger.warning("llm_proxy: credit notice delivery #{kind}: #{inspect(reason)}")
+      bump_credit_notice_failed_metric(state, budget_identity)
   end
 
   defp bump_credit_notice_failed_metric(state, budget_identity) do
