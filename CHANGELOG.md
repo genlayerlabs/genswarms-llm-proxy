@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+- A GENUINELY NEW prepaid credit now produces a user-facing "payment
+  received" notice, closing the gap where a confirmed top-up was invisible
+  until the user ran `/quota`. It rides the exact same delivery seam the
+  budget-block notice already uses (`deliver_fn` -> the configured `:sender`
+  via a `slot_reply` to the credited conversation's bound slot), fires from
+  exactly one choke point (`apply_validated_payment/3`'s `{:ok, balance}`
+  branch — reachable ONLY from the already trust-gated `payment_confirmed`
+  push handler, the `poll_payments` consumer, and the operator `retry_stuck`
+  action), and inherits `apply_credit_entry/3`'s own idempotency: a
+  re-delivered push or a re-polled settlement resolves as a duplicate and
+  never reaches the notice at all — one notice per payment, proven in
+  `checks/llm_proxy_payments_credit_notice_test.exs`. Best-effort and
+  money-first: the credit is applied and durable BEFORE the notice is even
+  attempted, a delivery failure (raise/exit, or simply no session yet bound
+  to that budget identity) is swallowed and bumps a durable
+  `llm_payments_credit_notice_failed` counter, and nothing here can revert or
+  delay the credit. New optional config `credit_notice_enabled` (default
+  `true`) lets a host turn the notice off while keeping credits on; absent
+  `sender`/`deliver_fn` degrades to a silent no-op, same as the block path.
+  Message: `"💳 Payment received — $<credited> credited. Prepaid balance:
+  $<balance>."` (the balance AFTER this credit).
+
 ## 0.4.0 — 2026-07-25
 
 - The STUCK queue is no longer a one-way door. A settled row this proxy

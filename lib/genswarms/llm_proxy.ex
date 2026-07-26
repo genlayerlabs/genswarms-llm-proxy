@@ -432,7 +432,27 @@ defmodule Genswarms.LlmProxy do
        # (B2) Same derivation as plug_opts.credits_enabled above — kept
        # alongside payments_source on the object-side state too, one
        # resolution point for "are credits on" regardless of which side asks.
-       credits_enabled: credits_enabled?(config)
+       credits_enabled: credits_enabled?(config),
+       # Credit-notice delivery seam (0.4.0): the SAME swarm_name/sender/
+       # deliver_fn triple the Plug reads into plug_opts (see `call/2` below),
+       # read here too so the object side — which is what actually applies a
+       # payment_confirmed/poll/retry_stuck credit — can push a "payment
+       # received" notice through the exact seam the block notice already
+       # uses (`slot_reply` -> `sender`), with no separate wiring for a host.
+       # `credit_notice_enabled` (default true) is the one operator toggle;
+       # `sender` absent/unreachable degrades to no notice either way, same
+       # as the block path degrades (see send_credit_notice/4).
+       swarm_name: Map.get(config, :swarm_name, "swarm"),
+       sender: Map.get(config, :sender, :sender),
+       # Function.capture/3 (not a `&M.f/4` literal) so this default resolves
+       # at RUNTIME — genswarms is a peer/runtime dependency this package
+       # never compiles against (see mix.exs), and a compile-time capture
+       # would add a second instance of the pre-existing "module not
+       # available" warning the Plug's own default already carries.
+       deliver_fn:
+         Map.get(config, :deliver_fn) ||
+           Function.capture(Genswarms.Objects.ObjectServer, :deliver_message, 4),
+       credit_notice_enabled: Map.get(config, :credit_notice_enabled, true) != false
      }}
   end
 
@@ -1285,6 +1305,12 @@ defmodule Genswarms.LlmProxy do
 
         {:ok, balance} ->
           clear_held_payment(state, key, ref, beneficiary)
+          # (0.4.0) A GENUINELY NEW credit — apply_credit_entry/3 only reaches
+          # this branch once per idempotency key; a re-delivered/re-polled
+          # settlement resolves :duplicate above and never reaches here. Best
+          # effort, money-first: the credit above already stands regardless
+          # of what happens next.
+          send_credit_notice(state, beneficiary, credited, balance)
           {:applied, credited, balance, key}
 
         {:error, :store_unavailable} ->
@@ -1293,6 +1319,104 @@ defmodule Genswarms.LlmProxy do
     else
       _ -> {:permanent, "bad_payment_confirmed", payment_key(msg)}
     end
+  end
+
+  # ── payment-received notice (0.4.0) ────────────────────────────────────────
+  #
+  # Mirrors the block notice's delivery seam (deliver_fn -> :sender via
+  # `slot_reply`) but fires on the OPPOSITE event: a credit was just applied,
+  # not blocked. Called from exactly one place — `apply_validated_payment/3`'s
+  # `{:ok, balance}` branch — which is itself reachable ONLY from the already
+  # trust-gated `handle_payment_confirmed/3` (payments_source), the
+  # `poll_payments` consumer (poll_sources), and the operator `retry_stuck`
+  # action (operator_sources). There is no route from an ordinary agent
+  # request into this function, so an untrusted sender can never paint a
+  # "payment received" message onto any conversation.
+  #
+  # Best-effort, money-first: this runs strictly AFTER the credit is durably
+  # applied (apply_credit_entry/3 already returned `{:ok, _}`), and nothing
+  # here can revert it. Every failure mode — the toggle is off, no session is
+  # bound to this budget identity yet, or delivery itself raises/exits — is
+  # swallowed with a counter bump on the last one, never a crash and never a
+  # second attempt (the ledger entry is already the single source of truth
+  # for "credited"; this is only the user-visible echo of it).
+  defp send_credit_notice(state, budget_identity, credited, balance) do
+    if credit_notice_enabled?(state) do
+      state
+      |> Map.get(:state_pid, @state_name)
+      |> notifiable_session_for_budget(budget_identity)
+      |> deliver_credit_notice(state, credited, balance)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp credit_notice_enabled?(state), do: Map.get(state, :credit_notice_enabled, true) != false
+
+  # The FIRST session bound to this budget identity that is not itself a
+  # background (notify: false) slot — a background summarizer sharing the
+  # conversation's budget identity must never become the notice's target any
+  # more than it becomes a block notice's target (see `session_notify?/1`).
+  # `nil` (no session ever bound for this identity — e.g. a deposit made
+  # before the user's first request) means there is no route and the notice
+  # is silently skipped, same stance as every other best-effort seam here.
+  defp notifiable_session_for_budget(pid, budget_identity) do
+    Agent.get(pid, fn mirror ->
+      mirror
+      |> Map.get(:sessions, %{})
+      |> Map.values()
+      |> Enum.find(fn session ->
+        session.budget_identity == budget_identity and Map.get(session, :notify, true) != false
+      end)
+    end)
+  rescue
+    _ -> nil
+  end
+
+  defp deliver_credit_notice(nil, _state, _credited, _balance), do: :ok
+
+  defp deliver_credit_notice(session, state, credited, balance) do
+    swarm_name = Map.get(state, :swarm_name, "swarm")
+    sender = Map.get(state, :sender, :sender)
+    deliver_fn = Map.get(state, :deliver_fn)
+
+    if is_binary(swarm_name) and not is_nil(sender) and is_function(deliver_fn, 4) do
+      msg =
+        Jason.encode!(%{
+          action: "slot_reply",
+          slot: session.slot,
+          content: credit_notice_text(credited, balance)
+        })
+
+      deliver_fn.(swarm_name, sender, :llm_proxy, msg)
+    end
+
+    :ok
+  rescue
+    e ->
+      Logger.warning("llm_proxy: credit notice delivery raised: #{Exception.message(e)}")
+      bump_credit_notice_failed_metric(state, session.budget_identity)
+  catch
+    kind, reason ->
+      Logger.warning("llm_proxy: credit notice delivery #{kind}: #{inspect(reason)}")
+      bump_credit_notice_failed_metric(state, session.budget_identity)
+  end
+
+  defp bump_credit_notice_failed_metric(state, budget_identity) do
+    bump_store_metric(
+      resolve_store_mod(state),
+      "llm_payments_credit_notice_failed",
+      %{budget_identity: budget_identity},
+      1
+    )
+  end
+
+  defp credit_notice_text(credited, balance) do
+    "💳 Payment received — $#{money2(credited)} credited. Prepaid balance: $#{money2(balance)}."
   end
 
   defp payment_namespace_match?(msg, state) do

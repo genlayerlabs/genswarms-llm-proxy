@@ -157,6 +157,31 @@ config:
   path that cannot credit them — the fun is not even called. It is likewise
   **suppressed while that identity has an unresolved hold** — see
   [Held payments](#held-payments-hub-quarantine).
+- `credit_notice_enabled` (default `true`) — toggle for the "payment
+  received" notice (below); `sender`/`deliver_fn` are reused, not separately
+  configured.
+
+**Payment-received notice.** Once a payment_confirmed/poll/retry_stuck credit
+is GENUINELY NEW — `apply_credit_entry/3` only reaches its `{:ok, balance}`
+branch once per `"<method>:<ref>"` key; a re-delivered push or a re-polled
+settlement resolves `:duplicate` and never gets here — the proxy sends one
+user-facing notice to the credited conversation, over the exact seam the
+block notice already uses (`deliver_fn.(swarm_name, sender, :llm_proxy,
+%{"action" => "slot_reply", "slot" => ..., "content" => ...})`, resolved to
+the conversation via the first non-background (`notify: true`) session bound
+to that budget identity). Text: `"💳 Payment received — $<credited> credited.
+Prepaid balance: $<balance>."` (the balance is the mirror balance AFTER this
+credit). This is called from the SAME choke point that applies the credit
+and nowhere else, so an ordinary agent request can never trigger it —
+trust is inherited from `handle_payment_confirmed/3`'s `payments_source`
+gate, `poll_payments`'s `poll_sources` gate, and `retry_stuck`'s
+`operator_sources` gate, never re-derived. Best-effort, money-first: this
+runs strictly AFTER the credit is durable, and every failure mode —
+`credit_notice_enabled: false`, no session yet bound to the identity (a
+deposit made before the user's first request), or the delivery itself
+raising/exiting — is swallowed (bumping `llm_payments_credit_notice_failed`
+on the last one) and never crashes the poll/push/retry path or reverts the
+credit.
 
 **Credits imply pricing (boot gate).** With `payments_source` configured, the
 operator rate card must be able to VALUE a call: `prices` must be a complete,

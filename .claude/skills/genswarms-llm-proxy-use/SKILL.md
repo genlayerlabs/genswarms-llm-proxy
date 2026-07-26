@@ -49,12 +49,24 @@ credit balance instead of blocking — 4 config keys, all optional:
 - `credit_per_usd` (default `"1.0"`) — `amount_usd` → credited balance rate.
 - `topup_hint_fun` — plug opt, 1-arity fun (`budget_identity -> hint |
   nil`) appended as an extra line on a budget block notice.
+- `credit_notice_enabled` (default `true`) — toggle for the "payment
+  received" notice below. Set `false` to keep crediting silently.
 
 The payments object (whatever settles usdc/fiat/whatever — this package is
 payment-agnostic) must be allowlisted as the trusted sender in your swarm
 topology, same as any other cross-object message. See README's "Prepaid
 credit ledger" section for the spend order, idempotency, and fail-policy
 details.
+
+**Payment-received notice.** Every GENUINELY NEW credit (push, poll, or
+operator `retry_stuck`) sends one user-facing notice — `"💳 Payment received
+— $<credited> credited. Prepaid balance: $<balance>."` — to the credited
+conversation, over the SAME `deliver_fn`/`:sender`/`slot_reply` seam the block
+notice uses. A re-delivered or re-polled settlement never sends a second one
+(it rides `apply_credit_entry/3`'s own idempotency). Best-effort: the credit
+is already durable before the notice is even attempted, so a delivery
+failure or a not-yet-bound session degrades to a silent no-op (bumping
+`llm_payments_credit_notice_failed`) and never touches the credit itself.
 
 ## Durable accounting
 
