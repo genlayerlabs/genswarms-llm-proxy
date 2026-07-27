@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.4.0 — 2026-07-27
 
 - A GENUINELY NEW prepaid credit now produces a user-facing "payment
   received" notice, closing the gap where a confirmed top-up was invisible
@@ -24,7 +24,13 @@
   Message: `"💳 Payment received — $<credited> credited. Prepaid balance:
   $<balance>."` (the balance AFTER this credit).
 
-## 0.4.0 — 2026-07-25
+- Operator `retry_stuck` credits SILENTLY (product decision 2026-07-27):
+  the re-applied credit lands without a user-facing notice — the payment
+  may be hours old and a surprise "payment received" reads as a new charge.
+  Normal push/poll credits keep the notice.
+
+- The proxy's dashboard page declares its own sidebar section (`group:
+  "LLM"`) — producer-declared grouping, host stamps nothing.
 
 - The STUCK queue is no longer a one-way door. A settled row this proxy
   classifies `{:permanent, _}` is recorded as stuck and the poll cursor advances
