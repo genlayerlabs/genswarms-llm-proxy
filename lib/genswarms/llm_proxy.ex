@@ -452,7 +452,19 @@ defmodule Genswarms.LlmProxy do
        deliver_fn:
          Map.get(config, :deliver_fn) ||
            Function.capture(Genswarms.Objects.ObjectServer, :deliver_message, 4),
-       credit_notice_enabled: Map.get(config, :credit_notice_enabled, true) != false
+       credit_notice_enabled: Map.get(config, :credit_notice_enabled, true) != false,
+       # OPTIONAL: a host that wants to present the credit ITSELF passes a
+       # 1-arity function here and this package composes no user-facing text
+       # and delivers nothing. Absent (the default) keeps the built-in notice
+       # exactly as before, so no consumer has to do anything.
+       #
+       # Presentation is a consumer concern. This package hardcodes one
+       # English sentence with an emoji, which is fine as a default and wrong
+       # as the only option: a host that shows a top-up as a card the user
+       # watches progress needs the credit to be the card's LAST STATE, not a
+       # separate message under it — and it is the host, not this package,
+       # that knows the card exists.
+       credit_notice_fn: credit_notice_fn(config)
      }}
   end
 
@@ -1310,7 +1322,7 @@ defmodule Genswarms.LlmProxy do
           # settlement resolves :duplicate above and never reaches here. Best
           # effort, money-first: the credit above already stands regardless
           # of what happens next.
-          send_credit_notice(state, beneficiary, credited, balance)
+          send_credit_notice(state, beneficiary, credited, balance, %{method: method, ref: ref, idempotency_key: key})
           {:applied, credited, balance, key}
 
         {:error, :store_unavailable} ->
@@ -1352,18 +1364,24 @@ defmodule Genswarms.LlmProxy do
   # LLM session at all. A first live run of the payments lane credited the
   # user and announced nothing, because route 1 was the only route. Whichever
   # route answers, the money was already credited before we got here.
-  defp send_credit_notice(state, budget_identity, credited, balance) do
+  defp send_credit_notice(state, budget_identity, credited, balance, payment) do
     if credit_notice_enabled?(state) do
-      case state
-           |> Map.get(:state_pid, @state_name)
-           |> notifiable_session_for_budget(budget_identity) do
-        nil ->
-          state
-          |> budget_origin_conversation(budget_identity)
-          |> deliver_credit_notice_to_conversation(state, budget_identity, credited, balance)
+      case Map.get(state, :credit_notice_fn) do
+        fun when is_function(fun, 1) ->
+          # The payment's own identifiers travel with it: a host presenting
+          # this credit as the last state of something it started (an order,
+          # a card, an invoice) needs to know WHICH payment landed, and
+          # nothing else here can tell it.
+          fun.(
+            Map.merge(payment, %{
+              budget_identity: budget_identity,
+              credited: credited,
+              balance: balance
+            })
+          )
 
-        session ->
-          deliver_credit_notice(session, state, credited, balance)
+        _ ->
+          route_credit_notice(state, budget_identity, credited, balance)
       end
     end
 
@@ -1372,6 +1390,20 @@ defmodule Genswarms.LlmProxy do
     _ -> :ok
   catch
     _, _ -> :ok
+  end
+
+  defp route_credit_notice(state, budget_identity, credited, balance) do
+    case state
+         |> Map.get(:state_pid, @state_name)
+         |> notifiable_session_for_budget(budget_identity) do
+      nil ->
+        state
+        |> budget_origin_conversation(budget_identity)
+        |> deliver_credit_notice_to_conversation(state, budget_identity, credited, balance)
+
+      session ->
+        deliver_credit_notice(session, state, credited, balance)
+    end
   end
 
   # The conversation this budget identity was last bound to, or nil when the
@@ -1401,6 +1433,13 @@ defmodule Genswarms.LlmProxy do
   end
 
   defp credit_notice_enabled?(state), do: Map.get(state, :credit_notice_enabled, true) != false
+
+  defp credit_notice_fn(config) do
+    case Map.get(config, :credit_notice_fn) do
+      fun when is_function(fun, 1) -> fun
+      _ -> nil
+    end
+  end
 
   # The FIRST session bound to this budget identity that is not itself a
   # background (notify: false) slot — a background summarizer sharing the

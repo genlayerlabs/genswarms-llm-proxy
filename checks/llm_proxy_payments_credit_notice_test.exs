@@ -560,6 +560,100 @@ check.(
   sends.() == [] and slot_replies.() == []
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+# 11. A host that supplies credit_notice_fn OWNS the presentation: this
+#     package composes no text and delivers nothing. Presentation is a
+#     consumer concern — a host showing a top-up as a card the user watches
+#     progress needs the credit to be that card's LAST STATE, not a separate
+#     message under it, and only the host knows the card exists.
+# ────────────────────────────────────────────────────────────────────────────
+{:ok, host_calls} = Agent.start_link(fn -> [] end)
+
+# Map.put, not %{… | …}: base_state is the hand-built state these checks use,
+# and a host that does NOT pass credit_notice_fn must keep working — which is
+# exactly what every scenario above proves.
+host_state =
+  Map.put(base_state, :credit_notice_fn, fn payload ->
+    Agent.update(host_calls, &[payload | &1])
+  end)
+
+CreditNoticeStore.reset()
+reset_captured.()
+
+{:reply, host_json, _} = Proxy.handle_message("payments", push_msg.("0xHOST:0", "3.25"), host_state)
+
+check.(
+  "a credit still applies with a host presenter",
+  Jason.decode!(host_json)["ok"] == true
+)
+
+case Agent.get(host_calls, &Enum.reverse/1) do
+  [payload] ->
+    check.("the host presenter is called exactly once", true)
+
+    # The balance is compared against the handler's OWN answer rather than a
+    # literal: that is the invariant that matters (the presenter is told
+    # exactly what the credit reported) and it does not silently encode how
+    # much this shared ledger happens to hold by this point in the file.
+    check.(
+      "…with the credited identity, the amount, and the balance AFTER the credit",
+      payload.budget_identity == beneficiary and
+        Decimal.equal?(payload.credited, Decimal.new("3.25")) and
+        Decimal.equal?(payload.balance, Decimal.new(Jason.decode!(host_json)["balance_usd"]))
+    )
+
+  other ->
+    check.("the host presenter is called exactly once (got #{length(other)})", false)
+end
+
+
+case Agent.get(host_calls, &Enum.reverse/1) do
+  [payload] ->
+    check.(
+      "…and with the payment's OWN identifiers, so the host knows WHICH payment landed",
+      payload.method == "usdc_base" and payload.ref == "0xHOST:0" and
+        payload.idempotency_key == "usdc_base:0xHOST:0"
+    )
+
+  _ ->
+    check.("…and with the payment's OWN identifiers", false)
+end
+
+check.(
+  "…and this package composes and delivers NOTHING of its own",
+  slot_replies.() == [] and Agent.get(captured, & &1) == []
+)
+
+# The host presenter inherits every guarantee the built-in notice has.
+reset_captured.()
+Agent.update(host_calls, fn _ -> [] end)
+
+{:reply, _dup, _} = Proxy.handle_message("payments", push_msg.("0xHOST:0", "3.25"), host_state)
+
+check.(
+  "a re-delivered payment does not call the host presenter again",
+  Agent.get(host_calls, & &1) == []
+)
+
+Agent.update(host_calls, fn _ -> [] end)
+CreditNoticeStore.reset()
+
+raising_state =
+  Map.put(base_state, :credit_notice_fn, fn _payload -> raise "host presenter down" end)
+
+{:reply, raised_json, _} =
+  Proxy.handle_message("payments", push_msg.("0xHOSTRAISE:0", "1.00"), raising_state)
+
+check.(
+  "a host presenter that raises does not affect the credit",
+  Jason.decode!(raised_json)["ok"] == true
+)
+
+check.(
+  "…and does not fall back to the built-in notice (the host OWNS presentation)",
+  slot_replies.() == []
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 
