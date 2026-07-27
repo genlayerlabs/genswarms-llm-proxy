@@ -654,6 +654,69 @@ check.(
   slot_replies.() == []
 )
 
+# ────────────────────────────────────────────────────────────────────────────
+# N. An operator retry_stuck credits SILENTLY (Albert, 2026-07-27): the
+#    operator is fixing plumbing — the user was notified (or held) when the
+#    payment actually happened, and a surprise "payment received" minutes or
+#    days later reads as a second charge. The credit itself is unchanged.
+# ────────────────────────────────────────────────────────────────────────────
+defmodule RetryStuckStore do
+  # Same persistent_term state as CreditNoticeStore, plus the ONE callback
+  # the retry path needs: the stuck row whose :row payload re-enters
+  # apply_payment exactly like a poll row would.
+  defdelegate llm_credit_balance(bi), to: CreditNoticeStore
+  defdelegate record_llm_credit_entry(e), to: CreditNoticeStore
+  defdelegate bump_metric(ev, meta, v), to: CreditNoticeStore
+
+  def list_llm_stuck_payments("usdc_base:0xSTUCK:0") do
+    {:ok,
+     [
+       %{
+         idempotency_key: "usdc_base:0xSTUCK:0",
+         row: %{
+           beneficiary: :persistent_term.get({__MODULE__, :beneficiary}),
+           amount_usd: Decimal.new("1.00"),
+           method: "usdc_base",
+           ref: "0xSTUCK:0",
+           namespace: "llm_quota"
+         }
+       }
+     ]}
+  end
+
+  def list_llm_stuck_payments(_), do: {:ok, []}
+end
+
+:persistent_term.put({RetryStuckStore, :beneficiary}, beneficiary)
+
+reset_captured.()
+
+retry_state =
+  Map.merge(base_state, %{
+    store_mod: RetryStuckStore,
+    quota: %{store_mod: RetryStuckStore},
+    operator_sources: ["admin"]
+  })
+
+{:reply, retry_json, _} =
+  Proxy.handle_message(
+    "admin",
+    Jason.encode!(%{"action" => "retry_stuck", "idempotency_key" => "usdc_base:0xSTUCK:0"}),
+    retry_state
+  )
+
+retry_body = Jason.decode!(retry_json)
+
+check.(
+  "operator retry applies the credit (money path unchanged)",
+  retry_body["ok"] == true and retry_body["duplicate"] == false
+)
+
+check.(
+  "…but sends NO user notice — an operator retry is silent",
+  slot_replies.() == []
+)
+
 failed = Agent.get(failures, & &1)
 IO.puts("")
 

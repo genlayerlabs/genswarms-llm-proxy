@@ -1322,7 +1322,19 @@ defmodule Genswarms.LlmProxy do
           # settlement resolves :duplicate above and never reaches here. Best
           # effort, money-first: the credit above already stands regardless
           # of what happens next.
-          send_credit_notice(state, beneficiary, credited, balance, %{method: method, ref: ref, idempotency_key: key})
+          #
+          # An operator "retry" credits SILENTLY (product decision,
+          # 2026-07-27): the operator is fixing plumbing, and a surprise
+          # "payment received" minutes or days after the payment reads as a
+          # second charge. Push and poll — the two organic routes — notify.
+          if source != "retry" do
+            send_credit_notice(state, beneficiary, credited, balance, %{
+              method: method,
+              ref: ref,
+              idempotency_key: key
+            })
+          end
+
           {:applied, credited, balance, key}
 
         {:error, :store_unavailable} ->
