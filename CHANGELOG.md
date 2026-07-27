@@ -1,5 +1,173 @@
 # Changelog
 
+## 0.4.0 — 2026-07-27
+
+- A GENUINELY NEW prepaid credit now produces a user-facing "payment
+  received" notice, closing the gap where a confirmed top-up was invisible
+  until the user ran `/quota`. It rides the exact same delivery seam the
+  budget-block notice already uses (`deliver_fn` -> the configured `:sender`
+  via a `slot_reply` to the credited conversation's bound slot), fires from
+  exactly one choke point (`apply_validated_payment/3`'s `{:ok, balance}`
+  branch — reachable ONLY from the already trust-gated `payment_confirmed`
+  push handler, the `poll_payments` consumer, and the operator `retry_stuck`
+  action), and inherits `apply_credit_entry/3`'s own idempotency: a
+  re-delivered push or a re-polled settlement resolves as a duplicate and
+  never reaches the notice at all — one notice per payment, proven in
+  `checks/llm_proxy_payments_credit_notice_test.exs`. Best-effort and
+  money-first: the credit is applied and durable BEFORE the notice is even
+  attempted, a delivery failure (raise/exit, or simply no session yet bound
+  to that budget identity) is swallowed and bumps a durable
+  `llm_payments_credit_notice_failed` counter, and nothing here can revert or
+  delay the credit. New optional config `credit_notice_enabled` (default
+  `true`) lets a host turn the notice off while keeping credits on; absent
+  `sender`/`deliver_fn` degrades to a silent no-op, same as the block path.
+  Message: `"💳 Payment received — $<credited> credited. Prepaid balance:
+  $<balance>."` (the balance AFTER this credit).
+
+- Operator `retry_stuck` credits SILENTLY (product decision 2026-07-27):
+  the re-applied credit lands without a user-facing notice — the payment
+  may be hours old and a surprise "payment received" reads as a new charge.
+  Normal push/poll credits keep the notice.
+
+- The proxy's dashboard page declares its own sidebar section (`group:
+  "LLM"`) — producer-declared grouping, host stamps nothing.
+
+- The STUCK queue is no longer a one-way door. A settled row this proxy
+  classifies `{:permanent, _}` is recorded as stuck and the poll cursor advances
+  past it, after which the money was unreachable by every path at once: below
+  the cursor for the poll, `already_settled` for the hub's release, unreadable,
+  and unrendered. Added two optional store callbacks —
+  `list_llm_stuck_payments/1` (unresolved rows, or one key; excluding cleared
+  rows and rows whose money is already in the credit ledger under EITHER key
+  domain — the row's own upstream `idempotency_key` or the `method:ref` join
+  derived from the stored row, which is the key a credit entry actually carries;
+  bounded server-side) and
+  `clear_llm_stuck_payment/1` — and two actions behind a NEW `operator_sources`
+  allowlist that defaults to `[]` and is gated exactly like `poll_payments`
+  (exact source match, explicit refusal, never a silent drop):
+  `stuck_payments` (see it) and `retry_stuck` (re-apply ONE row through
+  `apply_payment/3` — the same validating path the push and the poll use).
+  The retry mints nothing and bypasses nothing: a row stuck by a since-fixed
+  cause credits exactly once (the ledger's global key dedupe is what guarantees
+  the "once"), a row that is genuinely invalid fails again with its reason
+  recorded (`llm_payments_stuck_retry_failed`) and STAYS in the queue, and a
+  credit whose durable clear fails is reported `cleared: false` rather than as a
+  tidy success. `operator_sources` is deliberately a second list, not a reuse of
+  `poll_sources`: driving the credit poll and reaching into the money the poll
+  refused are different authorities. `stuck_payments` reports PAYMENTS, not
+  rows: the durable queue has no key uniqueness by design (a repeat is operator
+  evidence), so repeats of one key are collapsed before `count`, `total_usd`
+  and `rows` — otherwise a single stuck settlement inflates the money total
+  once per poll tick it spends inside the trailing window.
+- `notice_variant/3` now reads holds DURABLE-FIRST, like the sentence it gates.
+  Reading the mirror there while the sentence read the store meant the two
+  disagreed on any instance that did not record the hold: the notice was built
+  correctly but the dedup key was the plain 3-tuple, so an identity already
+  notified that day was told nothing at all — while the agent was told the user
+  had already been notified — for a whole `notice_repeat_ms` window.
+- The durable hold read is now bounded on both sides. The contract states that
+  the store MUST cap it server-side (it sits on a per-request path over a table
+  a third party can grow, since deposit addresses are permissionless and a
+  saturated issuance window quarantines everything), and the proxy truncates at
+  50 rows with a warning rather than trusting that.
+
+- The hold notice now SURVIVES A RESTART. Added two optional store callbacks —
+  `list_llm_held_payments/1` (unresolved holds for one budget identity,
+  excluding cleared rows and rows already present in the credit ledger) and
+  `clear_llm_held_payment/3` (mark resolved; scoped to the credited identity,
+  matching key **or** bare ref) — plus `held_payments/3` and
+  `held_notice_line/3`, the durable-first arities the block notice and
+  `quota_status` now use. Before this, the only consumer-side record of a hold
+  was the bounded in-process mirror, so one deploy left a user blocked, already
+  paid, being told to pay again, with `quota_status` asserting there was no
+  hold. A durable answer is authoritative even when empty; a missing callback
+  keeps the previous memory-only behaviour byte-for-byte, and a failing read
+  falls back to the mirror. The durable clear runs on every credit that
+  resolves a hold, not only when this instance's mirror matched, so a released
+  payment cannot resurrect its notice on the next restart
+  (`llm_payments_held_clear_failed` covers the failure).
+
+- Added the `payment_held` action: the consumer side of the settlement hub's
+  issuance caps. It **never credits** — behind the same trust gate a forged
+  `payment_confirmed` faces, it records the hold in a 200-entry FIFO mirror
+  (evictions logged), calls the new optional `record_llm_held_payment/1` store
+  callback (failure logged, metered, never fatal), and emits
+  `llm_payments_held` / `llm_payments_held_refused` /
+  `llm_payments_held_cleared`. The hub sends `method`, `namespace` and `at`
+  (genswarms-payments ≥ `01ab1dd`); all three stay optional so redeliveries
+  from an older hub still work, but a *present* namespace must match
+  `credit_namespace`, and a present-but-unusable `method` (empty, non-string,
+  or containing `":"`) is refused as `bad_payment_held` exactly as the credit
+  path refuses it.
+- Both held-mirror predicates — the dedup and the clearing — are scoped on
+  `(budget_identity, key)`, never the key alone. Money is per-identity and the
+  key shapes share a keyspace (the hub's `ref` legitimately contains a colon),
+  so a global predicate would let one beneficiary's settlement clear another
+  beneficiary's hold, or swallow a second identity's hold as a "duplicate"
+  while acking the hub `ok:true`.
+- A user whose money is held is no longer told nothing: while a hold is
+  unresolved, the identity's budget-block notice gains one sentence
+  ("Payment received but held for review: $X — not credited yet. An operator
+  has to release it."), summed across holds and appended once. It rides the
+  existing notice delivery, `{identity, cap, day}` dedup and
+  `notice_repeat_ms` rate limit — no second notification channel — except that
+  a *newly appeared* hold changes the dedup key, so the first notice after a
+  quarantine is always due instead of waiting out the repeat window. While the
+  sentence is showing, the `topup_hint_fun` line is **suppressed**: the cap
+  that produced the hold is likely still saturated, so telling a blocked user
+  to send more USDC would just freeze more of their money. The hint returns
+  once the hold clears. A later credit for the same beneficiary and `ref` (the
+  operator release) clears the hold.
+  *Known limitation:* a credit is the only thing that clears a hold, so a
+  voided/refunded hold, or a manual credit under a synthetic ref, leaves the
+  sentence standing for the life of the process — to be closed with a
+  `payment_voided` action or a bounded TTL before the operator release
+  affordances land.
+- `quota_status.payments_poll` gained `held` (the most recent 10 unresolved
+  holds for the asked identity, newest first) and `held_count`. Both are
+  identity-scoped; the whole block remains absent without `settlements_fn`.
+  Note that `quota_status` remains unauthenticated (as it already was for
+  balances and spend), so any object that can name a `conversation_id` can now
+  also read that conversation's hold refs and amounts — a conscious
+  carry-forward of the existing authorization model, not a new class.
+- `Genswarms.LlmProxy.notice_due?/5` gained an optional `:variant` term folded
+  into the dedup key. Default `nil` = the pre-0.4.0 3-tuple key, unchanged.
+- **D9 boot gate — credits imply pricing.** With `payments_source` configured,
+  `init/1` now refuses to boot unless `prices` is a complete non-negative
+  rate card with at least one positive per-Mtok price, in every pricing mode.
+  A proxy that takes a user's money and charges $0.00 per call never consumes
+  the credit — the liability stays open forever. A `0/0` card is still legal
+  with credits off (free tier); the gate cannot fire on an install with no
+  payments source.
+- **C4 — `budget_identity/1` documented as a pinned host-facing contract** and
+  guarded by a golden vector (`checks/llm_proxy_budget_identity_golden_test.exs`),
+  asserted identically host-side: hosts derive deposit beneficiaries from it,
+  so a shape change silently re-keys every user's deposit address.
+- Added the default-off `poll_payments` durable outbox consumer with a
+  trailing-window read, per-consumer cursor, unfiltered-page `next_seq`
+  advancement, per-row applied/duplicate/transient/stuck disposition, and
+  cursor-ahead protection.
+- Added optional coherent cursor callbacks and a durable stuck-payment
+  operator-queue callback to `Genswarms.LlmProxy.Store`; the in-memory stuck
+  mirror is FIFO-bounded to 200 entries.
+- Added `llm_payments_lag`, stuck, cursor anomaly, and cursor read/write
+  telemetry through the existing `bump_metric/3` store seam. Configured
+  polling is visible in `quota_status.payments_poll`; cursor-store errors now
+  report `{cursor: null, unavailable: true}` instead of fabricated zeros.
+- Fixed dense-sequence poll liveness by requesting
+  `poll_lag + poll_limit` rows, giving the trailing replay window separate
+  progress capacity. Init now boot-validates the poll types and requires the
+  combined request to fit the settlements hub's 500-row cap.
+- Poll cursors are advance-only, unchanged cursor writes are skipped, and
+  trailing-window rereads dedupe stuck appends/alarms against the 200-entry
+  in-memory mirror. The mirror is the dedupe horizon; one re-append per key
+  after restart or eviction is acceptable.
+- Payment-created credit entries now stamp the conversion rate in force,
+  source (`push` or `poll`), and outbox sequence when present without dropping
+  existing map metadata. Non-map hub metadata is dropped with a warning. The
+  push action remains the latency path and retains its existing replies and
+  trust behavior.
+
 ## 0.3.0 — 2026-07-23
 
 - Fixed (review R3-I1): a NONCONFORMING `record_llm_credit_entry/1` return

@@ -248,6 +248,54 @@ check.(
 
 Genswarms.LlmProxy.terminate(:shutdown, state_default_per_usd)
 
+# ── Payments poll config boot validation ──────────────────────────────────────
+poll_validation_base =
+  Map.merge(credits_false_config, %{
+    payments_source: "payments",
+    settlements_fn: fn _after_seq, _limit ->
+      {:ok, %{settlements: [], max_seq: 0, next_seq: 0, complete: true}}
+    end,
+    poll_sources: ["cron"]
+  })
+
+for {label, overrides, message_fragment} <- [
+      {"non-integer poll_lag", %{poll_lag: "100"}, "poll_lag"},
+      {"negative poll_lag", %{poll_lag: -1}, "poll_lag"},
+      {"non-integer poll_limit", %{poll_limit: "100"}, "poll_limit"},
+      {"zero poll_limit", %{poll_limit: 0}, "poll_limit"},
+      {"negative poll_limit", %{poll_limit: -1}, "poll_limit"},
+      {"non-list poll_sources", %{poll_sources: "cron"}, "poll_sources"},
+      {"non-function settlements_fn", %{settlements_fn: "hub"}, "settlements_fn"},
+      {"fetch above hub cap", %{poll_lag: 400, poll_limit: 101}, "poll_lag + poll_limit"}
+    ] do
+  result =
+    try do
+      Genswarms.LlmProxy.init(Map.merge(poll_validation_base, overrides))
+      :no_raise
+    rescue
+      e in ArgumentError -> {:raised, Exception.message(e)}
+    end
+
+  check.(
+    "init/1 rejects #{label} with a clear ArgumentError",
+    match?({:raised, message} when is_binary(message), result) and
+      String.contains?(elem(result, 1), message_fragment)
+  )
+end
+
+{:ok, state_poll_cap} =
+  Genswarms.LlmProxy.init(
+    Map.merge(poll_validation_base, %{port: boot_port + 9, poll_lag: 400, poll_limit: 100})
+  )
+
+check.(
+  "init/1 accepts poll_lag + poll_limit exactly at the hub cap",
+  state_poll_cap.poll_lag == 400 and state_poll_cap.poll_limit == 100 and
+    is_function(state_poll_cap.settlements_fn, 2) and state_poll_cap.poll_sources == ["cron"]
+)
+
+Genswarms.LlmProxy.terminate(:shutdown, state_poll_cap)
+
 # ─────────────────────────────────────────────────────────────────────────────
 failed = Agent.get(failures, & &1)
 IO.puts("")
