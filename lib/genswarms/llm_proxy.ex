@@ -3300,6 +3300,11 @@ defmodule Genswarms.LlmProxy do
           "id" => "proxy-router",
           "label" => "Proxy router",
           "icon" => "hero-shield-check",
+          # Sidebar section (dashboard ≥ sidebar-groups): "LLM" is a builtin
+          # section, so this page renders next to the host's Usage page.
+          # This declaration WINS — host stamps are fill-nil-only, for
+          # pages whose packages don't declare yet.
+          "group" => "LLM",
           "meta" => "UTC day " <> Date.to_iso8601(day),
           "sections" =>
             [
