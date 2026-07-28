@@ -5,9 +5,10 @@ defmodule Genswarms.LlmProxy.Store do
   enforced fleet-wide) passes `store_mod:` — a module implementing any subset
   of these callbacks, subject to the coherent callback groups documented
   below. Every call site is guarded with `function_exported?`; missing groups
-  fall back to the in-memory mirror (fail-open by design — an accounting
-  outage must not take the swarm's LLM path down; the global ceiling still
-  holds via `max(durable, in-memory)`).
+  fall back to the in-memory mirror. Usage-budget accounting remains fail-open
+  (the global ceiling still holds via `max(durable, in-memory)`), but a
+  configured credit-balance read failure blocks paid admission rather than
+  trusting a stale positive mirror.
 
   All money values are `Decimal`; `day` is a `Date` (UTC).
   """
@@ -50,7 +51,10 @@ defmodule Genswarms.LlmProxy.Store do
 
   @doc """
   Current prepaid credit balance for a budget identity (sum of all credit
-  entries, signed). Credits are the post-daily-limit overflow pool.
+  entries, signed). Credits are the post-daily-limit overflow pool. This
+  callback and `record_llm_credit_entry/1` are one coherent optional group:
+  missing either callback selects mirror-only mode; with both configured, a
+  read error makes the balance unavailable and paid admission fails closed.
   """
   @callback llm_credit_balance(String.t()) :: {:ok, Decimal.t()} | {:error, term()}
 

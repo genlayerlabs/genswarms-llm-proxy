@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.1 — 2026-07-28
+
+- Prepaid-credit balance reads now fail closed when a host has configured the
+  coherent durable credit callback pair. If `llm_credit_balance/1` returns an
+  error, raises, exits, or returns a nonconforming value after the free daily
+  budget is exhausted, the proxy blocks the paid request before upstream
+  instead of admitting it from a stale positive in-memory mirror. The normal
+  block path tells the user the prepaid balance is temporarily unavailable,
+  logs the failure, and records `reason: "store_unavailable"` in the structured
+  quota metric; `quota_status` reports the balance as unavailable rather than
+  publishing the stale amount. Hosts with a configured durable credit store
+  will therefore see paid requests blocked during store outages. Hosts without
+  the coherent callback pair remain in the supported in-memory mode, unchanged;
+  failed reads never overwrite the mirror, and the next successful durable read
+  resumes normal admission. The documented public `credit_balance/3` API
+  remains always-`Decimal`: it returns conservative `Decimal.new("0")` on a
+  configured read failure, while the new error-aware result path drives
+  admission, notices, and `quota_status`.
+
 ## 0.4.0 — 2026-07-27
 
 - A GENUINELY NEW prepaid credit now produces a user-facing "payment

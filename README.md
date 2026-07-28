@@ -113,8 +113,10 @@ compile dep on the engine — genswarms is a peer/runtime dependency).
 
 The proxy always runs an in-memory usage mirror (pruned on day rollover). For
 budgets that survive restarts, pass `store_mod:` — any subset of the
-`Genswarms.LlmProxy.Store` callbacks; missing ones fall back to memory
-(fail-open: an accounting outage must not take the swarm's LLM path down).
+`Genswarms.LlmProxy.Store` callbacks; missing callback groups fall back to
+memory. Usage-budget accounting remains fail-open, but prepaid-credit
+admission is deliberately stricter: once the coherent durable credit pair is
+configured, an unreadable balance blocks paid requests until the store heals.
 See `lib/genswarms/llm_proxy/store.ex` for the exact contract.
 
 ## Prepaid credit ledger (optional)
@@ -413,6 +415,11 @@ exporting only `llm_credit_balance/1`, for example, is treated as fully
 absent for the credit path — otherwise a mirror top-up would be shadowed by
 a durable read that never actually recorded anything, and the paying user
 would be told `ok` while the block gate kept reading a stale durable 0).
+Once both callbacks are present, error-aware admission and status consumers
+treat a balance read error/raise/nonconforming return as
+`{:error, :store_unavailable}`, not a mirror fallback. The public
+`credit_balance/3` compatibility API still always returns a `Decimal`; it
+returns conservative `"0"` when that configured read is unavailable.
 
 **Spend order:** the free daily budget spends first; only once it's
 exhausted (`spent >= limit`) does the credit balance start being drawn down,
@@ -437,14 +444,19 @@ than the true combined overflow. Neither bound is closed by this feature —
 both are inherited from the same read-then-write shape as the existing daily
 budget check.
 
-**Fail policy:** credit balance *reads* fail open to the in-memory mirror (an
-accounting outage must not block spend — the gate still sees whatever the
-mirror last carried). **Known limitation (cold mirror):** the mirror starts
-empty on every restart, so a durable *read* outage immediately after a
-restart leaves the credit gate seeing `0` — a user with a real durable
-balance stays blocked until the store read heals. Only the credit
-*extension* degrades closed this way (the conservative direction for money);
-free daily-budget calls are unaffected, as that path fails open on its own. Credit *writes* fail CLOSED per spec: when a durable
+**Fail policy:** when the coherent durable credit callback pair is absent,
+balance reads and writes use the in-memory mirror exactly as before. When the
+pair is configured, a balance read error/raise/nonconforming return fails
+CLOSED: once the free daily budget is exhausted, the proxy blocks before
+upstream, logs the failure, bumps the degraded counter and a structured quota
+metric with `reason: "store_unavailable"`, and tells the user the prepaid
+balance is temporarily unavailable. It never treats a stale positive mirror
+as spend authority and never overwrites that mirror from a failed read. A
+later successful durable read resumes paid admission normally. Free
+daily-budget calls are unaffected because they do not consult the credit
+store. `quota_status` reports
+`credit: %{balance_usd: nil, unavailable: true}` during the outage instead of
+publishing a stale amount. Credit *writes* fail CLOSED per spec: when a durable
 store is configured (`store_mod` exports both `llm_credit_balance/1` and
 `record_llm_credit_entry/1`) and `record_llm_credit_entry/1`
 errors/raises/exits — **or returns any shape outside the documented
@@ -473,27 +485,30 @@ write fails. Mirror-only installs (no durable store at all) are unaffected —
 there is nothing durable to fail closed against, so a top-up applies to the
 mirror exactly as before.
 
-**Debits during a store outage** are the one asymmetric case: the request was
-already served (budget-side accounting fails OPEN — an accounting outage
-never blocks the LLM path) and, unlike a top-up, a debit has no redelivery
-vehicle, so a failed durable write cannot be retried later. The proxy makes
-the loss visible and conservative rather than silent: it logs a warning,
-bumps `llm_proxy_budget_degraded`, and applies the debit to the in-memory
-mirror anyway, so the fail-open balance the gate reads during the outage is
-the lower (already-debited) figure. Balance reads are durable-first, so once
-the store heals its un-debited ledger shadows the mirror — the mirror debit
-is never double-counted. **Accepted rider:** the durable ledger permanently
-under-charges by the debits lost during the outage window (bounded by the
-global daily ceiling); the log/metric trail is the reconciliation signal.
+**Debits during a store outage** are the one asymmetric case: the request may
+already have been served before its post-call debit write fails, and unlike a
+top-up that debit has no redelivery vehicle. The proxy logs the failure, bumps
+`llm_proxy_budget_degraded`, and applies the debit to the in-memory mirror
+solely as bookkeeping for reconciliation. That mirror is not spend authority
+for a configured durable store: while its balance reads fail, subsequent paid
+requests block before upstream (fail closed). Once reads recover, the durable
+ledger is authoritative again; if the failed debit has not been reconciled,
+that ledger under-charges by the missing debit. The log, metric, and mirror
+entry are the reconciliation trail.
 
 Deliverers should send confirmations serially per ref (or treat any
 `ok:false` as retry-needed): a concurrent duplicate delivered during a
 failing store write can be acked `duplicate:true` while the write fails —
 the key is released afterward, so a serial retry always lands.
 
-`quota_status` gains a `credit.balance_usd` field (2dp string, like the other
-credit-related dollar amounts in this feature — `money2`, not the 6dp `money`
-used elsewhere in `quota_status`).
+`quota_status.credit` has exactly two shapes:
+
+- healthy: `%{balance_usd: "<2dp string>"}`
+- configured-store read unavailable:
+  `%{balance_usd: nil, unavailable: true}`
+
+Healthy balances use `money2`, not the 6dp `money` used elsewhere in
+`quota_status`.
 
 ## Dashboard integration
 

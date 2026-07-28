@@ -633,9 +633,8 @@ check.(
 )
 
 check.(
-  "J6: during the outage the gate reads the conservative mirror figure " <>
-    "(durable read down -> falls open to the mirror's 4.70)",
-  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("4.70"))
+  "J6: public balance API returns conservative zero during the configured-store outage",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("0"))
 )
 
 # Replay of the SAME request_id while still down: the mirror-only re-apply
