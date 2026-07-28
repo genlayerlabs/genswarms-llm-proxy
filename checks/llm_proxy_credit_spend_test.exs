@@ -633,9 +633,8 @@ check.(
 )
 
 check.(
-  "J6: during the outage the configured durable balance is unavailable (the " <>
-    "stale positive mirror cannot admit another paid request)",
-  Proxy.credit_balance(pid, DebitOutageStore, "bi-j") == {:error, :store_unavailable}
+  "J6: public balance API returns conservative zero during the configured-store outage",
+  eq.(Proxy.credit_balance(pid, DebitOutageStore, "bi-j"), d.("0"))
 )
 
 # Replay of the SAME request_id while still down: the mirror-only re-apply

@@ -3966,8 +3966,10 @@ defmodule Genswarms.LlmProxy do
   @doc """
   Prepaid credit balance for a budget identity. Durable read when the store
   exports the coherent credit callback pair; falls back to the in-memory mirror
-  only when that pair is absent. A configured store read failure returns
-  `{:error, :store_unavailable}` and never overwrites the mirror. Never raises.
+  only when that pair is absent. Always returns a `Decimal` and never raises.
+  A configured store read failure returns the conservative
+  `Decimal.new("0")` and never overwrites the mirror; error-aware admission and
+  status consumers use `credit_balance_result/3`.
   """
   def credit_balance(pid \\ @state_name, store_mod, budget_identity) do
     case credit_balance_result(pid, store_mod, budget_identity) do
@@ -3976,10 +3978,10 @@ defmodule Genswarms.LlmProxy do
 
       {:error, reason} ->
         Logger.error(
-          "llm_proxy: credit balance store read failed: #{inspect(reason)} — balance unavailable"
+          "llm_proxy: credit balance store read failed: #{inspect(reason)} — returning conservative zero"
         )
 
-        {:error, :store_unavailable}
+        Decimal.new("0")
     end
   end
 
@@ -4965,10 +4967,7 @@ defmodule Genswarms.LlmProxy.Plug do
       |> Map.put_new(:default_daily_limit, Proxy.default_daily_limit())
       |> Map.put_new(:swarm_name, "swarm")
       |> Map.put_new(:sender, :sender)
-      |> Map.put_new(
-        :deliver_fn,
-        Function.capture(Genswarms.Objects.ObjectServer, :deliver_message, 4)
-      )
+      |> Map.put_new(:deliver_fn, &Genswarms.Objects.ObjectServer.deliver_message/4)
       |> Map.put_new(:metrics, :metrics)
       # :provider + :prices are read on the hot path (respond_upstream / x_router / cost)
       # but only init/1 supplied them — a direct ProxyPlug.call with a bare opts map would
@@ -5375,6 +5374,11 @@ defmodule Genswarms.LlmProxy.Plug do
   # blank attempt is a REAL upstream call — bill it (status "empty_retry").
   # (X2) `budget` is the full map (spent_usd + limit_usd), threaded through so
   # every discarded-attempt debit sees the same limit_usd the gate saw.
+  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
+
+  defp record_discarded_attempts(opts, session, request_ctx, request, budget, discarded),
+    do: record_nonempty_discarded_attempts(opts, session, request_ctx, request, budget, discarded)
+
   # Hostile/garbage upstream token counts ("many", lists, maps) normalize to 0
   # BEFORE any consumer — cost, x_router, and the durable record all see ints
   # (mm hardening; a poisoned count must never crash a host store).
@@ -5392,9 +5396,7 @@ defmodule Genswarms.LlmProxy.Plug do
   defp nonneg_int(v) when is_integer(v) and v >= 0, do: v
   defp nonneg_int(_), do: 0
 
-  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
-
-  defp record_discarded_attempts(opts, session, request_ctx, request, budget, discarded) do
+  defp record_nonempty_discarded_attempts(opts, session, request_ctx, request, budget, discarded) do
     Enum.reduce(discarded, budget, fn %{body: body}, budget_acc ->
       usage = normalize_usage_counts(Map.get(body, "usage") || %{})
       upstream_router = upstream_router(Map.get(body, "x_router"))
@@ -5880,14 +5882,9 @@ defmodule Genswarms.LlmProxy.Plug do
 
     tail =
       case delivery do
-        :sent ->
-          "A deterministic Telegram notice was sent; do not send a separate user reply."
-
-        :suppressed ->
-          "The user was already notified earlier today; do not send a separate user reply."
-
-        :skipped ->
-          "No user notice was sent by this path."
+        :sent -> "A deterministic Telegram notice was sent; do not send a separate user reply."
+        :suppressed -> "The user was already notified earlier today; do not send a separate user reply."
+        :skipped -> "No user notice was sent by this path."
       end
 
     lead <> " " <> tail

@@ -81,8 +81,8 @@ result3 = Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00"))
 check.("store-down credit write fails CLOSED", result3 == {:error, :store_unavailable})
 
 check.(
-  "store-down: configured durable balance read reports unavailable (never serves the stale mirror)",
-  Proxy.credit_balance(pid2, CreditStore, bi) == {:error, :store_unavailable}
+  "store-down: public configured durable balance read returns conservative zero",
+  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("0"))
 )
 
 check.(
@@ -191,8 +191,11 @@ end
 {:ok, _} = Proxy.apply_credit_entry(raising_pid, nil, entry.("raise:1", "4.00"))
 
 check.(
-  "credit_balance/3 fails closed when the configured store raises (no crash)",
-  Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi) == {:error, :store_unavailable}
+  "credit_balance/3 returns conservative zero when the configured store raises (no crash)",
+  Decimal.equal?(
+    Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi),
+    Decimal.new("0")
+  )
 )
 
 check.(

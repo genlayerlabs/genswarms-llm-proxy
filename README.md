@@ -415,8 +415,11 @@ exporting only `llm_credit_balance/1`, for example, is treated as fully
 absent for the credit path — otherwise a mirror top-up would be shadowed by
 a durable read that never actually recorded anything, and the paying user
 would be told `ok` while the block gate kept reading a stale durable 0).
-Once both callbacks are present, a balance read error/raise/nonconforming
-return is `{:error, :store_unavailable}`, not a mirror fallback.
+Once both callbacks are present, error-aware admission and status consumers
+treat a balance read error/raise/nonconforming return as
+`{:error, :store_unavailable}`, not a mirror fallback. The public
+`credit_balance/3` compatibility API still always returns a `Decimal`; it
+returns conservative `"0"` when that configured read is unavailable.
 
 **Spend order:** the free daily budget spends first; only once it's
 exhausted (`spent >= limit`) does the credit balance start being drawn down,
@@ -482,27 +485,30 @@ write fails. Mirror-only installs (no durable store at all) are unaffected —
 there is nothing durable to fail closed against, so a top-up applies to the
 mirror exactly as before.
 
-**Debits during a store outage** are the one asymmetric case: the request was
-already served (budget-side accounting fails OPEN — an accounting outage
-never blocks the LLM path) and, unlike a top-up, a debit has no redelivery
-vehicle, so a failed durable write cannot be retried later. The proxy makes
-the loss visible and conservative rather than silent: it logs a warning,
-bumps `llm_proxy_budget_degraded`, and applies the debit to the in-memory
-mirror anyway, so the fail-open balance the gate reads during the outage is
-the lower (already-debited) figure. Balance reads are durable-first, so once
-the store heals its un-debited ledger shadows the mirror — the mirror debit
-is never double-counted. **Accepted rider:** the durable ledger permanently
-under-charges by the debits lost during the outage window (bounded by the
-global daily ceiling); the log/metric trail is the reconciliation signal.
+**Debits during a store outage** are the one asymmetric case: the request may
+already have been served before its post-call debit write fails, and unlike a
+top-up that debit has no redelivery vehicle. The proxy logs the failure, bumps
+`llm_proxy_budget_degraded`, and applies the debit to the in-memory mirror
+solely as bookkeeping for reconciliation. That mirror is not spend authority
+for a configured durable store: while its balance reads fail, subsequent paid
+requests block before upstream (fail closed). Once reads recover, the durable
+ledger is authoritative again; if the failed debit has not been reconciled,
+that ledger under-charges by the missing debit. The log, metric, and mirror
+entry are the reconciliation trail.
 
 Deliverers should send confirmations serially per ref (or treat any
 `ok:false` as retry-needed): a concurrent duplicate delivered during a
 failing store write can be acked `duplicate:true` while the write fails —
 the key is released afterward, so a serial retry always lands.
 
-`quota_status` gains a `credit.balance_usd` field (2dp string, like the other
-credit-related dollar amounts in this feature — `money2`, not the 6dp `money`
-used elsewhere in `quota_status`).
+`quota_status.credit` has exactly two shapes:
+
+- healthy: `%{balance_usd: "<2dp string>"}`
+- configured-store read unavailable:
+  `%{balance_usd: nil, unavailable: true}`
+
+Healthy balances use `money2`, not the 6dp `money` used elsewhere in
+`quota_status`.
 
 ## Dashboard integration
 

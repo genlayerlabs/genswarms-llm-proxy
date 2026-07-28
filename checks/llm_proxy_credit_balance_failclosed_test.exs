@@ -31,6 +31,8 @@ defmodule BalanceFailclosed.Store do
         %{
           mode: :healthy,
           durable_balance: Decimal.new("7.00"),
+          budget_spent: Decimal.new("0.60"),
+          balance_reads: 0,
           metrics: []
         }
       end,
@@ -39,6 +41,9 @@ defmodule BalanceFailclosed.Store do
   end
 
   def mode(mode), do: Agent.update(@name, &Map.put(&1, :mode, mode))
+  def budget_spent(spent), do: Agent.update(@name, &Map.put(&1, :budget_spent, spent))
+  def reset_balance_reads, do: Agent.update(@name, &Map.put(&1, :balance_reads, 0))
+  def balance_reads, do: Agent.get(@name, & &1.balance_reads)
   def metrics, do: Agent.get(@name, &Enum.reverse(&1.metrics))
 
   def llm_budget_status(identity, day, session_id, _default_limit) do
@@ -46,7 +51,7 @@ defmodule BalanceFailclosed.Store do
       budget_identity: identity,
       day: day,
       session_id: session_id,
-      spent_usd: Decimal.new("0.60"),
+      spent_usd: Agent.get(@name, & &1.budget_spent),
       limit_usd: Decimal.new("0.50"),
       requests: 1
     }
@@ -59,10 +64,17 @@ defmodule BalanceFailclosed.Store do
   def llm_usage_today(_day), do: %{spent_usd: Decimal.new("0")}
 
   def llm_credit_balance(_identity) do
-    case Agent.get(@name, &{&1.mode, &1.durable_balance}) do
+    case Agent.get_and_update(@name, fn state ->
+           {{state.mode, state.durable_balance}, Map.update!(state, :balance_reads, &(&1 + 1))}
+         end) do
       {:healthy, balance} -> {:ok, balance}
       {:error, _balance} -> {:error, :db_down}
       {:raise, _balance} -> raise "db_down"
+      {:throw, _balance} -> throw(:db_down)
+      {:exit, _balance} -> exit(:db_down)
+      {:raw_decimal, balance} -> balance
+      {nil, _balance} -> nil
+      {:wrong_inner, _balance} -> {:ok, "7.00"}
     end
   end
 
@@ -101,6 +113,30 @@ defmodule BalanceFailclosed.MirrorModeStore do
   end
 
   def llm_usage_today(_day), do: %{spent_usd: Decimal.new("0")}
+end
+
+defmodule BalanceFailclosed.BalanceOnlyStore do
+  defdelegate llm_budget_status(identity, day, session_id, default_limit),
+    to: BalanceFailclosed.MirrorModeStore
+
+  defdelegate record_llm_call(identity, day, session_id, attrs),
+    to: BalanceFailclosed.MirrorModeStore
+
+  defdelegate llm_usage_today(day), to: BalanceFailclosed.MirrorModeStore
+
+  def llm_credit_balance(_identity), do: raise("partial read callback must not be called")
+end
+
+defmodule BalanceFailclosed.RecordOnlyStore do
+  defdelegate llm_budget_status(identity, day, session_id, default_limit),
+    to: BalanceFailclosed.MirrorModeStore
+
+  defdelegate record_llm_call(identity, day, session_id, attrs),
+    to: BalanceFailclosed.MirrorModeStore
+
+  defdelegate llm_usage_today(day), to: BalanceFailclosed.MirrorModeStore
+
+  def record_llm_credit_entry(_entry), do: raise("partial write callback must not be called")
 end
 
 defmodule BalanceFailclosed.LogSink do
@@ -209,13 +245,29 @@ BalanceFailclosed.LogSink.reset()
 :ok = :logger.add_handler(:balance_failclosed_log_sink, BalanceFailclosed.LogSink, %{})
 BalanceFailclosed.Store.mode(:error)
 
+# The free daily budget remains authoritative before credits. Its healthy
+# remainder must admit without touching even a configured-but-down credit store.
+BalanceFailclosed.Store.budget_spent(Decimal.new("0.40"))
+BalanceFailclosed.Store.reset_balance_reads()
+free_budget_upstream_before = Agent.get(upstream_calls, & &1)
+free_budget_conn = request.(token, base_opts)
+
+check.(
+  "remaining free budget admits while the credit store is down without consulting it",
+  free_budget_conn.status == 200 and
+    Agent.get(upstream_calls, & &1) == free_budget_upstream_before + 1 and
+    BalanceFailclosed.Store.balance_reads() == 0
+)
+
+BalanceFailclosed.Store.budget_spent(Decimal.new("0.60"))
+
 blocked_conn = request.(token, base_opts)
 blocked_body = Jason.decode!(blocked_conn.resp_body)
 
 check.(
   "configured store {:error, :db_down} + stale positive mirror blocks before upstream",
   blocked_conn.status == 200 and blocked_body["model"] == "llm-proxy-budget" and
-    Agent.get(upstream_calls, & &1) == 0
+    Agent.get(upstream_calls, & &1) == free_budget_upstream_before + 1
 )
 
 notices =
@@ -259,7 +311,7 @@ check.(
   "configured-store outage also blocks the paid /v1/compact call before upstream",
   compact_conn.status == 429 and
     get_in(compact_body, ["error", "code"]) == "credit_store_unavailable" and
-    Agent.get(upstream_calls, & &1) == 0
+    Agent.get(upstream_calls, & &1) == free_budget_upstream_before + 1
 )
 
 check.(
@@ -287,7 +339,7 @@ check.(
 )
 
 check.(
-  "failed durable read reports unavailable and leaves the stale mirror untouched",
+  "failed durable read reports unavailable; public API returns conservative zero; mirror is untouched",
   match?(
     {:error, :db_down},
     Proxy.credit_balance_result(
@@ -296,6 +348,10 @@ check.(
       session.budget_identity
     )
   ) and
+    Decimal.equal?(
+      Proxy.credit_balance(state_pid, BalanceFailclosed.Store, session.budget_identity),
+      Decimal.new("0")
+    ) and
     Decimal.equal?(
       Proxy.credit_balance(state_pid, nil, session.budget_identity),
       Decimal.new("5.00")
@@ -328,7 +384,7 @@ check.(
   "next successful durable read resumes paid admission after recovery",
   recovered_conn.status == 200 and
     get_in(recovered_body, ["choices", Access.at(0), "message", "content"]) == "recovered" and
-    Agent.get(upstream_calls, & &1) == 1 and
+    Agent.get(upstream_calls, & &1) == free_budget_upstream_before + 2 and
     Decimal.equal?(
       Proxy.credit_balance(state_pid, BalanceFailclosed.Store, session.budget_identity),
       Decimal.new("7.00")
@@ -414,7 +470,119 @@ check.(
   "callback-absent mode still admits an exhausted-budget request from a positive mirror",
   mirror_conn.status == 200 and
     get_in(mirror_body, ["choices", Access.at(0), "message", "content"]) == "recovered" and
-    Agent.get(upstream_calls, & &1) == 2
+    Agent.get(upstream_calls, & &1) == free_budget_upstream_before + 3
+)
+
+# Every exceptional and nonconforming configured-store read must take the same
+# paid-admission fail-closed path. None may reach upstream.
+for {mode, label} <- [
+      {:throw, "configured durable read throw fails closed"},
+      {:exit, "configured durable read exit fails closed"},
+      {:raw_decimal, "raw Decimal return fails closed"},
+      {nil, "nil return fails closed"},
+      {:wrong_inner, "ok tuple with non-Decimal inner value fails closed"}
+    ] do
+  BalanceFailclosed.Store.mode(mode)
+  upstream_before = Agent.get(upstream_calls, & &1)
+  conn = request.(token, base_opts)
+
+  check.(
+    label,
+    conn.status == 200 and Jason.decode!(conn.resp_body)["model"] == "llm-proxy-budget" and
+      Agent.get(upstream_calls, & &1) == upstream_before
+  )
+end
+
+# 0.4.0's both-callbacks-or-neither contract: either partial pair is treated as
+# callback-absent mirror mode for both reads and writes.
+for {store_mod, suffix} <- [
+      {BalanceFailclosed.BalanceOnlyStore, "balance-only"},
+      {BalanceFailclosed.RecordOnlyStore, "record-only"}
+    ] do
+  {:ok, partial_pid} = Proxy.start_state_link()
+
+  {:ok, partial_token} =
+    Proxy.register_session(partial_pid, %{
+      conversation_id: "tg:balance-#{suffix}:0",
+      slot: :agent,
+      kind: :dm,
+      workspace_key: "default"
+    })
+
+  partial_session = Proxy.lookup_session(partial_pid, partial_token)
+
+  {:ok, _} =
+    Proxy.apply_credit_entry(partial_pid, store_mod, %{
+      stale_entry
+      | idempotency_key: "mirror:#{suffix}",
+        budget_identity: partial_session.budget_identity
+    })
+
+  partial_opts = %{base_opts | state_pid: partial_pid, store_mod: store_mod}
+  upstream_before = Agent.get(upstream_calls, & &1)
+  partial_conn = request.(partial_token, partial_opts)
+
+  check.(
+    "#{suffix} partial pair remains in documented mirror mode",
+    partial_conn.status == 200 and
+      get_in(Jason.decode!(partial_conn.resp_body), [
+        "choices",
+        Access.at(0),
+        "message",
+        "content"
+      ]) == "recovered" and
+      Agent.get(upstream_calls, & &1) == upstream_before + 1
+  )
+end
+
+# Same-reason store-outage blocks are rate-limited, not once-and-silent or
+# unbounded spam: first is sent, one just inside the boundary is suppressed,
+# and one exactly at the boundary is sent.
+{:ok, repeat_pid} = Proxy.start_state_link()
+
+{:ok, repeat_token} =
+  Proxy.register_session(repeat_pid, %{
+    conversation_id: "tg:balance-repeat:0",
+    slot: :agent,
+    kind: :dm,
+    workspace_key: "default"
+  })
+
+{:ok, repeat_clock} = Agent.start_link(fn -> ~U[2026-07-28 12:00:00Z] end)
+{:ok, repeat_delivered} = Agent.start_link(fn -> [] end)
+
+repeat_deliver_fn = fn _swarm, to, _from, payload ->
+  Agent.update(repeat_delivered, &[{to, Jason.decode!(payload)} | &1])
+  :ok
+end
+
+repeat_opts =
+  Map.merge(base_opts, %{
+    state_pid: repeat_pid,
+    clock: fn -> Agent.get(repeat_clock, & &1) end,
+    notice_repeat_ms: 1_000,
+    deliver_fn: repeat_deliver_fn
+  })
+
+BalanceFailclosed.Store.mode(:error)
+repeat_upstream_before = Agent.get(upstream_calls, & &1)
+request.(repeat_token, repeat_opts)
+Agent.update(repeat_clock, fn at -> DateTime.add(at, 999, :millisecond) end)
+request.(repeat_token, repeat_opts)
+Agent.update(repeat_clock, fn at -> DateTime.add(at, 1, :millisecond) end)
+request.(repeat_token, repeat_opts)
+
+repeat_notices =
+  Agent.get(repeat_delivered, fn messages ->
+    Enum.count(messages, fn
+      {:sender, %{"action" => "slot_reply"}} -> true
+      _ -> false
+    end)
+  end)
+
+check.(
+  "same-reason blocks send exactly two notices across notice_repeat_ms boundary",
+  repeat_notices == 2 and Agent.get(upstream_calls, & &1) == repeat_upstream_before
 )
 
 :logger.remove_handler(:balance_failclosed_log_sink)

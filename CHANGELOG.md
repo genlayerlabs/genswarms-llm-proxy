@@ -14,7 +14,10 @@
   will therefore see paid requests blocked during store outages. Hosts without
   the coherent callback pair remain in the supported in-memory mode, unchanged;
   failed reads never overwrite the mirror, and the next successful durable read
-  resumes normal admission.
+  resumes normal admission. The documented public `credit_balance/3` API
+  remains always-`Decimal`: it returns conservative `Decimal.new("0")` on a
+  configured read failure, while the new error-aware result path drives
+  admission, notices, and `quota_status`.
 
 ## 0.4.0 — 2026-07-27
 
