@@ -81,8 +81,13 @@ result3 = Proxy.apply_credit_entry(pid2, CreditStore, entry.("d:2", "2.00"))
 check.("store-down credit write fails CLOSED", result3 == {:error, :store_unavailable})
 
 check.(
-  "store-down: mirror NOT applied (stays at 3.00, unchanged — no fail-open credit)",
-  Decimal.equal?(Proxy.credit_balance(pid2, CreditStore, bi), Decimal.new("3.00"))
+  "store-down: configured durable balance read reports unavailable (never serves the stale mirror)",
+  Proxy.credit_balance(pid2, CreditStore, bi) == {:error, :store_unavailable}
+)
+
+check.(
+  "store-down: mirror was NOT applied (stays at 3.00, unchanged — no fail-open credit)",
+  Decimal.equal?(Proxy.credit_balance(pid2, nil, bi), Decimal.new("3.00"))
 )
 
 CreditStore.down!(false)
@@ -174,17 +179,26 @@ check.("concurrency: every other racer dedups", conc_dups == racers - 1)
 check.("concurrency: mirror credited exactly once — no double-credit",
   Decimal.equal?(Proxy.credit_balance(conc_pid, nil, bi), Decimal.new("7.00")))
 
-# 7. credit_balance/3 falls open to the mirror when the store's read RAISES
-# (not just when it returns {:error, _}) — never raises to the caller.
+# 7. A CONFIGURED durable store whose balance read raises returns unavailable
+# and leaves the mirror untouched. The write callback makes this the coherent
+# credit pair; without it the store is intentionally treated as absent.
 defmodule RaisingBalanceStore do
   def llm_credit_balance(_bi), do: raise("boom")
+  def record_llm_credit_entry(_entry), do: :ok
 end
 
 {:ok, raising_pid} = Proxy.start_state_link()
 {:ok, _} = Proxy.apply_credit_entry(raising_pid, nil, entry.("raise:1", "4.00"))
 
-check.("credit_balance/3 falls open to the mirror when the store raises (no crash)",
-  Decimal.equal?(Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi), Decimal.new("4.00")))
+check.(
+  "credit_balance/3 fails closed when the configured store raises (no crash)",
+  Proxy.credit_balance(raising_pid, RaisingBalanceStore, bi) == {:error, :store_unavailable}
+)
+
+check.(
+  "configured read raise does not overwrite the mirror",
+  Decimal.equal?(Proxy.credit_balance(raising_pid, nil, bi), Decimal.new("4.00"))
+)
 
 # 8. (B1, I1) durable credits are both-callbacks-or-neither: a store exporting
 # only ONE of the two callbacks must be treated as fully absent for the

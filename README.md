@@ -113,8 +113,10 @@ compile dep on the engine — genswarms is a peer/runtime dependency).
 
 The proxy always runs an in-memory usage mirror (pruned on day rollover). For
 budgets that survive restarts, pass `store_mod:` — any subset of the
-`Genswarms.LlmProxy.Store` callbacks; missing ones fall back to memory
-(fail-open: an accounting outage must not take the swarm's LLM path down).
+`Genswarms.LlmProxy.Store` callbacks; missing callback groups fall back to
+memory. Usage-budget accounting remains fail-open, but prepaid-credit
+admission is deliberately stricter: once the coherent durable credit pair is
+configured, an unreadable balance blocks paid requests until the store heals.
 See `lib/genswarms/llm_proxy/store.ex` for the exact contract.
 
 ## Prepaid credit ledger (optional)
@@ -413,6 +415,8 @@ exporting only `llm_credit_balance/1`, for example, is treated as fully
 absent for the credit path — otherwise a mirror top-up would be shadowed by
 a durable read that never actually recorded anything, and the paying user
 would be told `ok` while the block gate kept reading a stale durable 0).
+Once both callbacks are present, a balance read error/raise/nonconforming
+return is `{:error, :store_unavailable}`, not a mirror fallback.
 
 **Spend order:** the free daily budget spends first; only once it's
 exhausted (`spent >= limit`) does the credit balance start being drawn down,
@@ -437,14 +441,19 @@ than the true combined overflow. Neither bound is closed by this feature —
 both are inherited from the same read-then-write shape as the existing daily
 budget check.
 
-**Fail policy:** credit balance *reads* fail open to the in-memory mirror (an
-accounting outage must not block spend — the gate still sees whatever the
-mirror last carried). **Known limitation (cold mirror):** the mirror starts
-empty on every restart, so a durable *read* outage immediately after a
-restart leaves the credit gate seeing `0` — a user with a real durable
-balance stays blocked until the store read heals. Only the credit
-*extension* degrades closed this way (the conservative direction for money);
-free daily-budget calls are unaffected, as that path fails open on its own. Credit *writes* fail CLOSED per spec: when a durable
+**Fail policy:** when the coherent durable credit callback pair is absent,
+balance reads and writes use the in-memory mirror exactly as before. When the
+pair is configured, a balance read error/raise/nonconforming return fails
+CLOSED: once the free daily budget is exhausted, the proxy blocks before
+upstream, logs the failure, bumps the degraded counter and a structured quota
+metric with `reason: "store_unavailable"`, and tells the user the prepaid
+balance is temporarily unavailable. It never treats a stale positive mirror
+as spend authority and never overwrites that mirror from a failed read. A
+later successful durable read resumes paid admission normally. Free
+daily-budget calls are unaffected because they do not consult the credit
+store. `quota_status` reports
+`credit: %{balance_usd: nil, unavailable: true}` during the outage instead of
+publishing a stale amount. Credit *writes* fail CLOSED per spec: when a durable
 store is configured (`store_mod` exports both `llm_credit_balance/1` and
 `record_llm_credit_entry/1`) and `record_llm_credit_entry/1`
 errors/raises/exits — **or returns any shape outside the documented

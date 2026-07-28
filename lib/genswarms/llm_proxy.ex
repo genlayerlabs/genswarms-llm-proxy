@@ -2872,7 +2872,7 @@ defmodule Genswarms.LlmProxy do
       }
   end
 
-  defp quota_status(%{"conversation_id" => cid} = msg, state)
+  defp quota_status_for_conversation(%{"conversation_id" => cid} = msg, state)
        when is_binary(cid) and cid != "" do
     # Tolerate both host state shapes: everything under :quota (wingston lineage)
     # or store_mod/default_daily_limit at the top level with a *_usd global key
@@ -2926,11 +2926,31 @@ defmodule Genswarms.LlmProxy do
     # WITHOUT ever consulting the store — probe P5 showed a feature-off install
     # displaying a durable balance the block gate ignores entirely. credit_balance/3
     # (and therefore store_mod.llm_credit_balance/1) is only called when on.
-    credit_balance_usd =
+    credit =
       if Map.get(state, :credits_enabled, false) do
-        money2(credit_balance(state_pid, Map.get(quota, :store_mod), budget_identity))
+        store_mod = Map.get(quota, :store_mod)
+
+        case credit_balance_result(state_pid, store_mod, budget_identity) do
+          {:ok, balance} ->
+            %{balance_usd: money2(balance)}
+
+          {:error, reason} ->
+            Logger.error(
+              "llm_proxy: quota_status credit balance store read failed: " <>
+                "#{inspect(reason)} — reporting balance unavailable"
+            )
+
+            bump_store_metric(
+              store_mod,
+              "llm_credit_balance_read_failed",
+              %{context: "quota_status", reason: "store_unavailable"},
+              1
+            )
+
+            %{balance_usd: nil, unavailable: true}
+        end
       else
-        money2(Decimal.new("0"))
+        %{balance_usd: money2(Decimal.new("0"))}
       end
 
     %{
@@ -2960,7 +2980,7 @@ defmodule Genswarms.LlmProxy do
         limit_usd: money(global_limit),
         pct: pct_decimal(global_used, global_limit)
       },
-      credit: %{balance_usd: credit_balance_usd},
+      credit: credit,
       # mm vocabulary: the same numbers nested under "quota" with 2dp money strings
       # and a human reset stamp — both host lineages' consumers keep working.
       quota: %{
@@ -3032,6 +3052,11 @@ defmodule Genswarms.LlmProxy do
         else: 2
 
     d |> Decimal.round(places) |> Decimal.to_string(:normal)
+  end
+
+  defp quota_status(%{"conversation_id" => cid} = msg, state)
+       when is_binary(cid) and cid != "" do
+    quota_status_for_conversation(msg, state)
   end
 
   defp quota_status(msg, state) do
@@ -3933,21 +3958,28 @@ defmodule Genswarms.LlmProxy do
   #
   # A payment-agnostic prepaid credit balance per budget_identity, on top of the
   # existing daily-limit budget: the store (when it exports the two callbacks)
-  # is durable and authoritative; the in-memory `credits` mirror is always kept
-  # in sync and is the fail-open fallback (same availability stance as the rest
-  # of this module's accounting — an accounting outage never blocks the LLM
-  # path). Later tasks (block gate, top-ups, dashboard) build on these.
+  # is durable and authoritative; the in-memory `credits` mirror is kept in sync
+  # for callback-absent mode and local bookkeeping. A configured durable read
+  # failure is NOT equivalent to an absent store: paid admission fails closed
+  # until the authoritative balance is readable again.
 
   @doc """
   Prepaid credit balance for a budget identity. Durable read when the store
-  exports llm_credit_balance/1 and answers; falls OPEN to the in-memory
-  mirror otherwise (same availability stance as per-conversation budget).
-  Never raises. Returns Decimal (0 when unknown).
+  exports the coherent credit callback pair; falls back to the in-memory mirror
+  only when that pair is absent. A configured store read failure returns
+  `{:error, :store_unavailable}` and never overwrites the mirror. Never raises.
   """
   def credit_balance(pid \\ @state_name, store_mod, budget_identity) do
-    case durable_credit_balance(store_mod, budget_identity) do
-      %Decimal{} = bal -> bal
-      nil -> mirror_credit_balance(pid, budget_identity)
+    case credit_balance_result(pid, store_mod, budget_identity) do
+      {:ok, %Decimal{} = bal} ->
+        bal
+
+      {:error, reason} ->
+        Logger.error(
+          "llm_proxy: credit balance store read failed: #{inspect(reason)} — balance unavailable"
+        )
+
+        {:error, :store_unavailable}
     end
   end
 
@@ -3967,17 +3999,29 @@ defmodule Genswarms.LlmProxy do
       function_exported?(store_mod, :record_llm_credit_entry, 1)
   end
 
+  @doc false
+  def credit_balance_result(pid \\ @state_name, store_mod, budget_identity) do
+    case durable_credit_balance(store_mod, budget_identity) do
+      {:ok, %Decimal{} = bal} -> {:ok, bal}
+      :no_store -> {:ok, mirror_credit_balance(pid, budget_identity)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp durable_credit_balance(store_mod, budget_identity) do
     if credit_store_ready?(store_mod) do
       case store_mod.llm_credit_balance(budget_identity) do
-        {:ok, %Decimal{} = bal} -> bal
-        _ -> nil
+        {:ok, %Decimal{} = bal} -> {:ok, bal}
+        {:error, reason} -> {:error, reason}
+        other -> {:error, {:nonconforming_return, other}}
       end
+    else
+      :no_store
     end
   rescue
-    _ -> nil
+    e -> {:error, {:raised, e.__struct__, Exception.message(e)}}
   catch
-    _, _ -> nil
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp mirror_credit_balance(pid, budget_identity) do
@@ -4639,9 +4683,10 @@ defmodule Genswarms.LlmProxy.Plug do
          body when is_map(body) <- conn.body_params do
       request_ctx = request_context(session, opts)
       budget = budget_status(opts, session, request_ctx)
+      block_reason = request_block_reason(opts, session, request_ctx, budget)
 
       cond do
-        global_exhausted?(opts, request_ctx) ->
+        block_reason == :global ->
           # Operator-wide daily ceiling reached — block EVERY conversation (cost-DoS backstop),
           # before the per-conversation check. Same delivery/SSE shape as a per-conv block.
           global_exhausted_response(
@@ -4652,7 +4697,7 @@ defmodule Genswarms.LlmProxy.Plug do
             streaming?(body) and Map.get(opts, :allow_streaming, false)
           )
 
-        request_quota_exhausted?(opts, budget) ->
+        block_reason == :request_quota ->
           # Per-identity operation quota. This blocks before upstream and before
           # dollar-budget checks.
           request_quota_exhausted_response(
@@ -4664,7 +4709,7 @@ defmodule Genswarms.LlmProxy.Plug do
             streaming?(body) and Map.get(opts, :allow_streaming, false)
           )
 
-        exhausted?(budget) and credit_exhausted?(opts, session) ->
+        block_reason in [:budget_exhausted, :store_unavailable] ->
           # Only render an SSE budget body when streaming was REQUESTED *and* the gate is
           # on; otherwise the buffered JSON body (byte-identical to before).
           budget_exhausted_response(
@@ -4673,7 +4718,8 @@ defmodule Genswarms.LlmProxy.Plug do
             request_ctx,
             budget,
             opts,
-            streaming?(body) and Map.get(opts, :allow_streaming, false)
+            streaming?(body) and Map.get(opts, :allow_streaming, false),
+            block_reason
           )
 
         streaming?(body) and Map.get(opts, :allow_streaming, false) ->
@@ -4790,9 +4836,10 @@ defmodule Genswarms.LlmProxy.Plug do
          body when is_map(body) <- conn.body_params do
       request_ctx = request_context(session, opts)
       budget = budget_status(opts, session, request_ctx)
+      block_reason = request_block_reason(opts, session, request_ctx, budget)
 
       cond do
-        global_exhausted?(opts, request_ctx) ->
+        block_reason == :global ->
           bump_metric(opts, "llm_proxy_compact_block")
 
           json(conn, 429, %{
@@ -4803,7 +4850,7 @@ defmodule Genswarms.LlmProxy.Plug do
             }
           })
 
-        request_quota_exhausted?(opts, budget) ->
+        block_reason == :request_quota ->
           bump_metric(opts, "llm_proxy_compact_block")
 
           json(conn, 429, %{
@@ -4814,14 +4861,25 @@ defmodule Genswarms.LlmProxy.Plug do
             }
           })
 
-        exhausted?(budget) and credit_exhausted?(opts, session) ->
+        block_reason in [:budget_exhausted, :store_unavailable] ->
           bump_metric(opts, "llm_proxy_compact_block")
+
+          if block_reason == :store_unavailable do
+            bump_quota_metric(opts, session, "store_unavailable")
+          end
+
+          {message, code} =
+            if block_reason == :store_unavailable do
+              {"prepaid credit balance temporarily unavailable", "credit_store_unavailable"}
+            else
+              {"daily budget exhausted", "budget_exhausted"}
+            end
 
           json(conn, 429, %{
             error: %{
-              message: "daily budget exhausted",
+              message: message,
               type: "budget",
-              code: "budget_exhausted"
+              code: code
             }
           })
 
@@ -4907,7 +4965,10 @@ defmodule Genswarms.LlmProxy.Plug do
       |> Map.put_new(:default_daily_limit, Proxy.default_daily_limit())
       |> Map.put_new(:swarm_name, "swarm")
       |> Map.put_new(:sender, :sender)
-      |> Map.put_new(:deliver_fn, &Genswarms.Objects.ObjectServer.deliver_message/4)
+      |> Map.put_new(
+        :deliver_fn,
+        Function.capture(Genswarms.Objects.ObjectServer, :deliver_message, 4)
+      )
       |> Map.put_new(:metrics, :metrics)
       # :provider + :prices are read on the hot path (respond_upstream / x_router / cost)
       # but only init/1 supplied them — a direct ProxyPlug.call with a bare opts map would
@@ -5314,7 +5375,6 @@ defmodule Genswarms.LlmProxy.Plug do
   # blank attempt is a REAL upstream call — bill it (status "empty_retry").
   # (X2) `budget` is the full map (spent_usd + limit_usd), threaded through so
   # every discarded-attempt debit sees the same limit_usd the gate saw.
-  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
   # Hostile/garbage upstream token counts ("many", lists, maps) normalize to 0
   # BEFORE any consumer — cost, x_router, and the durable record all see ints
   # (mm hardening; a poisoned count must never crash a host store).
@@ -5331,6 +5391,8 @@ defmodule Genswarms.LlmProxy.Plug do
 
   defp nonneg_int(v) when is_integer(v) and v >= 0, do: v
   defp nonneg_int(_), do: 0
+
+  defp record_discarded_attempts(_opts, _session, _request_ctx, _request, budget, []), do: budget
 
   defp record_discarded_attempts(opts, session, request_ctx, request, budget, discarded) do
     Enum.reduce(discarded, budget, fn %{body: body}, budget_acc ->
@@ -5607,10 +5669,9 @@ defmodule Genswarms.LlmProxy.Plug do
     Decimal.compare(spent || Decimal.new("0"), limit || Proxy.default_daily_limit()) != :lt
   end
 
-  # Credits only matter once the free daily budget is spent: the gate is
-  # exhausted?(budget) AND credit_exhausted?. Reading the balance only on the
-  # already-exhausted path keeps the hot path store-call-free and makes the
-  # no-credits configuration byte-identical to 0.2.19 (balance 0 → true).
+  # Credits only matter once the free daily budget is spent. Reading the balance
+  # only on the already-exhausted path keeps the hot path store-call-free and
+  # makes the no-credits configuration byte-identical to 0.2.19.
   #
   # (B2) Feature-gated on `credits_enabled` (derived from `payments_source`
   # config being present, see init/1): when off, this returns true WITHOUT
@@ -5619,13 +5680,51 @@ defmodule Genswarms.LlmProxy.Plug do
   # hand-credited mirror balance, and enabling payments later must never
   # retro-charge overage accrued while the feature was off.
   @doc false
-  # Public for the credit-spend check: composes with exhausted?/1 in the two cond gates.
+  # Public compatibility predicate for the credit-spend checks. Configured
+  # durable read failures count as exhausted (fail closed).
   def credit_exhausted?(opts, session) do
+    credit_block_reason(opts, session) != nil
+  end
+
+  defp request_block_reason(opts, session, request_ctx, budget) do
+    cond do
+      global_exhausted?(opts, request_ctx) ->
+        :global
+
+      request_quota_exhausted?(opts, budget) ->
+        :request_quota
+
+      exhausted?(budget) ->
+        credit_block_reason(opts, session)
+
+      true ->
+        nil
+    end
+  end
+
+  defp credit_block_reason(opts, session) do
     if Map.get(opts, :credits_enabled, false) do
-      balance = Proxy.credit_balance(opts.state_pid, opts.store_mod, session.budget_identity)
-      Decimal.compare(balance, Decimal.new("0")) != :gt
+      case Proxy.credit_balance_result(
+             opts.state_pid,
+             opts.store_mod,
+             session.budget_identity
+           ) do
+        {:ok, balance} ->
+          if Decimal.compare(balance, Decimal.new("0")) == :gt,
+            do: nil,
+            else: :budget_exhausted
+
+        {:error, reason} ->
+          Logger.error(
+            "llm_proxy: credit balance store read FAILED: #{inspect(reason)} — " <>
+              "blocking paid request (fails closed)"
+          )
+
+          bump_metric(opts, "llm_proxy_budget_degraded")
+          :store_unavailable
+      end
     else
-      true
+      :budget_exhausted
     end
   end
 
@@ -5766,33 +5865,59 @@ defmodule Genswarms.LlmProxy.Plug do
   defp synthetic_block_content(reason, delivery) do
     lead =
       case reason do
-        :budget -> "The daily LLM limit for this conversation was reached."
-        :request_quota -> "This chat reached today's AI usage limit."
-        :global -> "The service-wide daily LLM budget was reached."
+        :budget ->
+          "The daily LLM limit for this conversation was reached."
+
+        :credit_store_unavailable ->
+          "The daily LLM limit was reached, and the prepaid balance is temporarily unavailable; no paid request was sent."
+
+        :request_quota ->
+          "This chat reached today's AI usage limit."
+
+        :global ->
+          "The service-wide daily LLM budget was reached."
       end
 
     tail =
       case delivery do
-        :sent -> "A deterministic Telegram notice was sent; do not send a separate user reply."
-        :suppressed -> "The user was already notified earlier today; do not send a separate user reply."
-        :skipped -> "No user notice was sent by this path."
+        :sent ->
+          "A deterministic Telegram notice was sent; do not send a separate user reply."
+
+        :suppressed ->
+          "The user was already notified earlier today; do not send a separate user reply."
+
+        :skipped ->
+          "No user notice was sent by this path."
       end
 
     lead <> " " <> tail
   end
 
-  defp budget_exhausted_response(conn, session, request_ctx, budget, opts, streaming?) do
-    bump_quota_metric(opts, session, "budget_exhausted")
-    notice = budget_notice(request_ctx, budget, opts, session)
+  defp budget_exhausted_response(
+         conn,
+         session,
+         request_ctx,
+         budget,
+         opts,
+         streaming?,
+         block_reason
+       ) do
+    metric_reason = Atom.to_string(block_reason)
+
+    notice_reason =
+      if block_reason == :store_unavailable, do: :credit_store_unavailable, else: :budget
+
+    bump_quota_metric(opts, session, metric_reason)
+    notice = budget_block_notice(request_ctx, budget, opts, session, block_reason)
 
     # Deterministic Telegram delivery + block metrics are mode-independent; only the
     # HTTP response body differs (SSE chunk vs buffered JSON).
-    delivery = block_notice_delivery(opts, session, request_ctx, :budget, notice)
+    delivery = block_notice_delivery(opts, session, request_ctx, notice_reason, notice)
     if delivery == :sent, do: bump_metric(opts, "llm_proxy_budget_block_notified")
 
     bump_metric(opts, "llm_proxy_budget_block")
     emit_display(%{kind: :llm_proxy_block, cid: session.conversation_id, reason: "budget"})
-    content = synthetic_block_content(:budget, delivery)
+    content = synthetic_block_content(notice_reason, delivery)
 
     if streaming? do
       budget_exhausted_sse(conn, request_ctx, content)
@@ -6067,6 +6192,15 @@ defmodule Genswarms.LlmProxy.Plug do
     [base, held, if(is_nil(held), do: topup_hint(opts, session))]
     |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
+  end
+
+  defp budget_block_notice(_request_ctx, _budget, _opts, _session, :store_unavailable) do
+    "⏳ This chat reached its daily LLM limit. The prepaid balance is temporarily " <>
+      "unavailable, so no paid request was sent. Please try again later."
+  end
+
+  defp budget_block_notice(request_ctx, budget, opts, session, :budget_exhausted) do
+    budget_notice(request_ctx, budget, opts, session)
   end
 
   # One sentence, appended at most once no matter how many holds the identity
