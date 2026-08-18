@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Upstream decode failures now report the REAL HTTP status and a bounded,
+  scrubbed snippet of the body instead of collapsing to a bare
+  "upstream returned non-JSON response". That message was the only record of
+  what the upstream said — `respond_upstream` stores just the error `code` as
+  the row status and nothing logs the raw response — so an nginx `413` HTML
+  page, a plain-text edge `error code: 502`, and a `200` with an empty body
+  were indistinguishable to an operator. The snippet is scrubbed of the
+  upstream key and passed through `sanitize_log/1` (strips CR/LF/C0, caps at
+  220 bytes). The error `code` stays `upstream_invalid_json`, so stored row
+  statuses and any query over them are unchanged.
+
 ## 0.4.1 — 2026-07-28
 
 - Prepaid-credit balance reads now fail closed when a host has configured the
