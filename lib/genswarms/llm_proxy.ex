@@ -5493,7 +5493,9 @@ defmodule Genswarms.LlmProxy.Plug do
               {:ok, status, resp_body} ->
                 case decode_upstream_body(resp_body) do
                   {:ok, decoded} -> {:ok, status, decoded}
-                  {:error, reason} -> {:error, 502, upstream_decode_error(reason)}
+                  {:error, reason} ->
+                    {:error, 502,
+                     upstream_decode_error(reason, status, resp_body, opts.upstream_api_key)}
                 end
 
               {:error, reason} ->
@@ -5588,18 +5590,31 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
-  defp upstream_decode_error(:non_object_json) do
-    upstream_decode_error("upstream returned non-object JSON")
-  end
+  # An undecodable body is the ONE upstream outcome whose real HTTP status and
+  # content reach no other record: `respond_upstream` stores only this map's
+  # "code" as the row status, and nothing logs the raw response. So a nginx 413
+  # HTML page, a plain-text edge `error code: 502`, and a 200 with an empty body
+  # all collapse into one indistinguishable message — an operator cannot tell a
+  # payload-too-large from a gateway failure from an empty completion. Carry the
+  # status and a bounded snippet so the failure names itself.
+  #
+  # The snippet is scrubbed of the upstream key and passed through sanitize_log/1
+  # (strips CR/LF/C0 — CWE-117 — and caps at 220 bytes). Public for checks.
+  @doc false
+  def upstream_decode_error(reason, status, body, key) do
+    wording =
+      if reason == :non_object_json,
+        do: "upstream returned non-object JSON",
+        else: "upstream returned non-JSON response"
 
-  defp upstream_decode_error(:non_json) do
-    upstream_decode_error("upstream returned non-JSON response")
-  end
+    snippet =
+      if is_binary(body) and body != "",
+        do: sanitize_log(scrub_secret(body, key)),
+        else: "empty body"
 
-  defp upstream_decode_error(message) do
     %{
       "error" => %{
-        "message" => message,
+        "message" => "#{wording} (HTTP #{status}): #{snippet}",
         "type" => "upstream_error",
         "code" => "upstream_invalid_json"
       }
