@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 — 2026-08-21
 
 - Upstream decode failures now report the REAL HTTP status and a bounded,
   scrubbed snippet of the body instead of collapsing to a bare
