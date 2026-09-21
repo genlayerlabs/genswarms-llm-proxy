@@ -565,3 +565,37 @@ apps — the package ships the seam, the host proves its adapter.
 
 `bandit`/`plug`/`jason`/`decimal` (mix), `curl` on PATH, and — at runtime only —
 the genswarms engine modules of the host BEAM.
+
+### Private I/O traces (opt-in)
+
+Set `trace_store_mod: MyApp.TraceStore` on the object. The module must implement
+`record_llm_trace(event)` and return `:ok` only after durable persistence. This is
+separate from the metering `store_mod`; existing applications are unchanged.
+
+The versioned `genswarms.llm-trace/1` event contains a server-generated `trace_id`,
+monotonic per-call `seq`, authenticated `identity`, optional client-label
+`correlation` from `x-agent-turn-id`, timestamp, type and data. Ownership comes
+from the registered session, never the body or correlation label. Events cover
+request, each forwarded attempt, original HTTP response before decoding, parsed
+upstream result, and final proxy response. Curl failures retain received partial
+bytes when curl supplies them. Provider-side fallback internals are only as
+complete as the upstream router's returned trace.
+
+Request capture must succeed before dispatch. A sink error latches admission
+closed in the proxy state; repair storage and restart the proxy to reset it.
+A post-call capture failure never triggers a new model call or changes a paid
+result into an automatic retry: the response carries `x-llm-trace-status:
+incomplete`, and new calls are blocked. Successful responses carry `complete`
+and `x-llm-trace-id`. Metering remains on its existing path.
+
+This first capture interface supports **buffered chat and compact requests**.
+When capture is enabled, streaming requests are explicitly rejected before
+spend, rather than falsely reported as captured. Interrupted requests can have
+an initial record without a terminal record. A host must expose these as
+incomplete, not silently reissue them.
+
+Payloads are sensitive: keep the sink and reader private, exclude them from
+public object/dashboard projections, and apply retention at the host. Known
+transport credentials and credential-named fields are redacted. Tracing does
+not grant access to undisclosed internal model reasoning. No payload logging is
+added to application logs or metrics.

@@ -281,6 +281,7 @@ defmodule Genswarms.LlmProxy do
         Map.get(config, :pricing_version) ||
           if(pricing_mode == :cost_plus, do: "cost_plus_v1", else: "rate_card_v1"),
       store_mod: module_ref(Map.get(config, :store_mod)),
+      trace_store_mod: module_ref(Map.get(config, :trace_store_mod)),
       default_daily_limit: decimal(Map.get(config, :default_daily_limit, @default_daily_limit)),
       # Operator-wide daily USD ceiling across ALL conversations (0 = disabled). Per-conversation
       # budgets don't bound aggregate spend, so N Sybil conversations = N × the per-conv cap with no
@@ -4670,7 +4671,10 @@ defmodule Genswarms.LlmProxy.Plug do
 
   plug(:match)
   plug(Plug.Parsers, parsers: [:json], pass: ["application/json"], json_decoder: Jason)
+  plug(:capture_trace)
   plug(:dispatch)
+
+  defp capture_trace(conn, opts), do: Genswarms.LlmProxy.Trace.prepare(conn, opts)
 
   get "/healthz" do
     json(conn, 200, %{ok: true})
@@ -5106,7 +5110,8 @@ defmodule Genswarms.LlmProxy.Plug do
   # Exposed @doc false so retry tests can drive this directly without Plug overhead.
   @doc false
   def call_upstream(body, opts, request_ctx) do
-    upstream = Map.get(opts, :upstream, &__MODULE__.http_upstream/3)
+    upstream =
+      Genswarms.LlmProxy.Trace.wrap(Map.get(opts, :upstream, &__MODULE__.http_upstream/3), opts)
     body = Map.put(body, "session", request_ctx.session_id)
 
     # Kill switch (LLM_PROXY_PROMPT_CACHE=0 → prompt_cache: false): the marking's
@@ -5160,7 +5165,8 @@ defmodule Genswarms.LlmProxy.Plug do
   # no body "session" injection (CompactRequest is a strict schema) and no
   # prompt-cache marking (the seal deliberately rewrites the aged middle).
   defp compact_upstream(body, opts, request_ctx) do
-    upstream = Map.get(opts, :upstream, &__MODULE__.http_upstream/3)
+    upstream =
+      Genswarms.LlmProxy.Trace.wrap(Map.get(opts, :upstream, &__MODULE__.http_upstream/3), opts)
 
     headers = [
       {"content-type", "application/json"},
@@ -5491,6 +5497,7 @@ defmodule Genswarms.LlmProxy.Plug do
           {out, 0} ->
             case Genswarms.LlmProxy.Curl.parse_response(out) do
               {:ok, status, resp_body} ->
+                Genswarms.LlmProxy.Trace.emit(opts, "upstream_wire_response", %{status: status, body: resp_body})
                 case decode_upstream_body(resp_body) do
                   {:ok, decoded} -> {:ok, status, decoded}
                   {:error, reason} ->
@@ -5502,7 +5509,8 @@ defmodule Genswarms.LlmProxy.Plug do
                 {:error, reason}
             end
 
-          {_out, code} ->
+          {out, code} ->
+            Genswarms.LlmProxy.Trace.emit(opts, "upstream_partial_response", %{curl_exit: code, body: out})
             {:error, {:curl, code}}
         end
       after
@@ -5982,7 +5990,7 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp global_exhausted_json(conn, request_ctx, opts, global, content) do
-    request_id = request_id()
+    request_id = get_in(opts, [:trace_context, :id]) || request_id()
 
     json(conn, 200, %{
       "id" => "chatcmpl-#{request_id}",
@@ -6099,7 +6107,7 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp budget_exhausted_json(conn, request_ctx, budget, opts, content) do
-    request_id = request_id()
+    request_id = get_in(opts, [:trace_context, :id]) || request_id()
 
     json(conn, 200, %{
       "id" => "chatcmpl-#{request_id}",
@@ -6133,7 +6141,7 @@ defmodule Genswarms.LlmProxy.Plug do
   end
 
   defp request_quota_exhausted_json(conn, request_ctx, budget, opts, limit, content) do
-    request_id = request_id()
+    request_id = get_in(opts, [:trace_context, :id]) || request_id()
 
     json(conn, 200, %{
       "id" => "chatcmpl-#{request_id}",
@@ -6446,7 +6454,7 @@ defmodule Genswarms.LlmProxy.Plug do
       executed_cost_usd(usage, opts, upstream_router, budget.spent_usd)
 
     if invalid?, do: bump_metric(opts, "llm_proxy_cost_invalid")
-    request_id = request_id()
+    request_id = get_in(opts, [:trace_context, :id]) || request_id()
     {cached_tokens, non_cached_tokens} = Proxy.cache_split(usage, upstream_router)
 
     record = %{
@@ -6498,7 +6506,7 @@ defmodule Genswarms.LlmProxy.Plug do
     message = scrub_secret(Map.get(err, "message") || "upstream error", opts.upstream_api_key)
     upstream_router = upstream_router(Map.get(body, "x_router"))
     model = served_model(upstream_router, %{}, conn.body_params)
-    request_id = request_id()
+    request_id = get_in(opts, [:trace_context, :id]) || request_id()
 
     # Money the router billed is never invisible — the same invariant
     # compact_record/4 holds for failed seals. A router can bill a partial call
