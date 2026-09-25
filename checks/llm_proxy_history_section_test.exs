@@ -77,9 +77,9 @@ defmodule GenswarmsLlmProxyHistorySectionTest do
     assert section(ext, "History") == nil
   end
 
-  test "a raising store contributes no history section (never a crashed snapshot)" do
+  test "a raising store contributes an unavailable history section (never a crashed snapshot)" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RaisingStore)
-    assert section(ext, "History") == nil
+    assert section(ext, "History")["meta"] =~ "unavailable"
     assert page(ext) != nil
   end
 end

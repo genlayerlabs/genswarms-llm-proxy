@@ -107,9 +107,12 @@ defmodule GenswarmsLlmProxyPeriodTabsTest do
     assert flat_users_table(ext) != nil
   end
 
-  test "a raising store falls back to the flat table (never a crashed snapshot)" do
+  test "a raising store preserves tabs with unavailable periods" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: RaisingPeriodStore)
-    assert tabs_section(ext) == nil
-    assert flat_users_table(ext) != nil
+    assert flat_users_table(ext) == nil
+
+    for tab <- tl(tabs_section(ext)["tabs"]) do
+      assert tab["section"]["meta"] =~ "unavailable"
+    end
   end
 end

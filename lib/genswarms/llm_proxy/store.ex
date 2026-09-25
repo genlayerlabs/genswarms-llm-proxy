@@ -46,6 +46,25 @@ defmodule Genswarms.LlmProxy.Store do
   @doc "Per-budget usage rows for `day` (dashboard extension), capped at `limit` rows."
   @callback llm_usage_by_budget(Date.t(), pos_integer()) :: {:ok, [map()]} | {:error, term()}
 
+  @doc """
+  Complete UTC-day dashboard aggregates across all budget identities, independent
+  of detail-table limits. Money is summed as Decimal before presentation rounding.
+  A missing callback or failed read renders complete totals unavailable; a bounded
+  detail list is never a fallback for this summary. Budget identities are not
+  verified unique people.
+  """
+  @callback llm_usage_summary(Date.t()) ::
+              {:ok,
+               %{
+                 budgets: non_neg_integer(),
+                 requests: non_neg_integer(),
+                 prompt_tokens: non_neg_integer(),
+                 total_tokens: non_neg_integer(),
+                 cached_tokens: non_neg_integer(),
+                 spent_usd: Decimal.t()
+               }}
+              | {:error, term()}
+
   @doc "All usage rows for `day` (operator/debug surface)."
   @callback list_llm_usage(Date.t()) :: {:ok, [map()]} | {:error, term()}
 
@@ -267,6 +286,7 @@ defmodule Genswarms.LlmProxy.Store do
                       llm_usage_for_budget: 3,
                       llm_usage_today: 1,
                       llm_usage_by_budget: 2,
+                      llm_usage_summary: 1,
                       list_llm_usage: 1,
                       llm_credit_balance: 1,
                       record_llm_credit_entry: 1,

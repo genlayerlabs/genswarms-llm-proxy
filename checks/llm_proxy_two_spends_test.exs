@@ -245,7 +245,7 @@ defmodule GenswarmsLlmProxyTwoSpendsTest do
     assert costs["meta"] == "same-scope UTC day"
     user = Enum.find(costs["items"], &(&1["label"] == "User charges"))
     router = Enum.find(costs["items"], &(&1["label"] == "Router cost"))
-    assert user["value"] == "$0.00"
+    assert user["value"] == "unavailable"
     assert router["value"] == "$0.92"
     assert router["sub"] == "router estimate · updated 13:42 UTC"
     assert router["wrap_sub"] == true

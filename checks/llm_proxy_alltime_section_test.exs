@@ -316,9 +316,9 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert item(comparable, "Coverage")["value"] == "Mismatch"
   end
 
-  test "nil usage (empty / persistence-off store) contributes no all-time section" do
+  test "nil usage is unavailable, not an empty ledger" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeEmptyStore)
-    assert section(ext, "All-time") == nil
+    assert section(ext, "All-time")["meta"] =~ "unavailable"
   end
 
   test "a store without the contract contributes no all-time section" do
@@ -326,9 +326,9 @@ defmodule GenswarmsLlmProxyAlltimeSectionTest do
     assert section(ext, "All-time") == nil
   end
 
-  test "a raising store contributes no all-time section (never a crashed snapshot)" do
+  test "a raising store marks all-time usage unavailable" do
     ext = Proxy.dashboard_extension(state_pid: dead_state(), store_mod: AlltimeRaisingStore)
-    assert section(ext, "All-time") == nil
+    assert section(ext, "All-time")["meta"] =~ "unavailable"
   end
 
   test "history window is 30 days" do

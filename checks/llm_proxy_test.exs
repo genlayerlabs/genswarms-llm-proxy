@@ -582,7 +582,7 @@ dashboard_row = dashboard_table["rows"] |> hd()
 check.(
   "dashboard extension publishes a generic proxy-router page with per-user spend and unmapped budget ids",
   dashboard_ext["proxy_router"]["requests"] == 1 and
-    dashboard_table["meta"] == "unmapped rows come from budget hashes" and
+    String.contains?(dashboard_table["meta"], "up to 100 budget identities") and
     dashboard_page["id"] == "proxy-router" and
     dashboard_row["user"] == "@alice · Alice" and
     dashboard_row["spent"] == "$0.0001" and
@@ -696,7 +696,7 @@ durable_dashboard_row = durable_dashboard_table["rows"] |> hd()
 
 check.(
   "dashboard extension can label durable Postgres rows after proxy restart via budget identity map",
-  durable_dashboard_ext["proxy_router"]["source"] == "postgres" and
+  durable_dashboard_ext["proxy_router"]["source"] == "unavailable" and
     durable_dashboard_row["user"] == "@alice · Alice" and
     durable_dashboard_row["spent"] == "$0.0001"
 )
