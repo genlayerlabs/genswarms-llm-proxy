@@ -3323,7 +3323,7 @@ defmodule Genswarms.LlmProxy do
         "spent_usd" => if(totals.spent_usd, do: Decimal.to_float(totals.spent_usd)),
         "available" => source != "unavailable",
         "default_daily_limit_usd" => default_daily_limit_usd,
-        "health_rules" => @health_rules
+        "health_rules" => if(source == "unavailable", do: [], else: @health_rules)
       },
       "proxy_router" => %{
         "day" => Date.to_iso8601(day),
@@ -3636,6 +3636,8 @@ defmodule Genswarms.LlmProxy do
           }
         ] ++ List.wrap(router_alltime_item(router))
     }
+  rescue
+    _ -> unavailable_section("Lifetime costs")
   end
 
   defp alltime_usage_section(u) do
@@ -3659,6 +3661,8 @@ defmodule Genswarms.LlmProxy do
         }
       ]
     }
+  rescue
+    _ -> unavailable_section("All-time usage")
   end
 
   defp financials_sections(financials) do
@@ -3670,6 +3674,8 @@ defmodule Genswarms.LlmProxy do
 
     List.wrap(if(legacy_history?, do: historical_costs_section(financials))) ++
       List.wrap(if(authoritative, do: comparable_costs_section(financials)))
+  rescue
+    _ -> [unavailable_section("Accounting")]
   end
 
   defp historical_costs_section(financials) do
@@ -3692,14 +3698,14 @@ defmodule Genswarms.LlmProxy do
       "items" => [
         %{
           "label" => "Repriced user total",
-          "value" => "$" <> money2(user_total),
+          "value" => dashboard_money2(user_total),
           "sub" => "archive-backed replay included",
           "title" => "Reconstructed user ledger total; not a literal pre-proxy charge",
           "wrap_sub" => true
         },
         %{
           "label" => "Router evidence",
-          "value" => "$" <> money2(router_total),
+          "value" => dashboard_money2(router_total),
           "sub" => "legacy shared-key estimates",
           "title" => "Router total from a different historical population; do not subtract",
           "wrap_sub" => true
@@ -3716,11 +3722,10 @@ defmodule Genswarms.LlmProxy do
       end
 
     margin_pct =
-      financials
-      |> Map.get(:gross_margin_pct, Decimal.new(0))
-      |> decimal()
-      |> Decimal.round(1)
-      |> Decimal.to_string(:normal)
+      case Map.get(financials, :gross_margin_pct) do
+        nil -> "percentage unavailable"
+        amount -> (amount |> Decimal.round(1) |> Decimal.to_string(:normal)) <> "% of router cost"
+      end
 
     reconciled = financials_reconciled?(financials)
 
@@ -3751,12 +3756,12 @@ defmodule Genswarms.LlmProxy do
           "label" => "Cost-plus margin",
           "value" =>
             if(reconciled,
-              do: "$" <> money2(Map.get(financials, :gross_margin_usd)),
+              do: dashboard_money2(Map.get(financials, :gross_margin_usd)),
               else: "—"
             ),
           "sub" =>
             if(reconciled,
-              do: margin_pct <> "% of router cost",
+              do: margin_pct,
               else: "withheld until coverage matches"
             ),
           "tone" => margin_tone(financials, reconciled),
@@ -3811,11 +3816,16 @@ defmodule Genswarms.LlmProxy do
 
   defp margin_tone(_financials, false), do: nil
 
-  defp margin_tone(financials, true) do
-    if Decimal.compare(decimal(Map.get(financials, :gross_margin_usd)), 0) == :lt,
+  defp margin_tone(%{gross_margin_usd: %Decimal{} = margin}, true) do
+    if Decimal.compare(margin, 0) == :lt,
       do: "warn",
       else: nil
   end
+
+  defp margin_tone(_, true), do: nil
+
+  defp dashboard_money2(nil), do: "unavailable"
+  defp dashboard_money2(amount), do: "$" <> money2(amount)
 
   defp financials_reconciled?(financials) do
     reported = Map.get(financials, :reconciled)
@@ -3887,7 +3897,22 @@ defmodule Genswarms.LlmProxy do
             {[], [:cost_usd]}
         end
 
-      if valid_dashboard_numbers?(result, counts, amounts), do: result, else: :unavailable
+      optional_amounts =
+        if fun == :llm_financials_alltime,
+          do: [
+            :lifetime_spent_usd,
+            :lifetime_router_cost_usd,
+            :gross_margin_usd,
+            :gross_margin_pct
+          ],
+          else: []
+
+      if valid_dashboard_numbers?(result, counts, amounts) and
+           valid_optional_dashboard_numbers?(
+             result,
+             [:days, :ledger_requests, :router_requests, :ledger_tokens, :router_tokens],
+             optional_amounts
+           ), do: result, else: :unavailable
     end
   rescue
     _ -> :unavailable
@@ -3901,6 +3926,14 @@ defmodule Genswarms.LlmProxy do
   end
 
   defp valid_dashboard_numbers?(_, _, _), do: false
+
+  defp valid_optional_dashboard_numbers?(row, counts, amounts) do
+    valid_dashboard_numbers?(
+      row,
+      Enum.reject(counts, &is_nil(row[&1])),
+      Enum.reject(amounts, &is_nil(row[&1]))
+    )
+  end
 
   defp history_section([]), do: nil
   defp history_section(rows) when not is_list(rows), do: unavailable_section("History")
@@ -3916,7 +3949,8 @@ defmodule Genswarms.LlmProxy do
             &1,
             [:budgets, :requests, :total_tokens, :prompt_tokens, :cached_tokens],
             [:spent_usd]
-          ) and match?(%Date{}, &1[:day]))
+          ) and valid_optional_dashboard_numbers?(&1, [], [:router_cost_usd]) and
+            match?(%Date{}, &1[:day]))
       )
 
     with_router? = Enum.any?(day_rows, &(not is_nil(Map.get(&1, :router_cost_usd))))

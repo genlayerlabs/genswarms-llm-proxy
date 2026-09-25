@@ -158,4 +158,125 @@ defmodule ProxyReliabilityTest do
   test "501 requests exceed the old 500-row read" do
     assert metric(extension(), "Requests") == 501
   end
+
+  defp financials do
+    %{
+      spent_usd: Decimal.new(13),
+      router_cost_usd: Decimal.new(10),
+      gross_margin_usd: Decimal.new(3),
+      gross_margin_pct: Decimal.new(30),
+      authoritative: true,
+      reconciled: true,
+      days: 1,
+      legacy_router_included: true
+    }
+  end
+
+  defp section(ext, title), do: Enum.find(sections(ext), &(&1["title"] == title))
+
+  test "malformed optional financial amounts cannot become zero" do
+    for key <- [
+          :lifetime_spent_usd,
+          :lifetime_router_cost_usd,
+          :gross_margin_usd,
+          :gross_margin_pct
+        ],
+        bad <- ["bad", Decimal.new("NaN"), Decimal.new("Infinity")] do
+      Process.put(:financials, Map.put(financials(), key, bad))
+      ext = extension()
+      assert section(ext, "Accounting")["meta"] =~ "unavailable"
+      assert metric(ext, "Requests") == 501
+    end
+  end
+
+  test "missing margin amounts stay unavailable instead of fabricated zero" do
+    for key <- [:gross_margin_usd, :gross_margin_pct] do
+      Process.put(:financials, Map.delete(financials(), key))
+      ext = extension()
+
+      margin =
+        section(ext, "Comparable accounting")["items"]
+        |> Enum.find(&(&1["label"] == "Cost-plus margin"))
+
+      if key == :gross_margin_usd do
+        assert margin["value"] == "unavailable"
+      else
+        assert margin["value"] == "$3.00"
+        assert margin["sub"] =~ "unavailable"
+      end
+
+      assert metric(ext, "Requests") == 501
+    end
+  end
+
+  test "optional nil amounts remain unavailable while absent lifetime fields use legacy totals" do
+    Process.put(:financials, financials())
+    assert metric(extension(), "Repriced user total") == "$13.00"
+
+    for key <- [
+          :lifetime_spent_usd,
+          :lifetime_router_cost_usd,
+          :gross_margin_usd,
+          :gross_margin_pct
+        ] do
+      Process.put(:financials, Map.put(financials(), key, nil))
+      ext = extension()
+      refute section(ext, "Accounting")
+
+      label =
+        case key do
+          :lifetime_spent_usd -> "Repriced user total"
+          :lifetime_router_cost_usd -> "Router evidence"
+          _ -> "Cost-plus margin"
+        end
+
+      if key == :gross_margin_pct do
+        margin =
+          section(ext, "Comparable accounting")["items"] |> Enum.find(&(&1["label"] == label))
+
+        assert margin["sub"] =~ "unavailable"
+      else
+        assert metric(ext, label) == "unavailable"
+      end
+    end
+  end
+
+  test "malformed accounting metadata does not hide healthy today sections" do
+    {:ok, usage} = ReliabilityProxyStore.llm_usage_summary(Date.utc_today())
+    Process.put(:alltime, Map.put(usage, :days, %{}))
+    Process.put(:financials, Map.put(financials(), :days, %{}))
+    ext = extension()
+    assert metric(ext, "Requests") == 501
+    assert section(ext, "All-time usage")["meta"] =~ "unavailable"
+    assert section(ext, "Accounting")["meta"] =~ "unavailable"
+  end
+
+  test "history rejects malformed optional router amounts but accepts nil" do
+    {:ok, row} = ReliabilityProxyStore.llm_usage_summary(Date.utc_today())
+    row = Map.put(row, :day, Date.utc_today())
+
+    for bad <- ["bad", Decimal.new("NaN"), Decimal.new("Infinity")] do
+      Process.put(:history, [Map.put(row, :router_cost_usd, bad)])
+      ext = extension()
+      assert section(ext, "History")["meta"] =~ "unavailable"
+      assert metric(ext, "Requests") == 501
+    end
+
+    Process.put(:history, [
+      Map.put(row, :router_cost_usd, nil),
+      Map.put(row, :router_cost_usd, Decimal.new(1))
+    ])
+
+    history = section(extension(), "History · last 30 UTC days")
+    assert hd(history["rows"])["router"] == "—"
+  end
+
+  test "unavailable summary publishes no arithmetic health rules" do
+    Process.put(:summary, {:error, :unavailable})
+    ext = extension()
+    assert ext["llm_proxy_budget"]["health_rules"] == []
+    assert ext["llm_proxy_budget"]["available"] == false
+    assert ext["llm_proxy_budget"]["spent_usd"] == nil
+    assert extension(ReliabilityProxyLegacyStore)["llm_proxy_budget"]["health_rules"] == []
+  end
 end
