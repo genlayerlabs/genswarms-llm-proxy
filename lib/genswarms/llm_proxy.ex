@@ -3254,7 +3254,7 @@ defmodule Genswarms.LlmProxy do
 
   The proxy owns the accounting details; the dashboard only renders the returned
   page grammar. Durable Postgres rows win when available. The in-memory mirror is
-  used as a live fallback when the store is disabled/down.
+  used only when no durable store is configured. Failed durable reads remain unavailable.
   """
   def dashboard_extension(opts \\ []) do
     day = Keyword.get(opts, :day, Date.utc_today())
@@ -3295,7 +3295,7 @@ defmodule Genswarms.LlmProxy do
     sessions = dashboard_sessions(state_pid)
 
     rows = dashboard_rows(usage_rows, sessions, users_by_cid, users_by_budget, origins_by_budget)
-    totals = dashboard_totals(usage_rows)
+    {totals, source} = dashboard_summary(store_mod, day, usage_rows, source)
     router_today = probe_map(store_mod, :llm_router_cost_today)
 
     quota = dashboard_quota(state_pid)
@@ -3310,9 +3310,9 @@ defmodule Genswarms.LlmProxy do
       # mm vocabulary: uncapped budget count + requests at "llm_proxy" (the table
       # below stays capped at 100 rows for display — count and display differ).
       "llm_proxy" => %{
-        "budgets" => length(usage_rows),
+        "budgets" => totals.budgets,
         "requests" => totals.requests,
-        "spent_usd" => money(totals.spent_usd)
+        "spent_usd" => if(totals.spent_usd, do: money(totals.spent_usd))
       },
       # Machine block (v1) for the observer's generic health_rules evaluator — numeric
       # twins of the "llm_proxy"/"proxy_router" strings above, PLUS the shipped
@@ -3320,17 +3320,18 @@ defmodule Genswarms.LlmProxy do
       "llm_proxy_budget" => %{
         "v" => 1,
         "ceiling_usd" => ceiling_usd,
-        "spent_usd" => totals.spent_usd |> decimal() |> Decimal.to_float(),
+        "spent_usd" => if(totals.spent_usd, do: Decimal.to_float(totals.spent_usd)),
+        "available" => source != "unavailable",
         "default_daily_limit_usd" => default_daily_limit_usd,
-        "health_rules" => @health_rules
+        "health_rules" => if(source == "unavailable", do: [], else: @health_rules)
       },
       "proxy_router" => %{
         "day" => Date.to_iso8601(day),
         "source" => source,
-        "users" => length(rows),
+        "budgets" => totals.budgets,
         "requests" => totals.requests,
         "total_tokens" => totals.total_tokens,
-        "spent_usd" => money(totals.spent_usd)
+        "spent_usd" => if(totals.spent_usd, do: money(totals.spent_usd))
       },
       "dashboard_pages" => [
         %{
@@ -3351,13 +3352,23 @@ defmodule Genswarms.LlmProxy do
                 "span" => "half",
                 "meta" => source,
                 "items" => [
-                  %{"label" => "Users", "value" => length(rows)},
-                  %{"label" => "Budgets", "value" => length(usage_rows)},
-                  %{"label" => "Requests", "value" => totals.requests},
-                  %{"label" => "Tokens", "value" => compact_count(totals.total_tokens)},
+                  %{"label" => "Budget identities", "value" => available_value(totals.budgets)},
+                  %{"label" => "Requests", "value" => available_value(totals.requests)},
+                  %{
+                    "label" => "Tokens",
+                    "value" =>
+                      if(totals.total_tokens,
+                        do: compact_count(totals.total_tokens),
+                        else: "unavailable"
+                      )
+                  },
                   %{
                     "label" => "Cache",
-                    "value" => cache_rate(totals.cached_tokens, totals.prompt_tokens)
+                    "value" =>
+                      if(totals.prompt_tokens,
+                        do: cache_rate(totals.cached_tokens, totals.prompt_tokens),
+                        else: "unavailable"
+                      )
                   }
                 ]
               }
@@ -3383,18 +3394,8 @@ defmodule Genswarms.LlmProxy do
   # Per-model breakdown (ported from mm's dashboard-llm-telemetry): durable only —
   # aggregated by the store's llm_usage_by_model/1; nil (section omitted) when the
   # store doesn't export it or has no per-model data.
-  defp dashboard_model_rows(store_mod, day) do
-    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
-         function_exported?(store_mod, :llm_usage_by_model, 1) do
-      store_mod.llm_usage_by_model(day)
-    else
-      []
-    end
-  rescue
-    _ -> []
-  catch
-    _, _ -> []
-  end
+  defp dashboard_model_rows(store_mod, day),
+    do: dashboard_list(store_mod, :llm_usage_by_model, [day])
 
   defp today_costs_section(totals, source, router_today) do
     %{
@@ -3407,9 +3408,14 @@ defmodule Genswarms.LlmProxy do
         [
           %{
             "label" => "User charges",
-            "value" => "$" <> money2(totals.spent_usd),
+            "value" =>
+              if(totals.spent_usd, do: "$" <> money2(totals.spent_usd), else: "unavailable"),
             "sub" =>
-              if(source == "postgres", do: "durable proxy ledger", else: "live memory fallback"),
+              case source do
+                "postgres" -> "durable proxy ledger"
+                "memory" -> "live memory only"
+                _ -> "complete aggregate unavailable"
+              end,
             "title" => "User charges accrued by the proxy today",
             "wrap_sub" => true
           }
@@ -3434,6 +3440,7 @@ defmodule Genswarms.LlmProxy do
     }
   end
 
+  defp router_cost_item(:unavailable), do: %{"label" => "Router cost", "value" => "unavailable"}
   defp router_cost_item(_), do: nil
 
   defp router_cost_sub(row) do
@@ -3453,18 +3460,36 @@ defmodule Genswarms.LlmProxy do
   # `store_mod.llm_usage_days/1` returns day aggregates across ALL budgets
   # (%{day, budgets, requests, prompt_tokens, total_tokens, cached_tokens,
   # spent_usd}). Same fail-open discipline as the By-model section: an absent
-  # function or a raising store contributes nothing, never a crashed snapshot.
-  defp dashboard_history_rows(store_mod, days) do
-    if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
-         function_exported?(store_mod, :llm_usage_days, 1) do
-      store_mod.llm_usage_days(days)
-    else
-      []
-    end
+  # function contributes nothing; failed reads render unavailable independently.
+  defp dashboard_history_rows(store_mod, days),
+    do: dashboard_list(store_mod, :llm_usage_days, [days])
+
+  # Each source fails independently. Older stores may return a bare list.
+  defp dashboard_list(store, fun, args) do
+    result =
+      if is_atom(store) and not is_nil(store) and Code.ensure_loaded?(store) and
+           function_exported?(store, fun, length(args)), do: apply(store, fun, args), else: []
+
+    rows =
+      case result do
+        {:ok, rows} -> rows
+        rows -> rows
+      end
+
+    if is_list(rows) and Enum.all?(rows, &is_map/1), do: rows, else: :unavailable
   rescue
-    _ -> []
+    _ -> :unavailable
   catch
-    _, _ -> []
+    _, _ -> :unavailable
+  end
+
+  defp unavailable_section(title) do
+    %{
+      "type" => "metrics",
+      "title" => title,
+      "meta" => "unavailable — source read failed or unsupported",
+      "items" => [%{"label" => "Status", "value" => "unavailable"}]
+    }
   end
 
   @today_users_columns [
@@ -3496,14 +3521,14 @@ defmodule Genswarms.LlmProxy do
   # The Users table, as period tabs when the host store exposes
   # `llm_usage_by_budget_since/2` (days | :all, limit) — Today keeps the live
   # day's limit/status semantics; 7/30/all-time aggregate the durable history.
-  # Absent contract or a raising store falls back to the classic flat table
-  # (never a crashed snapshot, and never an empty Users panel).
+  # Absent contracts keep the classic flat table; a failed period remains an
+  # unavailable tab without hiding other periods.
   defp users_section(store_mod, rows, sessions, users_by_cid, users_by_budget, origins_by_budget) do
     if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
          function_exported?(store_mod, :llm_usage_by_budget_since, 2) do
       period_tabs =
         Enum.map(@period_tabs, fn {label, window} ->
-          usage = store_mod.llm_usage_by_budget_since(window, 100)
+          usage = dashboard_list(store_mod, :llm_usage_by_budget_since, [window, 100])
 
           %{
             "label" => label,
@@ -3545,9 +3570,13 @@ defmodule Genswarms.LlmProxy do
     %{
       "type" => "table",
       "title" => "Users",
-      "meta" => meta,
+      "meta" =>
+        if(is_list(rows),
+          do: "up to 100 budget identities · " <> meta,
+          else: "unavailable — detail read failed or unsupported"
+        ),
       "columns" => columns,
-      "rows" => rows
+      "rows" => if(is_list(rows), do: rows, else: [])
     }
   end
 
@@ -3555,25 +3584,33 @@ defmodule Genswarms.LlmProxy do
   # deliberately separate sections. Lifetime reconstructed totals must never sit
   # beside a same-scope margin in a way that invites subtracting unlike populations.
   defp alltime_sections(store_mod, totals, source, router_today) do
-    today_costs = today_costs_section(totals, source, router_today)
+    usage = probe_map(store_mod, :llm_usage_alltime)
+    financials = probe_map(store_mod, :llm_financials_alltime)
 
-    case probe_map(store_mod, :llm_usage_alltime) do
-      %{} = u ->
-        case probe_map(store_mod, :llm_financials_alltime) do
-          %{} = financials ->
-            [alltime_usage_section(u), today_costs] ++ financials_sections(financials)
+    usage_sections =
+      case usage do
+        %{} -> [alltime_usage_section(usage)]
+        :unavailable -> [unavailable_section("All-time usage")]
+        _ -> []
+      end
 
-          _ ->
-            [
-              alltime_usage_section(u),
-              today_costs,
-              legacy_lifetime_costs_section(u, probe_map(store_mod, :llm_router_cost_alltime))
-            ]
-        end
+    costs =
+      case financials do
+        %{} ->
+          financials_sections(financials)
 
-      _ ->
-        [today_costs]
-    end
+        :unavailable ->
+          [unavailable_section("Accounting")]
+
+        _ ->
+          if is_map(usage),
+            do: [
+              legacy_lifetime_costs_section(usage, probe_map(store_mod, :llm_router_cost_alltime))
+            ],
+            else: []
+      end
+
+    usage_sections ++ [today_costs_section(totals, source, router_today)] ++ costs
   end
 
   defp legacy_lifetime_costs_section(u, router) do
@@ -3599,6 +3636,8 @@ defmodule Genswarms.LlmProxy do
           }
         ] ++ List.wrap(router_alltime_item(router))
     }
+  rescue
+    _ -> unavailable_section("Lifetime costs")
   end
 
   defp alltime_usage_section(u) do
@@ -3622,6 +3661,8 @@ defmodule Genswarms.LlmProxy do
         }
       ]
     }
+  rescue
+    _ -> unavailable_section("All-time usage")
   end
 
   defp financials_sections(financials) do
@@ -3633,6 +3674,8 @@ defmodule Genswarms.LlmProxy do
 
     List.wrap(if(legacy_history?, do: historical_costs_section(financials))) ++
       List.wrap(if(authoritative, do: comparable_costs_section(financials)))
+  rescue
+    _ -> [unavailable_section("Accounting")]
   end
 
   defp historical_costs_section(financials) do
@@ -3655,14 +3698,14 @@ defmodule Genswarms.LlmProxy do
       "items" => [
         %{
           "label" => "Repriced user total",
-          "value" => "$" <> money2(user_total),
+          "value" => dashboard_money2(user_total),
           "sub" => "archive-backed replay included",
           "title" => "Reconstructed user ledger total; not a literal pre-proxy charge",
           "wrap_sub" => true
         },
         %{
           "label" => "Router evidence",
-          "value" => "$" <> money2(router_total),
+          "value" => dashboard_money2(router_total),
           "sub" => "legacy shared-key estimates",
           "title" => "Router total from a different historical population; do not subtract",
           "wrap_sub" => true
@@ -3679,11 +3722,10 @@ defmodule Genswarms.LlmProxy do
       end
 
     margin_pct =
-      financials
-      |> Map.get(:gross_margin_pct, Decimal.new(0))
-      |> decimal()
-      |> Decimal.round(1)
-      |> Decimal.to_string(:normal)
+      case Map.get(financials, :gross_margin_pct) do
+        nil -> "percentage unavailable"
+        amount -> (amount |> Decimal.round(1) |> Decimal.to_string(:normal)) <> "% of router cost"
+      end
 
     reconciled = financials_reconciled?(financials)
 
@@ -3714,12 +3756,12 @@ defmodule Genswarms.LlmProxy do
           "label" => "Cost-plus margin",
           "value" =>
             if(reconciled,
-              do: "$" <> money2(Map.get(financials, :gross_margin_usd)),
+              do: dashboard_money2(Map.get(financials, :gross_margin_usd)),
               else: "—"
             ),
           "sub" =>
             if(reconciled,
-              do: margin_pct <> "% of router cost",
+              do: margin_pct,
               else: "withheld until coverage matches"
             ),
           "tone" => margin_tone(financials, reconciled),
@@ -3774,11 +3816,16 @@ defmodule Genswarms.LlmProxy do
 
   defp margin_tone(_financials, false), do: nil
 
-  defp margin_tone(financials, true) do
-    if Decimal.compare(decimal(Map.get(financials, :gross_margin_usd)), 0) == :lt,
+  defp margin_tone(%{gross_margin_usd: %Decimal{} = margin}, true) do
+    if Decimal.compare(margin, 0) == :lt,
       do: "warn",
       else: nil
   end
+
+  defp margin_tone(_, true), do: nil
+
+  defp dashboard_money2(nil), do: "unavailable"
+  defp dashboard_money2(amount), do: "$" <> money2(amount)
 
   defp financials_reconciled?(financials) do
     reported = Map.get(financials, :reconciled)
@@ -3823,29 +3870,89 @@ defmodule Genswarms.LlmProxy do
     }
   end
 
+  defp router_alltime_item(:unavailable),
+    do: %{"label" => "Router evidence", "value" => "unavailable"}
+
   defp router_alltime_item(_), do: nil
 
   # Zero-arity probed-contract read with the section-builders' fail-open discipline.
   defp probe_map(store_mod, fun) do
     if is_atom(store_mod) and not is_nil(store_mod) and Code.ensure_loaded?(store_mod) and
          function_exported?(store_mod, fun, 0) do
-      apply(store_mod, fun, [])
-    else
-      nil
+      result =
+        case apply(store_mod, fun, []) do
+          {:ok, row} -> row
+          row -> row
+        end
+
+      {counts, amounts} =
+        case fun do
+          :llm_usage_alltime ->
+            {[:requests, :prompt_tokens, :total_tokens, :cached_tokens], [:spent_usd]}
+
+          :llm_financials_alltime ->
+            {[], [:spent_usd, :router_cost_usd]}
+
+          _ ->
+            {[], [:cost_usd]}
+        end
+
+      optional_amounts =
+        if fun == :llm_financials_alltime,
+          do: [
+            :lifetime_spent_usd,
+            :lifetime_router_cost_usd,
+            :gross_margin_usd,
+            :gross_margin_pct
+          ],
+          else: []
+
+      if valid_dashboard_numbers?(result, counts, amounts) and
+           valid_optional_dashboard_numbers?(
+             result,
+             [:days, :ledger_requests, :router_requests, :ledger_tokens, :router_tokens],
+             optional_amounts
+           ), do: result, else: :unavailable
     end
   rescue
-    _ -> nil
+    _ -> :unavailable
   catch
-    _, _ -> nil
+    _, _ -> :unavailable
+  end
+
+  defp valid_dashboard_numbers?(row, counts, amounts) when is_map(row) do
+    Enum.all?(counts, &(is_integer(row[&1]) and row[&1] >= 0)) and
+      Enum.all?(amounts, &match?(%Decimal{coef: coef} when is_integer(coef), row[&1]))
+  end
+
+  defp valid_dashboard_numbers?(_, _, _), do: false
+
+  defp valid_optional_dashboard_numbers?(row, counts, amounts) do
+    valid_dashboard_numbers?(
+      row,
+      Enum.reject(counts, &is_nil(row[&1])),
+      Enum.reject(amounts, &is_nil(row[&1]))
+    )
   end
 
   defp history_section([]), do: nil
-  defp history_section(rows) when not is_list(rows), do: nil
+  defp history_section(rows) when not is_list(rows), do: unavailable_section("History")
 
   defp history_section(day_rows) do
     # Both spends when the host supplies them: "user spent" (operator-set price,
     # summed from per-budget accounting) and "router" (the day estimate the host
     # synced from its router's usage API — optional :router_cost_usd).
+    true =
+      Enum.all?(
+        day_rows,
+        &(valid_dashboard_numbers?(
+            &1,
+            [:budgets, :requests, :total_tokens, :prompt_tokens, :cached_tokens],
+            [:spent_usd]
+          ) and valid_optional_dashboard_numbers?(&1, [], [:router_cost_usd]) and
+            match?(%Date{}, &1[:day]))
+      )
+
     with_router? = Enum.any?(day_rows, &(not is_nil(Map.get(&1, :router_cost_usd))))
 
     rows =
@@ -3880,8 +3987,8 @@ defmodule Genswarms.LlmProxy do
 
     %{
       "type" => "table",
-      "title" => "History · last #{length(rows)} days",
-      "meta" => "durable day totals across all budgets — survives restarts",
+      "title" => "History · last 30 UTC days",
+      "meta" => "#{length(rows)} recorded day(s) in the calendar window · all budget identities",
       "columns" =>
         [
           %{"key" => "day", "label" => "day", "mono" => true},
@@ -3893,14 +4000,25 @@ defmodule Genswarms.LlmProxy do
         ] ++ router_col,
       "rows" => rows
     }
+  rescue
+    _ -> unavailable_section("History")
   end
 
   defp day_label(%Date{} = d), do: Date.to_iso8601(d)
   defp day_label(other), do: to_string(other || "")
 
   defp model_section([]), do: nil
+  defp model_section(rows) when not is_list(rows), do: unavailable_section("By model")
 
   defp model_section(model_rows) do
+    true =
+      Enum.all?(
+        model_rows,
+        &(valid_dashboard_numbers?(&1, [:calls, :total_tokens, :prompt_tokens, :cached_tokens], [
+            :spent_usd
+          ]) and is_binary(&1[:model]))
+      )
+
     rows =
       Enum.map(model_rows, fn row ->
         %{
@@ -3925,6 +4043,8 @@ defmodule Genswarms.LlmProxy do
       ],
       "rows" => rows
     }
+  rescue
+    _ -> unavailable_section("By model")
   end
 
   def fallback_budget_status(pid \\ @state_name, session, day, session_id, default_limit) do
@@ -4173,30 +4293,65 @@ defmodule Genswarms.LlmProxy do
     end)
   end
 
-  defp dashboard_usage_rows(store_mod, day, state_pid) do
-    durable =
-      try do
-        cond do
-          is_atom(store_mod) and Code.ensure_loaded?(store_mod) and
-              function_exported?(store_mod, :llm_usage_by_budget, 2) ->
-            store_mod.llm_usage_by_budget(day, 500)
+  defp dashboard_usage_rows(nil, day, state_pid),
+    do: {dashboard_memory_usage(state_pid, day), "memory"}
 
-          is_atom(store_mod) and Code.ensure_loaded?(store_mod) and
-              function_exported?(store_mod, :list_llm_usage, 1) ->
-            store_mod.list_llm_usage(500)
-            |> Enum.filter(&same_day?(Map.get(&1, :day), day))
+  defp dashboard_usage_rows(store, day, _state_pid) do
+    rows =
+      cond do
+        Code.ensure_loaded?(store) and function_exported?(store, :llm_usage_by_budget, 2) ->
+          dashboard_list(store, :llm_usage_by_budget, [day, 100])
 
-          true ->
-            []
-        end
-      rescue
-        _ -> []
+        Code.ensure_loaded?(store) and function_exported?(store, :list_llm_usage, 1) ->
+          case dashboard_list(store, :list_llm_usage, [500]) do
+            rows when is_list(rows) -> Enum.filter(rows, &same_day?(Map.get(&1, :day), day))
+            _ -> :unavailable
+          end
+
+        true ->
+          :unavailable
       end
 
-    if is_list(durable) and durable != [],
-      do: {durable, "postgres"},
-      else: {dashboard_memory_usage(state_pid, day), "memory"}
+    {rows, "postgres"}
   end
+
+  defp dashboard_summary(nil, _day, rows, "memory"), do: {dashboard_totals(rows), "memory"}
+
+  defp dashboard_summary(store, day, _rows, _source) do
+    result =
+      if Code.ensure_loaded?(store) and function_exported?(store, :llm_usage_summary, 1),
+        do: store.llm_usage_summary(day),
+        else: :unavailable
+
+    case result do
+      {:ok, %{spent_usd: %Decimal{coef: coef}} = totals} when is_integer(coef) ->
+        if Enum.all?(
+             [:budgets, :requests, :prompt_tokens, :cached_tokens, :total_tokens],
+             &(is_integer(totals[&1]) and totals[&1] >= 0)
+           ), do: {totals, "postgres"}, else: unavailable_totals()
+
+      _ ->
+        unavailable_totals()
+    end
+  rescue
+    _ -> unavailable_totals()
+  catch
+    _, _ -> unavailable_totals()
+  end
+
+  defp unavailable_totals,
+    do:
+      {%{
+         budgets: nil,
+         requests: nil,
+         prompt_tokens: nil,
+         cached_tokens: nil,
+         total_tokens: nil,
+         spent_usd: nil
+       }, "unavailable"}
+
+  defp available_value(nil), do: "unavailable"
+  defp available_value(value), do: value
 
   defp dashboard_memory_usage(state_pid, day) do
     state_pid
@@ -4282,7 +4437,19 @@ defmodule Genswarms.LlmProxy do
 
   defp proxy_state_alive?(_), do: false
 
+  defp dashboard_rows(rows, _, _, _, _) when not is_list(rows), do: :unavailable
+
   defp dashboard_rows(usage_rows, sessions, users_by_cid, users_by_budget, origins_by_budget) do
+    true =
+      Enum.all?(
+        usage_rows,
+        &(valid_dashboard_numbers?(
+            &1,
+            [:requests, :prompt_tokens, :total_tokens, :cached_tokens],
+            [:spent_usd]
+          ) and is_binary(&1[:budget_identity]))
+      )
+
     usage_rows
     |> Enum.sort_by(&(Decimal.to_float(decimal(Map.get(&1, :spent_usd))) * -1))
     |> Enum.take(100)
@@ -4308,6 +4475,8 @@ defmodule Genswarms.LlmProxy do
       # declared columns and may use "_cid" to open its conversation inspector.
       |> put_row_cid(session, Map.get(origins_by_budget, row.budget_identity))
     end)
+  rescue
+    _ -> :unavailable
   end
 
   defp put_row_cid(row, %{conversation_id: cid}, _origin) when is_binary(cid) and cid != "",
@@ -4322,6 +4491,7 @@ defmodule Genswarms.LlmProxy do
 
   defp dashboard_totals(rows) do
     %{
+      budgets: length(rows),
       requests: sum_int(rows, :requests),
       prompt_tokens: sum_int(rows, :prompt_tokens),
       cached_tokens: sum_int(rows, :cached_tokens),

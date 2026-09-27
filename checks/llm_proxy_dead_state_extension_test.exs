@@ -4,6 +4,18 @@
 ExUnit.start()
 
 defmodule DeadStateStore do
+  def llm_usage_summary(_day),
+    do:
+      {:ok,
+       %{
+         budgets: 1,
+         requests: 2,
+         prompt_tokens: 120,
+         total_tokens: 150,
+         cached_tokens: 40,
+         spent_usd: Decimal.new("0.0012")
+       }}
+
   def list_llm_usage(_limit) do
     [
       %{
@@ -27,10 +39,14 @@ defmodule GenswarmsLlmProxyDeadStateExtensionTest do
   alias Genswarms.LlmProxy, as: Proxy
 
   test "durable-only extension with a dead state Agent" do
-    {:ok, sp} = Agent.start(fn -> %{sessions: %{}, usage: %{}, notified: MapSet.new(), global: %{}} end)
+    {:ok, sp} =
+      Agent.start(fn -> %{sessions: %{}, usage: %{}, notified: MapSet.new(), global: %{}} end)
+
     Agent.stop(sp)
 
-    ext = Proxy.dashboard_extension(state_pid: sp, store_mod: DeadStateStore, day: Date.utc_today())
+    ext =
+      Proxy.dashboard_extension(state_pid: sp, store_mod: DeadStateStore, day: Date.utc_today())
+
     assert ext["llm_proxy"]["requests"] == 2
     assert Enum.any?(ext["dashboard_pages"], &(&1["id"] == "proxy-router"))
     assert ext["proxy_router"]["source"] == "postgres"
