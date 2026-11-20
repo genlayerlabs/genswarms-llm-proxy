@@ -2067,11 +2067,12 @@ check.(
   l4_ok_conn.status == 200 and l4_ok_usage.requests == 1
 )
 
-# ── L4 (mirror) — the PG-down in-memory fallback obeys the same LENIENT rule ────
-# With the store fully down (NoStore → budget_status nil → fallback mirror), quota
-# enforcement reads the mirror's `requests`. Errors must not advance it there either:
-# daily_request_limit=1 means a single burned request blocks the NEXT call, so the
-# ok call REACHING upstream after two prior errors proves the errors burned nothing.
+# ── L4 (mirror) — the PG-down in-memory fallback keeps the same row shape ───────
+# With the store fully down (NoStore → budget_status nil → fallback mirror), the
+# mirror's `requests` still only counts "ok" rows. But a request that was SENT
+# upstream burns the quota whatever its outcome (the admission gate counts it
+# in-process): with daily_request_limit=1 the 503 uses the one request, so the
+# next calls are blocked before upstream.
 {:ok, l4m_state_pid} = Proxy.start_state_link()
 l4m_attrs = %{conversation_id: "tg:l4m:0", slot: :agent_l4m, kind: :dm, workspace_key: "l4mws"}
 l4m_identity = Proxy.budget_identity(l4m_attrs)
@@ -2103,9 +2104,10 @@ l4m_mirror_after_errors =
   Proxy.usage_for_budget_inmem(l4m_state_pid, l4m_identity, today, Decimal.new("0.50"))
 
 check.(
-  "L4 mirror: with the store DOWN, two error events (5xx + transport) leave the in-memory requests count at 0",
-  l4m_503_conn.status == 503 and l4m_transport_conn.status == 502 and
-    l4m_mirror_after_errors.requests == 0
+  "L4 mirror: with the store DOWN, a 5xx leaves the in-memory requests count at 0 but burns the quota (next call blocked)",
+  l4m_503_conn.status == 503 and l4m_transport_conn.status == 200 and
+    get_in(Jason.decode!(l4m_transport_conn.resp_body), ["x_router", "request_quota_exhausted"]) ==
+      true and l4m_mirror_after_errors.requests == 0
 )
 
 l4m_ok_conn = l4m_post.(ok_upstream)
@@ -2121,9 +2123,9 @@ l4m_mirror_after_ok =
   Proxy.usage_for_budget_inmem(l4m_state_pid, l4m_identity, today, Decimal.new("0.50"))
 
 check.(
-  "L4 mirror: an ok event STILL reaches upstream under daily_request_limit=1 (errors burned no quota) and advances the mirror to 1",
-  l4m_ok_conn.status == 200 and l4m_ok_reached_upstream? and
-    l4m_mirror_after_ok.requests == 1
+  "L4 mirror: a later call does NOT reach upstream under daily_request_limit=1 (the failed call burned it)",
+  l4m_ok_conn.status == 200 and not l4m_ok_reached_upstream? and
+    l4m_mirror_after_ok.requests == 0
 )
 
 # ── L8 — gate-off stream downgrade also drops stream_options (upstream-strict 400

@@ -2762,6 +2762,7 @@ defmodule Genswarms.LlmProxy do
 
     key = {row.budget_identity, row.day, row.session_id, row.model, row.status}
     budget_key = {row.budget_identity, row.day, row.session_id, "_budget", "_daily"}
+    caller = self()
 
     Agent.update(pid, fn state ->
       usage =
@@ -2791,7 +2792,192 @@ defmodule Genswarms.LlmProxy do
       # budget it enforces is per-UTC-day, so rows from any other day are dead weight.
       # Dropping them on every record keeps the map bounded to a single day.
       %{state | usage: prune_usage(usage, day), global: global}
+      |> Map.put(:gate, gate_note_call(gate(state), caller, row.budget_identity, day, attrs))
     end)
+  end
+
+  # ── Admission gate: in-flight reservations ────────────────────────────────
+  #
+  # The store is read before the upstream call and written only after the
+  # reply, so the gate also has to see what is in flight. Reservations live in
+  # this Agent's state under `:gate`, keyed by the request (handler) pid:
+  #
+  #   gate_enter/3  registers the request as PENDING, before the store is read;
+  #   gate_admit/4  atomically computes what is ahead of the request, runs the
+  #                 (pure) decision and marks the reservation ADMITTED;
+  #   gate_leave/2  releases it — explicitly before the response is sent, again
+  #                 from an `after` in Plug.call/2, and lazily for dead pids.
+  #
+  # A PENDING entry never counts toward others; it only collects what admitted
+  # requests released after it entered (its store snapshot may predate their
+  # write). An in-flight call's cost is unknown, so it reserves the largest
+  # single-call cost recorded today for its identity (else for any identity).
+  # `extra` counts requests that were sent upstream but recorded no status "ok"
+  # row (errors, timeouts, killed handlers): the store contract only counts
+  # "ok" rows, so these burn the request quota here, in-process.
+
+  defp gate(state), do: Map.get(state, :gate) || %{inflight: %{}, extra: %{}, peak: %{}}
+
+  @doc false
+  def gate_enter(pid \\ @state_name, budget_identity, %Date{} = day) do
+    me = self()
+
+    Agent.update(pid, fn state ->
+      gate = state |> gate() |> gate_reap() |> gate_drop(me, :sent)
+      entry = gate_entry(budget_identity, day)
+      Map.put(state, :gate, %{gate | inflight: Map.put(gate.inflight, me, entry)})
+    end)
+  end
+
+  @doc false
+  # `decide` is a PURE fn(ahead) -> {admit?, reason}; it runs inside the Agent
+  # (no store or Agent calls). A raise in it is re-raised in the caller.
+  def gate_admit(pid \\ @state_name, budget_identity, %Date{} = day, decide)
+      when is_function(decide, 1) do
+    me = self()
+    zero = Decimal.new("0")
+
+    result =
+      Agent.get_and_update(pid, fn state ->
+        gate = state |> gate() |> gate_reap()
+        entry = Map.get(gate.inflight, me) || gate_entry(budget_identity, day)
+        key = {budget_identity, day}
+        others = for {p, e} <- gate.inflight, p != me, e.admitted, e.day == day, do: e
+        mine = Enum.filter(others, &(&1.identity == budget_identity))
+
+        ahead = %{
+          requests: entry.carry_requests + length(mine) + Map.get(gate.extra, key, 0),
+          usd: Enum.reduce(mine, entry.carry_usd, &Decimal.add(&2, &1.est)),
+          global_carry: entry.carry_global,
+          global_inflight: Enum.reduce(others, zero, &Decimal.add(&2, &1.est)),
+          global_inmem: state |> Map.get(:global, %{}) |> Map.get(day, zero)
+        }
+
+        {admit?, reason} =
+          try do
+            decide.(ahead)
+          rescue
+            e -> {false, {:gate_raised, e, __STACKTRACE__}}
+          end
+
+        est = Map.get(gate.peak, key) || Map.get(gate.peak, {:any, day}) || zero
+        entry = if admit?, do: %{entry | admitted: true, est: est}, else: entry
+        {reason, Map.put(state, :gate, %{gate | inflight: Map.put(gate.inflight, me, entry)})}
+      end)
+
+    case result do
+      {:gate_raised, e, stacktrace} -> reraise e, stacktrace
+      reason -> reason
+    end
+  end
+
+  @doc false
+  # Idempotent. `:sent` settles an admitted reservation (it went upstream);
+  # `:blocked` just drops it. Never raises: it also runs from an `after`.
+  def gate_leave(pid \\ @state_name, mode \\ :sent) do
+    me = self()
+    Agent.update(pid, fn state -> Map.put(state, :gate, gate_drop(gate(state), me, mode)) end)
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc false
+  # Requests sent upstream today that the store did not count (no "ok" row).
+  def gate_extra_requests(pid \\ @state_name, budget_identity, %Date{} = day) do
+    Agent.get(pid, fn state -> Map.get(gate(state).extra, {budget_identity, day}, 0) end)
+  rescue
+    _ -> 0
+  catch
+    :exit, _ -> 0
+  end
+
+  defp gate_entry(budget_identity, day) do
+    zero = Decimal.new("0")
+
+    %{
+      identity: budget_identity,
+      day: day,
+      admitted: false,
+      est: zero,
+      counted: false,
+      cost: zero,
+      carry_requests: 0,
+      carry_usd: zero,
+      carry_global: zero
+    }
+  end
+
+  # Process death: an `after` does not run for a killed handler, so reservations
+  # of dead pids are settled the next time the gate is touched.
+  defp gate_reap(gate) do
+    gate.inflight
+    |> Map.keys()
+    |> Enum.filter(&(node(&1) == node() and not Process.alive?(&1)))
+    |> Enum.reduce(gate, &gate_drop(&2, &1, :sent))
+  end
+
+  defp gate_drop(gate, pid, mode) do
+    case Map.pop(gate.inflight, pid) do
+      {%{admitted: true} = done, rest} when mode == :sent ->
+        key = {done.identity, done.day}
+
+        extra =
+          if done.counted do
+            gate.extra
+          else
+            gate.extra
+            |> Map.filter(fn {{_identity, day}, _n} -> day == done.day end)
+            |> Map.update(key, 1, &(&1 + 1))
+          end
+
+        rest = Map.new(rest, fn {p, e} -> {p, gate_carry(e, done)} end)
+        %{gate | inflight: rest, extra: extra}
+
+      {_pending_or_nil, rest} ->
+        %{gate | inflight: rest}
+    end
+  end
+
+  # A still-PENDING request may have read the store before `done` wrote to it.
+  defp gate_carry(%{admitted: false, day: day} = e, %{day: day} = done) do
+    e = %{e | carry_global: Decimal.add(e.carry_global, done.cost)}
+
+    if e.identity == done.identity do
+      %{
+        e
+        | carry_usd: Decimal.add(e.carry_usd, done.cost),
+          carry_requests: e.carry_requests + if(done.counted, do: 1, else: 0)
+      }
+    else
+      e
+    end
+  end
+
+  defp gate_carry(e, _done), do: e
+
+  defp gate_note_call(gate, caller, budget_identity, day, attrs) do
+    cost = decimal(Map.get(attrs, :cost_usd))
+
+    inflight =
+      case gate.inflight do
+        %{^caller => e} ->
+          counted = e.counted or request_increment(attrs) == 1
+          Map.put(gate.inflight, caller, %{e | counted: counted, cost: Decimal.add(e.cost, cost)})
+
+        inflight ->
+          inflight
+      end
+
+    peak =
+      [{budget_identity, day}, {:any, day}]
+      |> Enum.reduce(gate.peak, fn key, peak ->
+        Map.update(peak, key, cost, &Decimal.max(&1, cost))
+      end)
+      |> Map.filter(fn {{_identity, d}, _cost} -> d == day end)
+
+    %{gate | inflight: inflight, peak: peak}
   end
 
   @doc "Pure: the in-memory operator-wide spend accumulated for `day` (0 if none / store down)."
@@ -2919,7 +3105,10 @@ defmodule Genswarms.LlmProxy do
     global_used = quota_global_spent(quota, state_pid, day)
     global_limit = decimal(Map.get(quota, :global_daily_limit, Decimal.new("0")))
     request_limit = request_limit(Map.get(quota, :daily_request_limit, 0))
-    requests_used = max(int(Map.get(usage, :requests, 0)), 0)
+    requests_used =
+      max(int(Map.get(usage, :requests, 0)), 0) +
+        gate_extra_requests(state_pid, budget_identity, day)
+
 
     # (X5b) credits_enabled gates the credit read here too, not just the plug's
     # block gate (credit_exhausted?/2): a feature-off install must show "0.00"
@@ -4595,8 +4784,9 @@ defmodule Genswarms.LlmProxy do
   # L4 (LENIENT): only a status:"ok" call burns the daily request quota — mirrors
   # the durable store's gate (store.ex record_llm_call: CASE WHEN status = 'ok'
   # THEN 1 ELSE 0). Every OTHER counter (tokens/cost/spent) accrues regardless of
-  # status, exactly as before — only `requests` is gated, so the PG-down fallback
-  # mirror can't request-quota-block a conversation off failed calls.
+  # status, exactly as before — only `requests` is gated. Requests that were sent
+  # upstream but recorded no "ok" row still burn the quota: the admission gate
+  # counts them in-process (see gate_drop/3, `extra`), not in this row.
   defp request_increment(attrs) do
     if to_string(Map.get(attrs, :status) || "ok") == "ok", do: 1, else: 0
   end
@@ -4854,6 +5044,7 @@ defmodule Genswarms.LlmProxy.Plug do
            Proxy.lookup_session(opts.state_pid, token),
          body when is_map(body) <- conn.body_params do
       request_ctx = request_context(session, opts)
+      Proxy.gate_enter(opts.state_pid, session.budget_identity, request_ctx.day)
       budget = budget_status(opts, session, request_ctx)
       block_reason = request_block_reason(opts, session, request_ctx, budget)
 
@@ -5007,6 +5198,7 @@ defmodule Genswarms.LlmProxy.Plug do
            Proxy.lookup_session(opts.state_pid, token),
          body when is_map(body) <- conn.body_params do
       request_ctx = request_context(session, opts)
+      Proxy.gate_enter(opts.state_pid, session.budget_identity, request_ctx.day)
       budget = budget_status(opts, session, request_ctx)
       block_reason = request_block_reason(opts, session, request_ctx, budget)
 
@@ -5068,7 +5260,8 @@ defmodule Genswarms.LlmProxy.Plug do
           # status "ok" on success is deliberate: the store's request-quota SQL
           # only counts status='ok' rows (CASE WHEN status = 'ok'), and a seal
           # must burn quota. model "compact" keeps it distinguishable in the
-          # ledger; failures record as "compact_error" (visible, quota-free —
+          # ledger; failures record as "compact_error" (visible; they burn the
+          # quota through the admission gate's in-process count instead —
           # same treatment as chat upstream errors).
           # (X2) Pass the full `budget` map (not just spent_usd) so the debit
           # chokepoint sees the SAME limit_usd this cond's exhausted?/1 gate did.
@@ -5080,6 +5273,7 @@ defmodule Genswarms.LlmProxy.Plug do
             budget
           )
 
+          Proxy.gate_leave(opts.state_pid)
           json(conn, status, resp)
       end
     else
@@ -5159,9 +5353,15 @@ defmodule Genswarms.LlmProxy.Plug do
       |> Map.put_new(:notice_repeat_ms, Proxy.default_notice_repeat_ms())
       |> Map.update!(:daily_request_limit, &Proxy.request_limit/1)
 
-    conn
-    |> Plug.Conn.put_private(:router_opts, opts)
-    |> super(opts)
+    try do
+      conn
+      |> Plug.Conn.put_private(:router_opts, opts)
+      |> super(opts)
+    after
+      # Safety net for the admission reservation (no-op when none is held):
+      # covers raises, client disconnects and every early return.
+      if state_pid = Map.get(opts, :state_pid), do: Proxy.gate_leave(state_pid)
+    end
   end
 
   # Fire-and-forget metric bump. No-op if opts is missing swarm_name/metrics/deliver_fn.
@@ -5366,7 +5566,8 @@ defmodule Genswarms.LlmProxy.Plug do
   # advances the per-conversation budget and the global ceiling. ABSENCE of
   # both keys = legacy router = the same $0 row as before (compat: never crash,
   # never invent cost). model "compact" and the status semantics are preserved:
-  # "ok" burns the request quota, "compact_error" stays quota-free — but a
+  # "ok" burns the store's request count, "compact_error" does not (the
+  # admission gate counts the sent request in-process instead) — but a
   # compact_error row still records any cost a new router billed for the
   # failed seal.
   defp compact_record(status, resp, budget, opts) do
@@ -5852,8 +6053,12 @@ defmodule Genswarms.LlmProxy.Plug do
       )
   end
 
-  defp exhausted?(%{spent_usd: spent, limit_usd: limit}) do
-    Decimal.compare(spent || Decimal.new("0"), limit || Proxy.default_daily_limit()) != :lt
+  # `inflight` = what admitted, still-running calls of this identity reserve.
+  defp exhausted?(%{spent_usd: spent, limit_usd: limit}, inflight) do
+    Decimal.compare(
+      Decimal.add(spent || Decimal.new("0"), inflight),
+      limit || Proxy.default_daily_limit()
+    ) != :lt
   end
 
   # Credits only matter once the free daily budget is spent. Reading the balance
@@ -5873,19 +6078,35 @@ defmodule Genswarms.LlmProxy.Plug do
     credit_block_reason(opts, session) != nil
   end
 
+  # Atomic admission: the decision runs inside the state Agent against the store
+  # snapshot PLUS what is in flight, and reserves a slot when it admits. The
+  # credit check needs the store, so it runs after a tentative admit (credits
+  # on) and gives the slot back when it blocks.
   defp request_block_reason(opts, session, request_ctx, budget) do
-    cond do
-      global_exhausted?(opts, request_ctx) ->
-        :global
+    global_limit = Map.get(opts, :global_daily_limit, Decimal.new("0"))
+    global_on? = Decimal.compare(global_limit, 0) == :gt
 
-      request_quota_exhausted?(opts, budget) ->
-        :request_quota
+    global_pg =
+      if global_on?, do: global_spent_pg(opts, request_ctx.day), else: Decimal.new("0")
 
-      exhausted?(budget) ->
-        credit_block_reason(opts, session)
+    credits? = Map.get(opts, :credits_enabled, false)
 
-      true ->
-        nil
+    reason =
+      Proxy.gate_admit(opts.state_pid, session.budget_identity, request_ctx.day, fn ahead ->
+        cond do
+          global_on? and global_exhausted?(global_limit, global_pg, ahead) -> {false, :global}
+          request_quota_exhausted?(opts, budget, ahead.requests) -> {false, :request_quota}
+          exhausted?(budget, ahead.usd) -> {credits?, :exhausted}
+          true -> {true, nil}
+        end
+      end)
+
+    if reason == :exhausted do
+      blocked = credit_block_reason(opts, session)
+      if blocked, do: Proxy.gate_leave(opts.state_pid, :blocked)
+      blocked
+    else
+      reason
     end
   end
 
@@ -5915,9 +6136,10 @@ defmodule Genswarms.LlmProxy.Plug do
     end
   end
 
-  defp request_quota_exhausted?(opts, budget) do
+  # `ahead` = in-flight requests of this identity + sent-but-uncounted ones.
+  defp request_quota_exhausted?(opts, budget, ahead) do
     limit = request_quota_limit(opts)
-    limit > 0 and request_count(Map.get(budget, :requests, 0)) >= limit
+    limit > 0 and request_count(Map.get(budget, :requests, 0)) + ahead >= limit
   end
 
   defp request_quota_limit(opts), do: Proxy.request_limit(Map.get(opts, :daily_request_limit, 0))
@@ -5937,11 +6159,10 @@ defmodule Genswarms.LlmProxy.Plug do
   # day's GLOBAL spend reaches the limit. Spend = max(durable PG SUM, in-memory accumulator)
   # so a Postgres outage (which makes the per-conversation budget fail open) can't lift the
   # global cap below what this process has already metered.
-  defp global_exhausted?(opts, request_ctx) do
-    limit = Map.get(opts, :global_daily_limit, Decimal.new("0"))
-
-    Decimal.compare(limit, 0) == :gt and
-      Decimal.compare(global_spent(opts, request_ctx.day), limit) != :lt
+  # Plus what admitted, still-running calls (any identity) reserve.
+  defp global_exhausted?(limit, pg, ahead) do
+    recorded = Decimal.max(Decimal.add(pg, ahead.global_carry), ahead.global_inmem)
+    Decimal.compare(Decimal.add(recorded, ahead.global_inflight), limit) != :lt
   end
 
   # mm vocabulary: the global block carries the ceiling's numbers in x_router.global.
@@ -6639,6 +6860,7 @@ defmodule Genswarms.LlmProxy.Plug do
     # (X2) Pass the full `budget` map so the debit sees the same limit_usd the
     # cond's exhausted?/1 gate did (not a re-derived session/opts limit).
     record_budget_call(opts, session, request_ctx, record, budget)
+    Proxy.gate_leave(opts.state_pid)
 
     json(
       conn,
@@ -6676,7 +6898,8 @@ defmodule Genswarms.LlmProxy.Plug do
     # (OpenAI-shape "usage", or a known x_router cost) the row is priced through
     # the executed_cost_usd chokepoint and carries the two-spends accounting, so
     # SUM(cost_usd) never undercounts real spend. Status stays the error code
-    # (the request quota is not burned), only the dollar budget advances. A bare
+    # (the store's request count does not move; the admission gate counts the
+    # sent request in-process), only the dollar budget advances. A bare
     # error body — the overwhelmingly common 5xx — keeps the minimal legacy row:
     # no invented cost, and no llm_proxy_provider_cost_unknown noise (that
     # counter means "billable call missing router cost", not "upstream errored").
@@ -6719,6 +6942,7 @@ defmodule Genswarms.LlmProxy.Plug do
 
     # (X2) Same limit_usd the gate saw, not a re-derived session/opts one.
     record_budget_call(opts, session, request_ctx, record, budget)
+    Proxy.gate_leave(opts.state_pid)
 
     json(conn, status, %{
       error: %{

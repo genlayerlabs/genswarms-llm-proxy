@@ -15,6 +15,13 @@ implementations it unifies — micro-markets carried the other).
 - **Global daily ceiling** — the cost-DoS backstop across ALL conversations; enforced
   as `max(durable, in-memory)` so it holds even when the store is down.
 - **Per-identity daily request quota** (blocks before upstream).
+- **In-flight reservations** — admission is atomic per budget identity and for the
+  global ceiling: the gate counts recorded usage *plus* calls still in flight, so
+  parallel callers cannot exceed the request quota, nor a USD limit by more than
+  one call. An in-flight call reserves the largest single-call cost seen that day
+  (cost is only known afterwards). Every request sent upstream burns the request
+  quota whatever its outcome (error, timeout); non-`ok` ones are counted
+  in-process (reset on restart), since the store only counts `ok` rows.
 - **Cost tracking** per model: spend, prompt/completion tokens, cached tokens
   (router `x_router.tokens_cached` canonical, Anthropic/OpenAI shapes as fallback).
   Default `pricing_mode: :cost_plus` charges the direct per-call provider cost plus
