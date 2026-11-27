@@ -23,6 +23,15 @@ defmodule GenswarmsLlmProxyUpstreamDecodeErrorTest do
     assert msg =~ "error code: 502"
   end
 
+  test "the failure is logged, since the stored row keeps only the code" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Proxy.upstream_decode_error(:non_json, 500, "Internal Server Error", "sk-secret")
+      end)
+
+    assert log =~ "llm_proxy: upstream returned non-JSON response (HTTP 500): Internal Server Error"
+  end
+
   test "an empty body is reported as empty rather than as an absent reason" do
     msg = message(Proxy.upstream_decode_error(:non_json, 200, "", "sk-secret"))
 

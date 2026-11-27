@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Upstream decode failures are now logged as a warning with the HTTP status
+  and the scrubbed snippet. The stored row keeps only `upstream_invalid_json`,
+  so the log line is the one place an operator can read what the upstream said.
+
 ## 0.4.2 — 2026-08-21
 
 - Upstream decode failures now report the REAL HTTP status and a bounded,

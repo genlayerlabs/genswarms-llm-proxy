@@ -5983,9 +5983,14 @@ defmodule Genswarms.LlmProxy.Plug do
         do: sanitize_log(scrub_secret(body, key)),
         else: "empty body"
 
+    message = "#{wording} (HTTP #{status}): #{snippet}"
+    # The stored row keeps only the code and the agent's curl drops the body,
+    # so this line is the operator's only copy of what the upstream said.
+    Logger.warning("llm_proxy: #{message}")
+
     %{
       "error" => %{
-        "message" => "#{wording} (HTTP #{status}): #{snippet}",
+        "message" => message,
         "type" => "upstream_error",
         "code" => "upstream_invalid_json"
       }
